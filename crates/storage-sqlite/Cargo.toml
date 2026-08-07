@@ -5,7 +5,28 @@ edition.workspace = true
 rust-version.workspace = true
 description = "Operune SQLite persistence: schema, migration, repository adapter, storage executor (spec 24.2)"
 
+# §23.2 版本策略：所有依赖从根 workspace.dependencies 继承，不写版本字面量。
+# §24.2：storage-sqlite = SQLite schema、migration、repository adapter、Storage Executor。
+# 本 crate 是 adapter（§25 D1: Infrastructure Adapter），不包含领域业务规则。
 [dependencies]
+# operune-domain 是 workspace member（§24.1），path 依赖；所有存储签名使用 domain
+# typed 类型（§13.3 边界解析一次：SQL 边界接触字符串/整数 wire 表示，立即 parse
+# 成领域类型）。crate 包名为 operune-domain（见 crates/domain/Cargo.toml）。
+operune-domain = { path = "../domain" }
+# §22.4 / §18.1：rusqlite 0.40.1，必须启用 bundled——内嵌 SQLite，不依赖目标 OS 的
+# SQLite 版本（§18.1）；0.1.0 单节点权威元数据（§18.3）。
+rusqlite = { workspace = true, features = ["bundled"] }
+# §18.2 Storage Executor：tokio 有界 mpsc（§15.2）+ spawn_blocking（shutdown 等待
+# worker 线程）+ oneshot 单答复。只启用本 crate 真实需要的 feature：
+#   rt / sync      —— production：spawn_blocking、有界 channel、oneshot；
+#   macros / rt-multi-thread / time —— 仅 executor 并发/取消/有界队列测试（§29）。
+tokio = { workspace = true, features = ["rt", "sync", "macros", "rt-multi-thread", "time"] }
+# §14.1：封闭、可匹配的 typed error（thiserror 2.0.19）。
+thiserror = { workspace = true }
+
+# §22.8：tempfile 3.27.0 只用于隔离文件系统测试。
+[dev-dependencies]
+tempfile = { workspace = true }
 
 [lints]
 workspace = true
