@@ -20,17 +20,20 @@
 //! 的映射）。descriptor 调用使用独立 deadline / 预算
 //! （`RuntimeConfig::descriptor_deadline` / `descriptor_budget`，§19.3）。
 //!
-//! # 0.1.0 集成边界说明
+//! # WASI 集成边界（§19.3 / §7.6 / §17.2）
 //!
 //! - descriptor-only Store 使用空 Linker（§19.3 零 operational grant）：
 //!   任何带 import 的组件在 descriptor 阶段以确定性 link 错误失败
-//!   （deny-by-default，§17.2 / §19.5）。WASI 默认 context（runtime-wasi-p2
-//!   的零权限上下文）的接线需要 runtime-wasm 为 `StoreHostState` 实现
-//!   `wasmtime_wasi::WasiView`（orphan rule，见 runtime-wasi-p2 crate 文档）——
-//!   该缺口已作为 API gap 报告，闭合后 descriptor 阶段可在零权限 WASI
-//!   context 下实例化带标准 WASI import 的组件；
-//! - runtime candidate 的 grant 快照中非空 WASI 能力 →
-//!   [`RuntimeExecutionError::WasiIntegrationUnavailable`]（同一缺口）。
+//!   （deny-by-default，§17.2 / §19.5）。descriptor 阶段**绝不 attach WASI**
+//!   （§19.3：读取 descriptor 只为目的元数据，不给 guest 正常运行权限）；
+//! - runtime candidate 在目标 grant/resource 快照下实例化（§19.3）：
+//!   grant 快照中的非空 WASI 能力经 runtime-wasi-p2 的 adapter
+//!   （[`operune_runtime_wasi_p2::adapter::WasiContextAdapter`]，实现
+//!   [`operune_runtime_wasm::wasi::WasiAdapter`] port）按 grant 构建 WASI
+//!   0.2 context 并 attach（零 grant = 零权限 context，§7.6）；attach 失败
+//!   即整个 candidate 失败（fail closed，§17.2）。WASI 0.2 世界组装经
+//!   [`operune_runtime_wasi_p2::linker::add_to_linker`]（标准
+//!   `wasi:cli/imports` 接口，P4：不建立平行接口）。
 //!
 //! # Safe Rust（§11）
 //!
@@ -44,9 +47,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use operune_domain::InstallationId;
+use operune_runtime_wasi_p2::adapter::WasiContextAdapter;
+use operune_runtime_wasi_p2::linker::add_to_linker;
 use operune_runtime_wasm::{
     CallDeadline, ComponentHandle, EngineHandle, InstanceSet, ResourceBudget, StoreFactory,
-    StoreHandle,
+    StoreHandle, WasiPolicy,
 };
 use wasmtime::component::{ComponentExportIndex, Func, Instance, InstancePre, Linker, Val};
 
@@ -420,11 +425,19 @@ impl WasmRuntime for WasmtimeRuntime {
         plan: &RuntimePlan,
     ) -> Result<Arc<dyn PreparedRuntime>, RuntimeExecutionError> {
         let real = self.real_component(component.as_ref())?;
-        // §7.6 / §17.2：非空 WASI 能力需要宿主集成（0.1.0 缺口，见模块文档）。
+        let mut linker = Linker::<operune_runtime_wasm::StoreHostState>::new(self.engine.engine());
+        // §7.6 / §17.2 deny-by-default：只有 grant 快照携带 WASI 能力值时
+        // 才组装标准 WASI 0.2 世界（runtime-wasi-p2 的 adapter 侧 linker，
+        // P4：标准接口）。空能力时保持空 Linker——带 WASI import 的组件以
+        // 确定性 link 错误失败（§19.5：不"先运行，失败时 trap"）。
         if !plan.grants.wasi.is_empty() {
-            return Err(RuntimeExecutionError::WasiIntegrationUnavailable);
+            add_to_linker(&mut linker).map_err(|error| {
+                RuntimeExecutionError::Runtime(operune_runtime_wasm::RuntimeError::Execution {
+                    kind: operune_runtime_wasm::WasmFailure::Unknown,
+                    source: Box::new(error),
+                })
+            })?;
         }
-        let linker = Linker::<operune_runtime_wasm::StoreHostState>::new(self.engine.engine());
         let pre = linker
             .instantiate_pre(real.inner.component())
             .map_err(|error| {
@@ -447,8 +460,19 @@ impl WasmRuntime for WasmtimeRuntime {
         let real = self.real_prepared(prepared.as_ref())?;
         let config = self.config_snapshot()?;
         let budget = real.grants.budget.clone();
-        let set =
-            InstanceSet::new(&self.engine, &budget).map_err(RuntimeExecutionError::Runtime)?;
+        // §19.3：runtime candidate 在目标 grant/resource 快照下实例化——
+        // 非空 WASI 能力经 runtime-wasi-p2 的 adapter（WasiAdapter port，
+        // §8.2）执行 attach：per-plan context builder 携带 grant 构建的
+        // 能力（§7.6：能力只经显式构建进入 context；零 grant = 零权限）。
+        // attach 失败（政策不匹配 / 能力无法满足）→ 整个 candidate 拒绝，
+        // fail closed（§17.2），当前 Active 不受污染（§19.2）。
+        let set = if real.grants.wasi.is_empty() {
+            InstanceSet::new(&self.engine, &budget).map_err(RuntimeExecutionError::Runtime)?
+        } else {
+            let adapter = WasiContextAdapter::new().with_capabilities(real.grants.wasi.clone());
+            InstanceSet::new_with_wasi(&self.engine, &budget, &adapter, &WasiPolicy::p2())
+                .map_err(RuntimeExecutionError::Runtime)?
+        };
         let capacity = set.capacity();
         let mut bindings: Vec<std::sync::Mutex<Option<SlotBindings>>> =
             (0..capacity).map(|_| std::sync::Mutex::new(None)).collect();
@@ -919,6 +943,23 @@ mod tests {
         )"#
     }
 
+    /// 带**真实签名**的 WASI import 的 Component（WASI 世界组装后的
+    /// link + 实例化测试夹具）：`wasi:random/random@0.2.0` 的
+    /// `get-random-u64: func() -> u64` 是纯 primitive 签名——wasmtime 36
+    /// 对 import 实例内的内联 variant/record/enum 有 named-type 注册
+    /// 要求（手写 WAT 无法表达 `wasi:cli/run` 的 `result<(), error-code>`
+    /// 变体），而 primitive 形状可直接表达且与宿主 linker 类型精确匹配
+    /// （探针已验证：add_to_linker + instantiate_pre + instantiate 全链路
+    /// 成功）。复杂 WIT 形状的 guest fixture 属于 §30 conformance（本机无
+    /// cargo-component 工具链）。
+    fn wasi_importing_component_wat() -> &'static str {
+        r#"(component
+            (import "wasi:random/random@0.2.0" (instance $random
+                (export "get-random-u64" (func (result u64)))
+            ))
+        )"#
+    }
+
     #[test]
     fn real_compile_rejects_garbage_bytes() {
         let runtime = real_runtime();
@@ -999,16 +1040,17 @@ mod tests {
     }
 
     #[test]
-    fn real_prepare_rejects_nonempty_wasi_grants() {
-        // 0.1.0 集成缺口（见模块文档）：非空 WASI 能力 → 显式 typed 错误，
-        // 不静默降级。
+    fn real_prepare_and_instantiate_with_wasi_env_grant() {
+        // §7.6 / §17.2：grant 快照中的 WASI 能力值经 adapter 真实 attach——
+        // prepare（link 解析）+ instantiate（Instance Set 在 WASI context
+        // 下实例化）+ readiness 全链路成功（0.1.0 集成缺口已闭合）。
         let runtime = real_runtime();
         let component = ok(
             runtime.compile(minimal_component_wat().as_bytes()),
             "component compile",
         );
         let mut caps = WasiCapabilities::empty();
-        caps.add_env(match EnvVarSpec::new("K", "V") {
+        caps.add_env(match EnvVarSpec::new("OPERUNE_PIPELINE_TEST", "attached") {
             Ok(spec) => spec,
             Err(_) => test_failure("env spec construction failed"),
         });
@@ -1020,14 +1062,105 @@ mod tests {
                 budget: ResourceBudget::default(),
             },
         };
-        let result = runtime.prepare(&component, &plan);
-        assert!(
-            matches!(
-                result,
-                Err(RuntimeExecutionError::WasiIntegrationUnavailable)
-            ),
-            "non-empty WASI grants must fail explicitly"
+        let prepared = ok(
+            runtime.prepare(&component, &plan),
+            "prepare with wasi grants",
         );
+        let active = ok(
+            runtime.instantiate(&prepared),
+            "instantiate with wasi grants",
+        );
+        ok(active.check_readiness(), "readiness");
+        ok(Arc::clone(&active).drain(Duration::from_secs(1)), "drain");
+    }
+
+    #[test]
+    fn real_prepare_and_instantiate_with_wasi_imports() {
+        // §19.5 / §17.2：带标准 WASI import 的组件在非空 WASI 能力下经
+        // 标准 wasi:cli/imports 世界组装通过 link 解析并成功实例化——
+        // import 名与宿主 linker 类型精确匹配（§19.5 的 deny-by-default
+        // 强制点：空能力时同一组件以确定性 link 错误失败，见
+        // real_prepare_rejects_component_with_imports；能力在场时解析 +
+        // 实例化成功，0.1.0 集成缺口已闭合）。
+        let runtime = real_runtime();
+        let component = ok(
+            runtime.compile(wasi_importing_component_wat().as_bytes()),
+            "component compile",
+        );
+        let mut caps = WasiCapabilities::empty();
+        caps.add_env(match EnvVarSpec::new("OPERUNE_LINK_TEST", "visible") {
+            Ok(spec) => spec,
+            Err(_) => test_failure("env spec construction failed"),
+        });
+        let plan = RuntimePlan {
+            installation: InstallationId::new(),
+            grants: GrantSnapshot {
+                installation: InstallationId::new(),
+                wasi: caps,
+                budget: ResourceBudget::default(),
+            },
+        };
+        let prepared = ok(
+            runtime.prepare(&component, &plan),
+            "prepare wasi importing component",
+        );
+        let active = ok(
+            runtime.instantiate(&prepared),
+            "instantiate wasi importing component",
+        );
+        ok(active.check_readiness(), "readiness");
+        ok(Arc::clone(&active).drain(Duration::from_secs(1)), "drain");
+    }
+
+    #[test]
+    fn real_instantiate_fails_closed_when_wasi_attach_fails() {
+        // §17.2 fail closed：attach 失败（grant 声明的 preopen host 路径
+        // 无法打开）→ 整个 runtime candidate 拒绝，不静默跳过能力。
+        let runtime = real_runtime();
+        let component = ok(
+            runtime.compile(minimal_component_wat().as_bytes()),
+            "component compile",
+        );
+        let mut caps = WasiCapabilities::empty();
+        let guest = match operune_runtime_wasi_p2::capability::GuestPath::new("data") {
+            Ok(path) => path,
+            Err(_) => test_failure("guest path construction failed"),
+        };
+        let spec = match operune_runtime_wasi_p2::capability::PreopenDirSpec::new(
+            guest,
+            std::path::PathBuf::from("definitely-missing-host-path"),
+            operune_runtime_wasi_p2::capability::FsPerms::READ_ONLY,
+            operune_runtime_wasi_p2::capability::FsPerms::READ_ONLY,
+        ) {
+            Ok(spec) => spec,
+            Err(_) => test_failure("preopen spec construction failed"),
+        };
+        match caps.add_preopen(spec) {
+            Ok(()) => {}
+            Err(_) => test_failure("add preopen failed"),
+        }
+        let plan = RuntimePlan {
+            installation: InstallationId::new(),
+            grants: GrantSnapshot {
+                installation: InstallationId::new(),
+                wasi: caps,
+                budget: ResourceBudget::default(),
+            },
+        };
+        let prepared = ok(runtime.prepare(&component, &plan), "prepare");
+        let result = runtime.instantiate(&prepared);
+        match result {
+            Ok(_) => test_failure("instantiate must fail closed when WASI attach fails"),
+            Err(error) => {
+                assert!(
+                    matches!(
+                        error,
+                        RuntimeExecutionError::Runtime(operune_runtime_wasm::RuntimeError::Wasi(_))
+                    ),
+                    "attach failure must surface as RuntimeError::Wasi: {error:?}"
+                );
+            }
+        }
     }
 
     #[test]

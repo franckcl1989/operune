@@ -184,11 +184,6 @@ pub enum RuntimeExecutionError {
     #[error("wasm execution deadline exceeded")]
     DeadlineExceeded,
 
-    /// WASI 能力解析成功但宿主集成尚未就绪（0.1.0 集成缺口：runtime-wasm
-    /// 的 `WasiView` 接线待主 agent 派微任务，见 crate 文档）。
-    #[error("WASI capability integration is not yet available in this build")]
-    WasiIntegrationUnavailable,
-
     /// config 快照读取失败（§18.0 RuntimeConfig 语义）。
     #[error("runtime config snapshot unavailable")]
     ConfigUnavailable,
