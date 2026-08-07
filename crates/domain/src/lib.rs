@@ -58,6 +58,31 @@
 //!   scope 的键）、[`EventId`]（`event-id`，审计关联）、[`EventPayload`]
 //!   （`event-payload` 闭集：json/raw 有界形态，§22.4 禁止万能动态值）。
 //!
+//! # 0.4.0 公开面（§42 Web Application Runtime 中的 domain 部分）
+//!
+//! 契约面 = `operune:web@0.2.0`（app-descriptor / navigation / routes /
+//! permissions / route-dispatch，已提交稳定；类型语义与 WIT 契约严格对齐，
+//! §42.2）：
+//! - 页面（navigation）：[`PageId`]（`page-id`）、[`PagePath`]（`page-path`，
+//!   挂载命名空间下的静态路径）、[`PageDeclaration`]（`page-declaration`）；
+//! - 权限（permissions）：[`PermissionName`]（`permission-name`）、
+//!   [`PermissionDeclaration`]（`permission-declaration`）；
+//! - 路由（routes）：[`RouteId`]（`route-id`）、[`HttpMethod`]（`http-method`
+//!   闭集：get/post/put/patch/delete）、[`PathTemplate`]（`path-template`，
+//!   "{name}" 段模板）、[`PathSegment`]（模板段：字面 / 参数）、[`ParamType`]
+//!   （`param-type` 闭集）、[`RouteParam`]（`route-param`）、[`RouteDeclaration`]
+//!   （`route-declaration`，构造校验模板与参数一致）、[`PathConflict`]（同
+//!   method 下模板冲突的纯逻辑判定）、[`PathConflictParty`]（冲突当事方：
+//!   route / page）；
+//! - 运行期参数（route-dispatch）：[`ParamValue`]（`param-value` 闭集，与
+//!   `param-type` 一一对应，构造校验值域）、[`TypedParam`]（`typed-param`）；
+//! - app 声明（app-descriptor）：[`AssetPath`]（`asset-path`，入口资产路径）、
+//!   [`AppFeatures`]（`app-features` flags 闭集）、[`AppDeclaration`]
+//!   （`app-descriptor`，组装期冲突诊断）；
+//! - 声明期冲突诊断（app-descriptor-error 闭集）：[`WebDeclarationError`]
+//!   （route-id / page-id 重复、路径冲突、非法路径模板、参数不一致、非法
+//!   权限引用、非法默认页）。
+//!
 //! # 0.2.0 公开面（§40 Capability Composition 中的 domain 部分）
 //!
 //! - Capability Provider identity（§40.2）：[`ProviderId`]——"提供某能力的
@@ -108,6 +133,7 @@ mod state;
 mod time;
 mod upgrade;
 mod version;
+mod web;
 
 pub use config::{ConfigFormat, ConfigRevision, ConfigSchemaVersion, ConfigSnapshot, ConfigValue};
 pub use digest::ContentDigest;
@@ -133,3 +159,9 @@ pub use upgrade::{
     ConsumerUpgradeImpact, UpgradeCompatibilityReport, UpgradeImpact, UpgradeIncompatibility,
 };
 pub use version::ComponentVersion;
+pub use web::{
+    AppDeclaration, AppFeatures, AssetPath, HttpMethod, PageDeclaration, PageId, PagePath,
+    ParamType, ParamValue, PathConflict, PathConflictParty, PathSegment, PathTemplate,
+    PermissionDeclaration, PermissionName, RouteDeclaration, RouteId, RouteParam, TypedParam,
+    WebDeclarationError,
+};

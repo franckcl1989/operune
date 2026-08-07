@@ -100,6 +100,26 @@ pub enum ValueKind {
     EventTopic,
     /// [`EventPayload`](crate::EventPayload) 载荷（0.3.0 event bus，§41.2）。
     EventPayload,
+    /// [`PageId`](crate::PageId)（0.4.0 web application runtime，§42.2）。
+    PageId,
+    /// [`PagePath`](crate::PagePath)（0.4.0 web application runtime，§42.2）。
+    PagePath,
+    /// [`AssetPath`](crate::AssetPath)（0.4.0 web application runtime，§42.2）。
+    AssetPath,
+    /// [`RouteId`](crate::RouteId)（0.4.0 web application runtime，§42.2）。
+    RouteId,
+    /// [`HttpMethod`](crate::HttpMethod) 字符串解析（0.4.0 web application runtime，§42.2）。
+    HttpMethod,
+    /// [`ParamType`](crate::ParamType) 字符串解析（0.4.0 web application runtime，§42.2）。
+    ParamType,
+    /// [`RouteParam`](crate::RouteParam)（0.4.0 web application runtime，§42.2）。
+    RouteParam,
+    /// [`ParamValue`](crate::ParamValue)（0.4.0 web application runtime，§42.2）。
+    ParamValue,
+    /// [`TypedParam`](crate::TypedParam)（0.4.0 web application runtime，§42.2）。
+    TypedParam,
+    /// [`PermissionName`](crate::PermissionName)（0.4.0 web application runtime，§42.2）。
+    PermissionName,
 }
 
 impl fmt::Display for ValueKind {
@@ -130,6 +150,16 @@ impl fmt::Display for ValueKind {
             Self::TaskState => "task-state",
             Self::EventTopic => "event-topic",
             Self::EventPayload => "event-payload",
+            Self::PageId => "page-id",
+            Self::PagePath => "page-path",
+            Self::AssetPath => "asset-path",
+            Self::RouteId => "route-id",
+            Self::HttpMethod => "http-method",
+            Self::ParamType => "param-type",
+            Self::RouteParam => "route-param",
+            Self::ParamValue => "param-value",
+            Self::TypedParam => "typed-param",
+            Self::PermissionName => "permission-name",
         };
         f.write_str(s)
     }
