@@ -5,7 +5,56 @@ edition.workspace = true
 rust-version.workspace = true
 description = "Operune Core Runtime binary: the only composition root (spec 24.2)"
 
+# §23.2 版本策略：所有依赖从根 workspace.dependencies 继承，不写版本字面量。
+# §24.2：server = 唯一 binary composition root，只负责配置、构造和 wiring，
+# 依赖全部具体 adapter；业务规则禁止落入本 crate（§24.2 硬约束）。
 [dependencies]
+# 第一方 crate（§24.1 path 依赖）。
+operune-application = { path = "../application" }
+operune-domain = { path = "../domain" }
+operune-observability = { path = "../observability" }
+operune-platform = { path = "../platform" }
+operune-platform-windows = { path = "../platform-windows" }
+operune-security = { path = "../security" }
+operune-storage-sqlite = { path = "../storage-sqlite" }
+
+# §22.3 Async / Web：Axum 0.8.9（server 是唯一允许构造 HTTP listener 的
+# composition root；router 由 web-admin 装配，见 src/server.rs 装配点）。
+axum = { workspace = true }
+# tokio features 按真实需求最小化：
+#   rt-multi-thread / macros —— runtime 与 #[tokio::main]/#[tokio::test]；
+#   net —— TcpListener（§16.1 loopback listener）；
+#   signal —— Ctrl+C 优雅 shutdown（§15.3）；
+#   sync —— 第一方 CancellationToken（watch，§15.3）；
+#   io-util —— 测试 HTTP 探针的 AsyncReadExt；
+#   time —— 测试的超时/轮询（tokio::time）。
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "signal", "sync", "io-util", "time"] }
+
+# §22.4 Config：单个 TOML BootstrapConfig（§18.0）。toml 默认 features
+# （parse/display）即足够：本 crate 从 toml::Value 手写解析
+# （validate-on-construct，§13.3），不启用 serde derive（§22.4 基线）。
+toml = { workspace = true }
+
+# §22.7 CLI：clap 4.6.4；"cargo" feature 提供 crate_name!/crate_version!
+# 宏（--version/帮助头用 CARGO_PKG_VERSION，不硬编码版本字面量）。
+# "derive" 为成员级 feature 叠加（workspace 条目是裸版本、无
+# default-features = false，叠加合法）：CLI 命令面用 derive 宏定义
+# （§16.3 typed commands，见 src/cli.rs）。
+clap = { workspace = true, features = ["cargo", "derive"] }
+
+# §22.6 Security：secrecy 0.10.3——密码缓冲 drop 时清零（§16.6，
+# src/cli.rs read_password 的 SecretString 返回值）。
+secrecy = { workspace = true }
+
+# §14.1 封闭、可匹配的 typed error（thiserror 2.0.19）。
+thiserror = { workspace = true }
+
+# §22.7 结构化日志：tracing 事件面（audit target 与启动日志）。
+tracing = { workspace = true }
+
+# §22.8：tempfile 3.27.0 只用于隔离文件系统测试。
+[dev-dependencies]
+tempfile = { workspace = true }
 
 [lints]
 workspace = true
