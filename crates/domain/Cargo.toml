@@ -5,7 +5,21 @@ edition.workspace = true
 rust-version.workspace = true
 description = "Operune Core domain: pure domain types, state machines, invariants, compatibility rules (spec 24.2)"
 
+# §23.2 版本策略：所有依赖从根 workspace.dependencies 继承，不写版本字面量。
+# §24.2：domain 禁止 Wasmtime / Tokio / Axum / rusqlite。
+# §22.5/§22.6：thiserror（typed error）、uuid（持久 ID）、semver（版本兼容）、
+# sha2（ContentDigest）、serde（内部持久/配置边界序列化）。
 [dependencies]
+semver = { workspace = true }
+serde = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true, features = ["v4"] }
+
+# §22.8：proptest 只用于测试目标；serde_json 仅用于 serde 往返测试。
+[dev-dependencies]
+proptest = { workspace = true }
+serde_json = { workspace = true }
 
 [lints]
 workspace = true

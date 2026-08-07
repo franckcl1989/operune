@@ -1,0 +1,94 @@
+use std::fmt;
+
+use crate::lifecycle::{ComponentLifecycleEvent, ComponentLifecycleState};
+
+/// 领域层统一封闭错误（§14.1：使用 `thiserror` 定义封闭、可匹配的 typed error；
+/// 禁止 anyhow / eyre / `Box<dyn Error>` / String 作为公开错误类型，§22.9）。
+///
+/// 所有 Domain 操作的失败都落在本枚举中，调用方可以穷尽匹配。错误信息只包含
+/// 可诊断信息，不含任何机密（§16.6 secret 不进日志/错误）。
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum DomainError {
+    /// 值对象构造 / 边界解析失败（§13.3 边界解析一次、构造即校验）。
+    ///
+    /// `kind` 指明失败的值类别，`detail` 是原因描述。
+    #[error("invalid {kind}: {detail}")]
+    InvalidValue {
+        /// 校验失败的值类别。
+        kind: ValueKind,
+        /// 可诊断原因。
+        detail: String,
+    },
+
+    /// 非法生命周期转换（§12.2：非法转换返回 typed error，不能静默忽略）。
+    #[error("invalid lifecycle transition: {state} does not accept event {event}")]
+    InvalidTransition {
+        /// 转换前状态。
+        state: ComponentLifecycleState,
+        /// 被拒绝的事件。
+        event: ComponentLifecycleEvent,
+    },
+
+    /// checked / saturating 算术失败（§14.4：不得依赖整数回绕）。
+    #[error("arithmetic overflow during {operation}")]
+    Overflow {
+        /// 发生溢出的运算（静态字符串，用于日志）。
+        operation: &'static str,
+    },
+}
+
+impl DomainError {
+    /// 便捷构造 [`DomainError::InvalidValue`]（crate 内部使用）。
+    pub(crate) fn invalid_value(kind: ValueKind, detail: impl Into<String>) -> Self {
+        Self::InvalidValue {
+            kind,
+            detail: detail.into(),
+        }
+    }
+}
+
+/// 发生校验失败的值类别（§13.1 语义类型清单），用于匹配与日志。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValueKind {
+    /// [`ComponentId`](crate::ComponentId)。
+    ComponentId,
+    /// [`InstallationId`](crate::InstallationId)。
+    InstallationId,
+    /// [`CapabilityId`](crate::CapabilityId)。
+    CapabilityId,
+    /// [`ComponentVersion`](crate::ComponentVersion)。
+    ComponentVersion,
+    /// [`ContentDigest`](crate::ContentDigest)。
+    ContentDigest,
+    /// [`ByteSize`](crate::ByteSize)。
+    ByteSize,
+    /// [`Duration`](crate::Duration)。
+    Duration,
+    /// [`Deadline`](crate::Deadline)。
+    Deadline,
+    /// [`ArtifactPath`](crate::ArtifactPath)。
+    ArtifactPath,
+    /// [`ComponentLifecycleState`](crate::ComponentLifecycleState) 字符串解析。
+    LifecycleState,
+    /// [`ComponentLifecycleEvent`](crate::ComponentLifecycleEvent) 字符串解析。
+    LifecycleEvent,
+}
+
+impl fmt::Display for ValueKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            Self::ComponentId => "component-id",
+            Self::InstallationId => "installation-id",
+            Self::CapabilityId => "capability-id",
+            Self::ComponentVersion => "component-version",
+            Self::ContentDigest => "content-digest",
+            Self::ByteSize => "byte-size",
+            Self::Duration => "duration",
+            Self::Deadline => "deadline",
+            Self::ArtifactPath => "artifact-path",
+            Self::LifecycleState => "lifecycle-state",
+            Self::LifecycleEvent => "lifecycle-event",
+        };
+        f.write_str(s)
+    }
+}

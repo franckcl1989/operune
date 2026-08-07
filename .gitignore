@@ -12,3 +12,6 @@ Thumbs.db
 
 # Local runtime data (never commit host state)
 /data_root/
+
+# Claude Code session metadata (never commit)
+.claude/

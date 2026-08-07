@@ -60,8 +60,12 @@ unimplemented = "deny"
 # §22.2 Wasm Runtime：36.x LTS 线。36.0.13 为 2026-08-07 已发布的 36.x 最新 patch；
 # 三个 crate 必须保持同一 release line，禁止混搭（精确 patch 后续由 accepted
 # Cargo.lock / §23 Gate 决定；48 在 2026-08-20 发布并完成 promotion Gate 前不得使用）。
-wasmtime = "36.0.13"
-wasmtime-wasi = "36.0.13"
+# default-features = false：§22.2 要求 production feature set 最小化（不启用
+# gc/winch/pooling/watch/cache/profiling/threads/stack-switching 等），成员 crate
+# 按各自需求显式启用 feature；cargo 规则要求 workspace 声明 default-features 后
+# 成员才能覆盖。
+wasmtime = { version = "36.0.13", default-features = false }
+wasmtime-wasi = { version = "36.0.13", default-features = false }
 wasmtime-wasi-http = "36.0.13"
 
 # §22.3 Async / Web / TLS
@@ -70,7 +74,10 @@ tokio-util = "0.7.19"
 axum = "0.8.9"
 tower = "0.5.3"
 tower-http = "0.7.0"
-rustls = "0.23.42"
+# rustls：default-features = false（§22.6 注释）——crypto provider（aws-lc-rs/ring）
+# 由装配层显式选择并安装，不随默认 features 隐式引入；协议版本与 cipher suite
+# 使用 rustls 安全默认集（§16.2）。
+rustls = { version = "0.23.42", default-features = false }
 tokio-rustls = "0.26.4"
 askama = "0.16.0"
 
@@ -89,13 +96,17 @@ time = "0.3.54"
 arc-swap = "1.9.2"
 
 # §22.6 Security
-argon2 = "0.5.3"
+# default-features = false：§22.6 要求 base64 不启用默认 simd-unsafe（只启用所需
+# std），argon2 不启用默认 rand（盐由 getrandom 生成），rustls 的 crypto provider
+# 由装配层（web-admin）显式选择；cargo 规则要求 workspace 声明 default-features
+# 后成员才能覆盖。
+argon2 = { version = "0.5.3", default-features = false }
 secrecy = "0.10.3"
 zeroize = "1.9.0"
 getrandom = "0.4.3"
 sha2 = "0.11.0"
 subtle = "2.6.1"
-base64 = "0.23.0"
+base64 = { version = "0.23.0", default-features = false }
 cookie = "0.18.1"
 
 # §22.7 CLI / Observability
