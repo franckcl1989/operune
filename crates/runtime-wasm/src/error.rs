@@ -129,6 +129,9 @@ pub enum RuntimeError {
     /// WASI adapter 拒绝 Store 构建（fail closed，§7.6）。
     #[error("WASI adapter rejected store setup: {0}")]
     Wasi(#[from] crate::wasi::WasiError),
+    /// 0.2.0 组件间链接失败（§40.2 c2c linking；见 [`crate::linked::LinkError`]）。
+    #[error("component-to-component link failed: {0}")]
+    Link(#[from] crate::linked::LinkError),
     /// runtime-wasm 内部不变量被破坏（视为系统故障，fail-stop 语义）。
     #[error("runtime-wasm internal invariant violated: {0}")]
     Internal(&'static str),

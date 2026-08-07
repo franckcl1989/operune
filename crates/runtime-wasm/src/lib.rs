@@ -32,6 +32,13 @@
 //!   独占）、有界 dispatch（`try_dispatch` 非阻塞拒绝 / `dispatch` 有界排队）。
 //!   0.1.0 stateless contract：不承诺跨调用 instance affinity，调用者不得把
 //!   linear memory 或实例本地变量当作下一次调用仍存在的事实。
+//! - **0.2.0 组件链接（§40.2）**：[`linked::LinkedComponentSet`] 是
+//!   Component-to-Component 链接集合：provider 成员与 consumer 成员按激活
+//!   顺序（拓扑序）实例化进同一 Store，consumer 的 imports 由 provider
+//!   实例的 exports 经宿主桥接满足（wasmtime 36.0.13 无“已实例化组件
+//!   exports 注册进 Linker”的宿主 API——机制研究与桥接设计见模块文档）。
+//!   资源治理（§7.3/§7.4）与 epoch deadline（§7.5）对集合整体保持；每个
+//!   集合是单一执行上下文。
 //!
 //! # 分层（§8.2/§24.2）
 //!
@@ -62,6 +69,7 @@ pub mod engine;
 pub mod error;
 pub mod instance;
 pub mod limiter;
+pub mod linked;
 pub mod store;
 pub mod wasi;
 
@@ -77,5 +85,8 @@ pub use component::ComponentHandle;
 pub use engine::{EngineConfig, EngineHandle, EpochTicker};
 pub use error::{ResourceLimitKind, RuntimeError, TrapKind, WasmFailure, classify_wasm_error};
 pub use instance::{DispatchError, InstanceLease, InstanceSet};
+pub use linked::{
+    HostLinkHook, LinkError, LinkName, LinkSpec, LinkedComponentSet, LinkedSetSpec, MemberSpec,
+};
 pub use store::{StoreFactory, StoreHandle, StoreHostState};
 pub use wasi::{WasiAdapter, WasiError, WasiP2HostState, WasiPolicy, WasiVersion};
