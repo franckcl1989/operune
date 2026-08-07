@@ -3,9 +3,32 @@ name = "operune-runtime-wasi-p2"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-description = "Operune WASI 0.2 linker/context/binding adapter (spec 24.2)"
+description = "Operune WASI 0.2 linker/context/binding adapter (spec 8.2 / 24.2); p2-side replacement point for WASI version isolation"
 
 [dependencies]
+# §22.2 Wasmtime 36.x LTS production line（与 runtime-wasm 同 release line，禁止混搭）。
+# 根 workspace.dependencies 已声明 default-features = false（§22.2 feature
+# 最小化：不启用 gc/winch/pooling/watch/cache/profiling/threads/stack-switching
+# 等），此处只显式启用本 crate 真实需要的 features：
+# - "component-model"：wasmtime::component::Linker / ResourceTable；
+# - "std"：本 crate 的 wasmtime 使用面基于 std。
+wasmtime = { workspace = true, features = ["component-model", "std"] }
+# §22.2 wasmtime-wasi 36.x LTS；production 仅 p2。
+# 继承根条目 default-features = false：上游默认的 "preview1"（wiggle 遗留
+# preview1 linker，p2 components 不需要）不启用；"p3" feature 绝不启用
+#（§4.2 MUST NOT：p3 experimental/unstable 不得进入 production dependency
+# closure）。本 crate 源码因此不存在任何 wasmtime_wasi::p3 引用——p3 模块在
+# 该 feature 关闭时不存在。
+wasmtime-wasi = { workspace = true }
+# §14.1 typed error 契约。
+thiserror = { workspace = true }
+
+[dev-dependencies]
+# 单元测试需要本地 JIT 后端（Engine::default()）；cranelift 为 §22.2 规定的
+# production 编译后端（Cranelift），feature 只出现在 dev 目标，lib 不启用。
+wasmtime = { workspace = true, features = ["cranelift"] }
+# §22.8 test/dev-only：preopen 集成测试需要真实隔离目录。
+tempfile = { workspace = true }
 
 [lints]
 workspace = true
