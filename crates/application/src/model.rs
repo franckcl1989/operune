@@ -203,15 +203,102 @@ impl ContractSurface {
             .any(|name| name == "descriptor" || name == "operune:component/descriptor@0.1.0")
     }
 
-    /// 是否导出 `operune:web/assets`（§21.3 static assets）。
+    /// 是否导出 `operune:web/assets`（§21.3 static assets；0.1 表面，
+    /// 仅短名形态）。
     pub fn exports_web_assets(&self) -> bool {
         self.exports.iter().any(|name| name == "assets")
     }
 
-    /// 是否导出 `operune:web/actions`（§21.3 bounded backend action）。
+    /// 是否导出 `operune:web/actions`（§21.3 bounded backend action；0.1
+    /// 表面，仅短名形态）。
     pub fn exports_web_actions(&self) -> bool {
         self.exports.iter().any(|name| name == "actions")
     }
+
+    /// 0.4.0（§42.2）：是否导出 `operune:web@0.2.0` 的 `assets` 表面
+    ///（同一语义角色 0.2.0 版本内全量定义，语义继承 0.1；两种 world 写法
+    /// 都接受，§6.7 实例名不是身份事实源）。
+    pub fn exports_web_assets_any(&self) -> bool {
+        self.exports.iter().any(|name| {
+            matches!(
+                name.as_str(),
+                "assets" | "operune:web/assets@0.2.0" | "operune:web/assets@0.1.0"
+            )
+        })
+    }
+
+    /// 0.4.0（§42.2）：是否导出 `operune:web@0.2.0` 的 `actions` 表面。
+    pub fn exports_web_actions_any(&self) -> bool {
+        self.exports.iter().any(|name| {
+            matches!(
+                name.as_str(),
+                "actions" | "operune:web/actions@0.2.0" | "operune:web/actions@0.1.0"
+            )
+        })
+    }
+
+    /// 0.4.0（§42.2）：是否导出 `app-descriptor` 接口（`get-app-descriptor`
+    /// 声明入口）。
+    pub fn exports_web_app_descriptor(&self) -> bool {
+        self.exports
+            .iter()
+            .any(|name| name == "app-descriptor" || name == "operune:web/app-descriptor@0.2.0")
+    }
+
+    /// 0.4.0（§42.2）：是否导出 `route-dispatch` 接口（typed route 的
+    /// 运行期分发入口）。
+    pub fn exports_web_route_dispatch(&self) -> bool {
+        self.exports
+            .iter()
+            .any(|name| name == "route-dispatch" || name == "operune:web/route-dispatch@0.2.0")
+    }
+
+    /// 0.4.0（§42.2）：是否导出 `navigation` 接口（页面声明面）。
+    pub fn exports_web_navigation(&self) -> bool {
+        self.exports
+            .iter()
+            .any(|name| name == "navigation" || name == "operune:web/navigation@0.2.0")
+    }
+
+    /// 0.4.0（§42.2）：是否导出 `routes` 接口（typed route 声明面）。
+    pub fn exports_web_routes(&self) -> bool {
+        self.exports
+            .iter()
+            .any(|name| name == "routes" || name == "operune:web/routes@0.2.0")
+    }
+
+    /// 0.4.0（§42.2）：是否导出 `permissions` 接口（权限声明面）。
+    pub fn exports_web_permissions(&self) -> bool {
+        self.exports
+            .iter()
+            .any(|name| name == "permissions" || name == "operune:web/permissions@0.2.0")
+    }
+
+    /// 0.1 → 0.2 surface 分发（§42.2）：确定性优先 0.2.0、回退 0.1.0。
+    ///
+    /// 判定只依赖二进制可观察的 contract surface（§6.7），不依赖 root
+    /// world 名称。`0.2.0` 表面的标志性导出是 `app-descriptor` /
+    /// `route-dispatch`（0.2.0 独有接口）；`assets` / `actions` 是两个版本
+    /// 共有的语义角色（同一桥接实现，0.2.0 版本内全量定义，§42.2 明文
+    /// "不是第二套 bridge"）。
+    pub fn web_surface(&self) -> WebSurfaceKind {
+        if self.exports_web_app_descriptor() || self.exports_web_route_dispatch() {
+            WebSurfaceKind::V020
+        } else {
+            WebSurfaceKind::V010
+        }
+    }
+}
+
+/// 0.1 → 0.2 surface 分发的结果（§42.2：Core 按可观察 contract surface
+/// 分发；确定性优先 0.2.0、回退 0.1.0）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WebSurfaceKind {
+    /// 组件呈现 0.2.0 表面（导出 app-descriptor / route-dispatch 等）。
+    V020,
+    /// 组件只呈现 0.1.0 表面（0.1 契约永久受支持，无 flag-day，§8.4
+    /// 精神；按 0.1.0 语义服务）。
+    V010,
 }
 
 /// import 名的规范化分类（§19.5 / §17.2 deny-by-default 的 Resolution 面）。

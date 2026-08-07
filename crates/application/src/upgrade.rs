@@ -96,6 +96,17 @@ impl UpgradeService {
         self.install.set_state(state)
     }
 
+    /// 接线 0.4.0 Web Application Runtime（§42.2）：升级 / 回滚激活期
+    /// 校验 app descriptor（冲突诊断 + 二进制表面交叉校验）并随 Active
+    /// 快照原子切换（[`InstallService::set_web_app`]）。与 install 侧同一
+    /// 接线事实；composition root 在启动装配期调用一次。
+    pub fn set_web_app(
+        &self,
+        web_app: Arc<crate::web_app::WebAppService>,
+    ) -> Result<(), ApplicationError> {
+        self.install.set_web_app(web_app)
+    }
+
     /// 热升级（§20.1）：v1 保持可用直到 v2 验证通过并原子切换。
     pub fn upgrade(&self, request: UpgradeRequest) -> Result<UpgradeOutcome, ApplicationError> {
         let current = self.require_active(request.installation)?;

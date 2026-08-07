@@ -250,6 +250,29 @@ const _: &str = wasmtime::component::bindgen!({
     stringify: true,
 });
 
+// 编译期验证 `operune:web@0.2.0` 的参考 world（§42.2 / §6.6）：0.4.0
+// Web Application Runtime 全契约面（app-descriptor / navigation / routes /
+// permissions / assets / actions / route-dispatch；0.1→0.2 兼容策略与
+// §42.3 边界见 web@0.2.0 包内注释）。
+//
+// 实测注（2026-08-08）：bindgen 的 world 选择串不支持带 package 版本
+// 的形态（`operune:web@0.2.0/operune-web-application` → "expected `/`,
+// found `@`"，wit-parser 0.236.1 的 world specifier 解析）——本 resolve
+// 只含一个 `operune:web` package（0.2.0），无版本形态
+// `operune:web/operune-web-application` 唯一解析。package 目录名含 "@"
+//（版本化 package 目录，wit 解析以目录为 package 根）。若 WIT 解析 /
+// world 选择 / 代码生成失败，此处产生编译错误（含具体错误文本），即
+// 0.4.0 契约的权威验证点（§22.2；错误指向 WIT 文件本身 = 主 agent 的
+// WIT 修复项，错误原文须完整复制到任务报告）。
+const _: &str = wasmtime::component::bindgen!({
+    path: [
+        "../../wit/operune/component",
+        "../../wit/operune/web@0.2.0",
+    ],
+    world: "operune:web/operune-web-application",
+    stringify: true,
+});
+
 // —— WIT 文件内容依赖跟踪（stringify 形态下 bindgen 不自动跟踪；
 //    路径相对本文件 crates/application/src/ → 仓库根 wit/）——
 #[allow(clippy::items_after_statements)]
@@ -259,6 +282,16 @@ const _: &str = include_str!("../../../wit/operune/web/descriptor.wit");
 const _: &str = include_str!("../../../wit/operune/web/assets.wit");
 const _: &str = include_str!("../../../wit/operune/web/actions.wit");
 const _: &str = include_str!("../../../wit/operune/web/world.wit");
+// 0.4.0（§42.2）：operune:web@0.2.0 包全部契约文件（依赖跟踪；bindgen
+// 的编译期解析覆盖语法）。
+const _: &str = include_str!("../../../wit/operune/web@0.2.0/app-descriptor.wit");
+const _: &str = include_str!("../../../wit/operune/web@0.2.0/navigation.wit");
+const _: &str = include_str!("../../../wit/operune/web@0.2.0/routes.wit");
+const _: &str = include_str!("../../../wit/operune/web@0.2.0/permissions.wit");
+const _: &str = include_str!("../../../wit/operune/web@0.2.0/assets.wit");
+const _: &str = include_str!("../../../wit/operune/web@0.2.0/actions.wit");
+const _: &str = include_str!("../../../wit/operune/web@0.2.0/route-dispatch.wit");
+const _: &str = include_str!("../../../wit/operune/web@0.2.0/world.wit");
 // 0.3.0 state/config/secret 三包（§41.2；契约已提交稳定）。
 const _: &str = include_str!("../../../wit/operune/state/declaration.wit");
 const _: &str = include_str!("../../../wit/operune/state/migration.wit");
@@ -308,6 +341,19 @@ mod tests {
             include_str!("../../../wit/operune/web/assets.wit"),
             include_str!("../../../wit/operune/web/actions.wit"),
         ];
+        // 0.4.0（§42.2）：operune:web@0.2.0 包（同一 package 名的新版本
+        // 目录；裁决二规则同样适用——只有主契约文件 app-descriptor.wit 在
+        // package 声明前带注释）。
+        let web_020_files = [
+            include_str!("../../../wit/operune/web@0.2.0/app-descriptor.wit"),
+            include_str!("../../../wit/operune/web@0.2.0/navigation.wit"),
+            include_str!("../../../wit/operune/web@0.2.0/routes.wit"),
+            include_str!("../../../wit/operune/web@0.2.0/permissions.wit"),
+            include_str!("../../../wit/operune/web@0.2.0/assets.wit"),
+            include_str!("../../../wit/operune/web@0.2.0/actions.wit"),
+            include_str!("../../../wit/operune/web@0.2.0/route-dispatch.wit"),
+            include_str!("../../../wit/operune/web@0.2.0/world.wit"),
+        ];
         // 0.3.0 state/config/secret/scheduler/event 五包（§41.2）。
         let state_files = [
             include_str!("../../../wit/operune/state/state.wit"),
@@ -341,6 +387,7 @@ mod tests {
         for files in [
             component_files.as_slice(),
             web_files.as_slice(),
+            web_020_files.as_slice(),
             state_files.as_slice(),
             config_files.as_slice(),
             secret_files.as_slice(),
@@ -375,5 +422,12 @@ mod tests {
         assert!(scheduler_world.contains("operune-scheduler-component"));
         let event_world = include_str!("../../../wit/operune/event/world.wit");
         assert!(event_world.contains("operune-event-component"));
+        // 0.4.0（§42.2）：operune:web@0.2.0 包契约文本存在性。
+        let app_descriptor = include_str!("../../../wit/operune/web@0.2.0/app-descriptor.wit");
+        assert!(app_descriptor.contains("get-app-descriptor"));
+        let route_dispatch = include_str!("../../../wit/operune/web@0.2.0/route-dispatch.wit");
+        assert!(route_dispatch.contains("handle-route"));
+        let web_020_world = include_str!("../../../wit/operune/web@0.2.0/world.wit");
+        assert!(web_020_world.contains("operune-web-application"));
     }
 }

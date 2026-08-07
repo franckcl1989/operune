@@ -40,8 +40,9 @@
 use std::sync::{Arc, OnceLock};
 
 use operune_domain::{
-    ByteSize, CapabilityId, ComponentId, ComponentLifecycleEvent, ComponentLifecycleState,
-    ComponentVersion, ContentDigest, InstallationId, StateSchemaVersion, StateTransactionId,
+    AppDeclaration, ByteSize, CapabilityId, ComponentId, ComponentLifecycleEvent,
+    ComponentLifecycleState, ComponentVersion, ContentDigest, InstallationId, StateSchemaVersion,
+    StateTransactionId,
 };
 use operune_runtime_wasi_p2::capability::{
     EnvVarSpec, FsPerms, GuestPath, PreopenDirSpec, WasiCapabilities,
@@ -63,6 +64,7 @@ use crate::ports::{
 };
 use crate::runtime::{ActiveRuntime, CompiledWasm, RuntimePlan, WasmRuntime};
 use crate::web::AssetCache;
+use crate::web_app::{WebAppContext, WebAppService};
 
 /// 展示性文本上限（§19.3 宿主侧体积上限；对齐 descriptor 契约的
 /// display-name 语义）。
@@ -137,6 +139,20 @@ impl InstallService {
             .state
             .set(state)
             .map_err(|_| ApplicationError::Internal("state wiring is already wired"))
+    }
+
+    /// 接线 0.4.0 Web Application Runtime（§42.2）：激活期读取
+    /// `get-app-descriptor`、组装 AppDeclaration、执行声明期冲突诊断与
+    /// 二进制表面交叉校验（失败 = candidate Failed 保持 quarantine）；
+    /// 激活后 WebAppContext（app descriptor + typed route registry）随
+    /// Active 快照原子切换（§21.5）。composition root 在启动装配期调用
+    /// 一次；重复接线 → typed 拒绝（§12.4 无全局可变状态，wiring 是一次性
+    /// 事实）。未接线（默认）= 0.1.0 语义：管线不读取 app-descriptor。
+    pub fn set_web_app(&self, web_app: Arc<WebAppService>) -> Result<(), ApplicationError> {
+        self.pipeline
+            .web_app
+            .set(web_app)
+            .map_err(|_| ApplicationError::Internal("web app service is already wired"))
     }
 
     /// 两阶段安装（§19.2）：成功返回激活结果；失败返回 typed error，
@@ -234,6 +250,10 @@ pub(crate) struct Pipeline {
     /// 不读取 state-declaration、不触发迁移）。`OnceLock`：composition
     /// root 装配期一次性设置，运行期只读。
     state: OnceLock<Arc<StateWiring>>,
+    /// 0.4.0 Web Application Runtime 接线（§42.2；`None` = 0.1.0 语义：
+    /// 管线不读取 app-descriptor、不执行声明期冲突诊断）。`OnceLock`：
+    /// composition root 装配期一次性设置，运行期只读。
+    web_app: OnceLock<Arc<WebAppService>>,
 }
 
 impl Pipeline {
@@ -256,6 +276,7 @@ impl Pipeline {
             assets,
             composition: OnceLock::new(),
             state: OnceLock::new(),
+            web_app: OnceLock::new(),
         }
     }
 
@@ -648,6 +669,13 @@ impl Pipeline {
         self.validate_manifest(&manifest, &surface, &config, digest, installation_id)?;
         let cached = self.cache_assets(digest, &active, &manifest, &config, installation_id)?;
 
+        // —— 0.4.0 Web Application Runtime（§42.2）：app-descriptor 激活期
+        // 校验（get-app-descriptor → AppDeclaration 组装 → 冲突诊断 →
+        // 二进制表面交叉校验）。任何失败 = candidate Failed（quarantine），
+        // 当前 Active 不受污染（§19.2）。
+        let web_app_declaration =
+            self.run_web_app_phase(digest, installation_id, &component, &surface)?;
+
         // 授权落盘（§17.5 显式批准 / 复用验证通过；fail-closed 审计先行）。
         if matches!(request.grants, GrantApproval::Explicit(_)) {
             self.audit_ok(AuditEvent::GrantsApproved {
@@ -668,6 +696,7 @@ impl Pipeline {
                 active,
                 manifest,
                 cached,
+                web_app_declaration,
                 &surface,
             ),
             PipelineTarget::Upgrade { current } => self.activate_upgrade(
@@ -686,6 +715,7 @@ impl Pipeline {
                 active,
                 manifest,
                 cached,
+                web_app_declaration,
                 &config,
                 &surface,
             ),
@@ -705,6 +735,7 @@ impl Pipeline {
                 active,
                 manifest,
                 cached,
+                web_app_declaration,
                 &config,
                 &surface,
             ),
@@ -1044,6 +1075,88 @@ impl Pipeline {
         Ok(cached)
     }
 
+    /// 0.4.0 Web Application Runtime 激活期阶段（§42.2）：读取
+    /// `get-app-descriptor` → [`WebAppService::build_app_declaration`]（
+    /// 组装 + 声明期冲突诊断）→ [`WebAppService::validate_contract_surface`]
+    /// （features flag 与二进制 exports 交叉校验）。
+    ///
+    /// - 未接线（composition root 未注入 [`WebAppService`]）= 0.1.0 语义：
+    ///   不读取 app-descriptor（返回 `None`）；
+    /// - 组件无 app-descriptor 导出 = 0.1-only surface（`Ok(None)`，0.1
+    ///   语义保持，无 flag-day，§8.4 精神）；
+    /// - 声明读取遵循 §19.3 descriptor 阶段精神（app-descriptor.wit 明文：
+    ///   side-effect-free、可重复）：同一 digest 同一 contract version 重复
+    ///   调用比对 canonical 结果，不一致 = contract violation；
+    /// - 全部失败路径 → candidate Failed（quarantine），当前 Active 不受
+    ///   污染（§19.2）。
+    fn run_web_app_phase(
+        &self,
+        digest: ContentDigest,
+        installation_id: InstallationId,
+        component: &Arc<dyn CompiledWasm>,
+        surface: &ContractSurface,
+    ) -> Result<Option<AppDeclaration>, ApplicationError> {
+        let Some(service) = self.web_app.get() else {
+            return Ok(None);
+        };
+        let guest = self
+            .runtime
+            .read_app_descriptor(component)
+            .map_err(|error| {
+                self.fail_activating(
+                    digest,
+                    installation_id,
+                    "app-descriptor",
+                    ApplicationError::Runtime(error),
+                )
+            })?;
+        let Some(guest) = guest else {
+            // 组件不导出 app-descriptor = 0.1-only surface。
+            return Ok(None);
+        };
+        // §19.3：同一 digest 重复调用比对 canonical 结果。
+        let second = self
+            .runtime
+            .read_app_descriptor(component)
+            .map_err(|error| {
+                self.fail_activating(
+                    digest,
+                    installation_id,
+                    "app-descriptor",
+                    ApplicationError::Runtime(error),
+                )
+            })?;
+        if second.as_ref() != Some(&guest) {
+            return Err(self.fail_activating(
+                digest,
+                installation_id,
+                "app-descriptor",
+                ApplicationError::DescriptorViolation(
+                    "app descriptor result is not deterministic (contract violation, §19.3)",
+                ),
+            ));
+        }
+        let declaration = service.build_app_declaration(&guest).map_err(|failure| {
+            self.fail_activating(
+                digest,
+                installation_id,
+                "app-descriptor",
+                ApplicationError::WebAppDescriptor { source: failure },
+            )
+        })?;
+        service
+            .validate_contract_surface(&declaration, surface)
+            .map_err(|failure| {
+                self.fail_activating(
+                    digest,
+                    installation_id,
+                    "app-descriptor",
+                    ApplicationError::WebAppDescriptor { source: failure },
+                )
+            })?;
+        Ok(Some(declaration))
+    }
+
     /// 全新安装的原子激活（§19.2 末步）。
     /// 参数较多（身份 + 运行时 + 清单 + 审计计数），以显式实参保持管线
     /// 步骤的可见性（局部 allow 有原因注释，§26.1）。
@@ -1057,6 +1170,7 @@ impl Pipeline {
         active: Arc<dyn ActiveRuntime>,
         manifest: Option<WebManifestData>,
         cached: u64,
+        web_app_declaration: Option<AppDeclaration>,
         surface: &ContractSurface,
     ) -> Result<PipelineResult, ApplicationError> {
         // 0.2.0：graph records 提交 + 快照原子切换（§40.2）。在任何
@@ -1102,6 +1216,8 @@ impl Pipeline {
                 },
                 runtime: active,
                 manifest,
+                web_app: web_app_declaration
+                    .map(|declaration| Arc::new(WebAppContext::new(declaration))),
             }),
         )?;
         Ok(PipelineResult::Activated {
@@ -1125,6 +1241,7 @@ impl Pipeline {
         active: Arc<dyn ActiveRuntime>,
         manifest: Option<WebManifestData>,
         cached: u64,
+        web_app_declaration: Option<AppDeclaration>,
         config: &RuntimeConfig,
         surface: &ContractSurface,
     ) -> Result<PipelineResult, ApplicationError> {
@@ -1177,7 +1294,8 @@ impl Pipeline {
         self.transition_candidate(digest, ComponentLifecycleEvent::ReadinessSucceeded)?;
 
         // §20.3：原子快照交换——单指针交换，新请求 → 新版本（§21.5：
-        // UI assets 与 backend exports 随同一 ComponentVersion 原子切换）。
+        // UI assets、app descriptor 与 backend exports 随同一
+        // ComponentVersion 原子切换）。
         self.active.swap(
             installation_id,
             Arc::new(ActiveEntry {
@@ -1189,6 +1307,8 @@ impl Pipeline {
                 },
                 runtime: active,
                 manifest,
+                web_app: web_app_declaration
+                    .map(|declaration| Arc::new(WebAppContext::new(declaration))),
             }),
         )?;
 

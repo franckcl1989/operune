@@ -71,11 +71,13 @@ use operune_runtime_wasm::{
 use wasmtime::component::{ComponentExportIndex, Func, Instance, InstancePre, Linker, Val};
 
 use crate::contract::{
-    ContractValueError, GuestActionError, GuestActionRequest, GuestAssetMetadata,
-    GuestComponentDescriptor, GuestDescriptorError, GuestStateDeclaration,
-    GuestStateDeclarationError, GuestWebDescriptor, build_action_request_val,
-    parse_action_result_val, parse_asset_list_val, parse_component_descriptor_val,
-    parse_state_declaration_val, parse_web_descriptor_val,
+    ContractValueError, GuestActionError, GuestActionRequest, GuestAppDescriptor,
+    GuestAssetMetadata, GuestComponentDescriptor, GuestDescriptorError, GuestRouteError,
+    GuestRouteRequest, GuestStateDeclaration, GuestStateDeclarationError, GuestWebDescriptor,
+    build_action_request_val, build_route_request_val, parse_action_result_val,
+    parse_app_descriptor_error_val, parse_app_descriptor_val, parse_asset_list_val,
+    parse_component_descriptor_val, parse_route_result_val, parse_state_declaration_val,
+    parse_web_descriptor_val,
 };
 use crate::error::{ErrorSource, RuntimeExecutionError};
 use crate::event::DeliveredEvent;
@@ -132,6 +134,12 @@ pub trait ActiveRuntime: Send + Sync {
     fn invoke_action(&self, request: &GuestActionRequest)
     -> Result<Vec<u8>, RuntimeExecutionError>;
 
+    /// 0.4.0（§42.2）：处理一次 typed route 调用（同步、有界；无流 /
+    /// 长连接，route-dispatch.wit）。Core 在分发前已完成路由表解析、
+    /// 权限 / 参数 / body / quota 检查；本调用只做 guest 动态调用 +
+    /// deadline / 响应上限强制。
+    fn invoke_route(&self, request: &GuestRouteRequest) -> Result<Vec<u8>, RuntimeExecutionError>;
+
     /// drain（§20.4）：不接新工作；已接受工作允许在有界 deadline 内完成；
     /// deadline 到期后释放 Store 与 Host 资源。`self` 按值消费（drop 即释放）。
     fn drain(self: Arc<Self>, deadline: Duration) -> Result<(), RuntimeExecutionError>;
@@ -182,6 +190,24 @@ pub trait WasmRuntime: Send + Sync {
         &self,
         _component: &Arc<dyn CompiledWasm>,
     ) -> Result<Option<GuestStateDeclaration>, RuntimeExecutionError> {
+        Ok(None)
+    }
+
+    /// 0.4.0（§42.2）：在 descriptor-only Store（§19.3 精神，与
+    /// `read_descriptor` / `read_state_declaration` 同模式）中读取一次
+    /// `operune:web@0.2.0` `app-descriptor` 的 `get-app-descriptor`。
+    ///
+    /// 组件不导出 app-descriptor 接口 = 0.1-only surface（`Ok(None)`，
+    /// 0.1 语义保持，无 flag-day，§8.4 精神）。编排层按 §19.3 惯例对同一
+    /// digest 重复调用并比对 canonical 结果（不一致 = contract violation，
+    /// candidate 保持 quarantine/failed）。
+    ///
+    /// 默认实现返回 `Ok(None)`（同 [`Self::read_state_declaration`] 的
+    /// 桩语义）；生产与 fake 实现按语义覆写。
+    fn read_app_descriptor(
+        &self,
+        _component: &Arc<dyn CompiledWasm>,
+    ) -> Result<Option<GuestAppDescriptor>, RuntimeExecutionError> {
         Ok(None)
     }
 
@@ -259,6 +285,25 @@ struct WasmtimeActiveRuntime {
     in_flight: AtomicUsize,
 }
 
+/// 0.1 → 0.2 surface 分发的接口名优先顺序（§42.2：确定性优先 0.2.0、
+/// 回退 0.1.0——同一语义角色同时出现两个版本表面时按此顺序解析；
+/// 0.2.0 `assets` / `actions` 是版本内全量定义，语义继承 0.1，共用同一
+/// 桥接实现，不是第二套 bridge，§42.2 明文）。
+const APP_DESCRIPTOR_INTERFACE_NAMES: &[&str] =
+    &["app-descriptor", "operune:web/app-descriptor@0.2.0"];
+const ROUTE_DISPATCH_INTERFACE_NAMES: &[&str] =
+    &["route-dispatch", "operune:web/route-dispatch@0.2.0"];
+const ASSETS_INTERFACE_NAMES: &[&str] = &[
+    "assets",
+    "operune:web/assets@0.2.0",
+    "operune:web/assets@0.1.0",
+];
+const ACTIONS_INTERFACE_NAMES: &[&str] = &[
+    "actions",
+    "operune:web/actions@0.2.0",
+    "operune:web/actions@0.1.0",
+];
+
 /// 每槽位已解析的导出函数（绑定与槽位 Store 同生命周期；`Func` 自身
 /// 携带其所属 Instance 的索引，无需单独保存 Instance 句柄）。
 #[derive(Clone)]
@@ -266,6 +311,10 @@ struct SlotBindings {
     web_descriptor: Option<Func>,
     assets: Option<Func>,
     actions: Option<Func>,
+    /// 0.4.0（§42.2）：route-dispatch 导出（`operune:web@0.2.0`
+    /// `route-dispatch` 的 `handle-route`，guest export——typed route 的
+    /// 运行期分发入口；0.2.0 独有表面）。
+    route_dispatch: Option<Func>,
     /// 0.3.0（§41.2）：scheduler handler 导出（`operune:scheduler/handler`
     /// 的 `on-trigger`，guest export——Core 在 fire 时刻同步调用）。
     scheduler_handler: Option<Func>,
@@ -542,6 +591,60 @@ impl WasmRuntime for WasmtimeRuntime {
         }
     }
 
+    fn read_app_descriptor(
+        &self,
+        component: &Arc<dyn CompiledWasm>,
+    ) -> Result<Option<GuestAppDescriptor>, RuntimeExecutionError> {
+        let real = self.real_component(component.as_ref())?;
+        let config = self.config_snapshot()?;
+        // §19.3 精神（app-descriptor.wit 明文：side-effect-free、bounded、
+        // 可重复）：descriptor-only Store + 独立 deadline / 预算读取。
+        let mut store = StoreFactory::new(&self.engine)
+            .new_store(&config.descriptor_budget)
+            .map_err(RuntimeExecutionError::Runtime)?;
+        let instance = self.instantiate_descriptor_store(
+            real.inner.component(),
+            &mut store,
+            config.descriptor_deadline,
+        )?;
+        // 0.1 → 0.2 surface 分发（§42.2）：app-descriptor 是 0.2.0 独有
+        // 表面；无该导出 = 0.1-only 组件（0.1 语义保持）。
+        let Some(func) = Self::optional_interface_func(
+            &mut store,
+            &instance,
+            APP_DESCRIPTOR_INTERFACE_NAMES,
+            "get-app-descriptor",
+        )?
+        else {
+            return Ok(None);
+        };
+        prepare_store_call(&mut store, config.descriptor_deadline)?;
+        let mut results = [Val::Result(Ok(None))];
+        func.call(store.store_mut(), &[], &mut results)
+            .map_err(|error| {
+                RuntimeExecutionError::from_classified(&mut store, ErrorSource::from(error))
+            })?;
+        func.post_return(store.store_mut()).map_err(|error| {
+            RuntimeExecutionError::from_classified(&mut store, ErrorSource::from(error))
+        })?;
+        match &results[0] {
+            Val::Result(Ok(_)) => parse_app_descriptor_val(&results[0])
+                .map(Some)
+                .map_err(RuntimeExecutionError::MalformedGuestData),
+            Val::Result(Err(_)) => {
+                let guest_error = parse_app_descriptor_error_val(&results[0])
+                    .map_err(RuntimeExecutionError::MalformedGuestData)?;
+                Err(RuntimeExecutionError::GuestAppDescriptorError(guest_error))
+            }
+            _ => Err(RuntimeExecutionError::MalformedGuestData(
+                ContractValueError::ShapeMismatch {
+                    field: "get-app-descriptor",
+                    expected: "result",
+                },
+            )),
+        }
+    }
+
     fn prepare(
         &self,
         component: &Arc<dyn CompiledWasm>,
@@ -630,10 +733,28 @@ impl WasmRuntime for WasmtimeRuntime {
                     &["descriptor"],
                     "get-web-descriptor",
                 )?;
-                let assets =
-                    Self::optional_interface_func(store, &instance, &["assets"], "list-assets")?;
-                let actions =
-                    Self::optional_interface_func(store, &instance, &["actions"], "handle-action")?;
+                // 0.1 → 0.2 surface 分发（§42.2）：同一语义角色的接口名按
+                // 确定性优先 0.2.0、回退 0.1.0 顺序解析（0.2.0 全量定义，
+                // 共用同一桥接实现）。
+                let assets = Self::optional_interface_func(
+                    store,
+                    &instance,
+                    ASSETS_INTERFACE_NAMES,
+                    "list-assets",
+                )?;
+                let actions = Self::optional_interface_func(
+                    store,
+                    &instance,
+                    ACTIONS_INTERFACE_NAMES,
+                    "handle-action",
+                )?;
+                // 0.4.0（§42.2）：typed route 分发入口（0.2.0 独有表面）。
+                let route_dispatch = Self::optional_interface_func(
+                    store,
+                    &instance,
+                    ROUTE_DISPATCH_INTERFACE_NAMES,
+                    "handle-route",
+                )?;
                 // 0.3.0（§41.2）：scheduler/event handler 导出（可选接口——
                 // 无 handler 导出的组件在交付时以观测错误表达，不阻碍激活）。
                 // 接口名接受两种 world 写法（§6.7 实例名不是身份事实源）：
@@ -659,6 +780,7 @@ impl WasmRuntime for WasmtimeRuntime {
                     web_descriptor,
                     assets,
                     actions,
+                    route_dispatch,
                     scheduler_handler,
                     event_handler,
                 });
@@ -1050,6 +1172,71 @@ impl ActiveRuntime for WasmtimeActiveRuntime {
                 }
             };
             // §21.3：宿主侧响应硬上限。
+            if u64::try_from(bytes.len()).unwrap_or(u64::MAX)
+                > config.max_action_response_bytes.as_u64()
+            {
+                return Err(RuntimeExecutionError::ResponseTooLarge);
+            }
+            Ok(bytes)
+        })
+    }
+
+    fn invoke_route(&self, request: &GuestRouteRequest) -> Result<Vec<u8>, RuntimeExecutionError> {
+        // 0.4.0（§42.2）：bounded typed route 调用——同步一次调用，
+        // 无流 / 长连接（route-dispatch.wit）；调用 deadline / 响应上限
+        // 在宿主侧强制（与 invoke_action 同模式）。
+        let config = self.config_snapshot()?;
+        let _guard = InFlightGuard {
+            counter: &self.in_flight,
+        };
+        self.with_lease(|slot, store| {
+            let bindings = self.slot_bindings(slot)?;
+            let Some(route_func) = bindings.route_dispatch else {
+                return Err(RuntimeExecutionError::MissingOperuneExport(
+                    "route-dispatch",
+                ));
+            };
+            let deadline = self.call_deadline().ok_or(RuntimeExecutionError::Internal(
+                "call deadline is required for route dispatch",
+            ))?;
+            prepare_store_call(store, deadline)?;
+            let param = build_route_request_val(request);
+            let mut results = [Val::Result(Ok(None))];
+            route_func
+                .call(store.store_mut(), &[param], &mut results)
+                .map_err(|error| {
+                    RuntimeExecutionError::from_classified(store, ErrorSource::from(error))
+                })?;
+            route_func.post_return(store.store_mut()).map_err(|error| {
+                RuntimeExecutionError::from_classified(store, ErrorSource::from(error))
+            })?;
+            let bytes = match &results[0] {
+                Val::Result(_) => {
+                    parse_route_result_val(&results[0]).map_err(|error| match error {
+                        GuestRouteError::NotFound => {
+                            RuntimeExecutionError::GuestWebError("route not found")
+                        }
+                        GuestRouteError::InvalidParams => {
+                            RuntimeExecutionError::GuestWebError("invalid route params")
+                        }
+                        GuestRouteError::InvalidPayload => {
+                            RuntimeExecutionError::GuestWebError("invalid route payload")
+                        }
+                        GuestRouteError::Internal => {
+                            RuntimeExecutionError::GuestWebError("guest route internal error")
+                        }
+                    })?
+                }
+                _ => {
+                    return Err(RuntimeExecutionError::MalformedGuestData(
+                        ContractValueError::ShapeMismatch {
+                            field: "handle-route",
+                            expected: "result",
+                        },
+                    ));
+                }
+            };
+            // §42.2：宿主侧响应硬上限。
             if u64::try_from(bytes.len()).unwrap_or(u64::MAX)
                 > config.max_action_response_bytes.as_u64()
             {
@@ -1652,6 +1839,28 @@ mod tests {
             ),
             "action invoke on a non-web component must fail"
         );
+        // 0.4.0（§42.2）：无 route-dispatch 导出 → 确定性 typed 失败。
+        let route_request = GuestRouteRequest {
+            route_id: "get-item".to_owned(),
+            params: Vec::new(),
+            payload: None,
+        };
+        assert!(
+            matches!(
+                active.invoke_route(&route_request),
+                Err(RuntimeExecutionError::MissingOperuneExport(
+                    "route-dispatch"
+                ))
+            ),
+            "route invoke on a non-web component must fail"
+        );
+        // 0.4.0（§42.2）：无 app-descriptor 导出 = 0.1-only surface
+        //（0.1 语义保持，无 flag-day，§8.4 精神）。
+        match runtime.read_app_descriptor(&component) {
+            Ok(None) => {}
+            Ok(Some(_)) => test_failure("non-web component must have no app descriptor"),
+            Err(e) => test_failure(format_args!("app descriptor read failed: {e}")),
+        }
         // drain（§20.4）：close + 释放。
         ok(Arc::clone(&active).drain(Duration::from_secs(1)), "drain");
     }

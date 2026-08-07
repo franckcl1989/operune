@@ -228,6 +228,17 @@ pub enum ApplicationError {
     #[error("state store failure: {0}")]
     StateStore(#[source] crate::ports::StateStoreError),
 
+    /// 0.4.0（§42.2）：Web app descriptor 校验失败（激活期：get-app-descriptor
+    /// → AppDeclaration 组装 → 冲突诊断 / 二进制表面交叉校验）。失败 =
+    /// candidate 保持 Failed（quarantine），当前 Active 不受污染（§19.2）。
+    #[error("web app descriptor validation failed: {source}")]
+    WebAppDescriptor {
+        /// 声明期诊断（malformed / conflict diagnostics / contract
+        /// violation）。
+        #[source]
+        source: crate::web_app::AppDescriptorFailure,
+    },
+
     /// 内部不变量破坏（视为系统故障，fail-stop 语义，§14.3）。
     #[error("application internal invariant violated: {0}")]
     Internal(&'static str),
@@ -262,6 +273,11 @@ pub enum RuntimeExecutionError {
     /// metadata 视为失败，declaration.wit）。
     #[error("guest returned state declaration error: {0:?}")]
     GuestStateDeclarationError(crate::contract::GuestStateDeclarationError),
+
+    /// 0.4.0（§42.2）：`get-app-descriptor` 调用返回 guest 错误（返回
+    /// 非法 app descriptor 视为失败；冲突诊断的 guest 侧闭集）。
+    #[error("guest returned app descriptor error: {0:?}")]
+    GuestAppDescriptorError(crate::contract::GuestAppDescriptorError),
 
     /// web descriptor / assets / actions 调用返回 guest 错误。
     #[error("guest returned web bridge error: {0}")]

@@ -41,6 +41,10 @@ pub struct ActiveEntry {
     pub runtime: Arc<dyn ActiveRuntime>,
     /// 激活期 Web 清单（无 Web UI 为 `None`）。
     pub manifest: Option<crate::model::WebManifestData>,
+    /// 0.4.0（§42.2）：激活期构建的 Web 应用上下文（app descriptor +
+    /// typed route registry；组件无 `operune:web@0.2.0` 表面为 `None`，
+    /// 0.1 语义保持）。随快照一起原子交换（§21.5）。
+    pub web_app: Option<Arc<crate::web_app::WebAppContext>>,
 }
 
 impl ActiveRuntimeRegistry {

@@ -18,7 +18,10 @@ use operune_domain::{
 use crate::active::ActiveRuntimeRegistry;
 use crate::clock::{Clock, ClockError};
 use crate::composition::{ActiveGraph, CompositionService, GraphPolicy};
-use crate::contract::{GuestActionRequest, GuestComponentDescriptor, GuestStateDeclaration};
+use crate::contract::{
+    GuestActionRequest, GuestAppDescriptor, GuestComponentDescriptor, GuestRouteRequest,
+    GuestStateDeclaration,
+};
 use crate::error::RuntimeExecutionError;
 use crate::event::DeliveredEvent;
 use crate::install::{InstallService, StateMigrationRunner, StateWiring};
@@ -40,6 +43,7 @@ use crate::runtime::{ActiveRuntime, CompiledWasm, PreparedRuntime, RuntimePlan, 
 use crate::state::MigrationGate;
 use crate::upgrade::UpgradeService;
 use crate::web::{AssetCache, WebBridge};
+use crate::web_app::WebAppService;
 use operune_domain::{TriggerPayload, UtcInstant};
 
 /// 断言式失败：以测试失败语义中止当前测试（返回类型 `!`）。
@@ -503,6 +507,12 @@ pub(crate) struct FakeState {
     /// 按字节内容定制的 state-declaration（0.3.0 stateful 升级测试：
     /// v1/v2 不同声明版本）。
     pub(crate) declarations_by_bytes: HashMap<Vec<u8>, GuestStateDeclaration>,
+    /// 0.4.0（§42.2）：脚本化 app-descriptor 序列（按调用次序；`None` =
+    /// 注入失败；§19.3 确定性比对测试用）。
+    pub(crate) app_descriptors: Vec<Option<GuestAppDescriptor>>,
+    pub(crate) app_descriptor_index: usize,
+    /// 按字节内容定制的 app-descriptor（v1/v2 不同声明的升级测试）。
+    pub(crate) app_descriptors_by_bytes: HashMap<Vec<u8>, GuestAppDescriptor>,
     /// 最近一次 compile 的字节（read_descriptor 的按键依据）。
     pub(crate) last_compiled_bytes: Vec<u8>,
     /// prepare 注入失败标志。
@@ -515,13 +525,20 @@ pub(crate) struct FakeState {
     pub(crate) assets: HashMap<WebAssetPath, Vec<u8>>,
     /// action 成功响应；`None` = 注入失败（调用时现构造错误）。
     pub(crate) action_result_ok: Option<Vec<u8>>,
+    /// 0.4.0（§42.2）：route 成功响应；`None` = 注入失败。
+    pub(crate) route_result_ok: Option<Vec<u8>>,
+    /// 0.4.0（§42.2）：route 调用注入 deadline 到期（epoch 强制语义的
+    /// fake 形态）。
+    pub(crate) route_deadline_exceeded: bool,
     pub(crate) compile_calls: usize,
     pub(crate) descriptor_calls: usize,
     pub(crate) declaration_calls: usize,
+    pub(crate) app_descriptor_calls: usize,
     pub(crate) prepare_calls: usize,
     pub(crate) instantiate_calls: usize,
     pub(crate) asset_reads: usize,
     pub(crate) action_calls: usize,
+    pub(crate) route_calls: usize,
     pub(crate) drains: Vec<Duration>,
 }
 
@@ -537,6 +554,9 @@ impl Default for FakeState {
             declarations: Vec::new(),
             declaration_index: 0,
             declarations_by_bytes: HashMap::new(),
+            app_descriptors: Vec::new(),
+            app_descriptor_index: 0,
+            app_descriptors_by_bytes: HashMap::new(),
             last_compiled_bytes: Vec::new(),
             prepare_failure: false,
             instantiate_failure: false,
@@ -544,13 +564,17 @@ impl Default for FakeState {
             manifest: None,
             assets: HashMap::new(),
             action_result_ok: Some(vec![1, 2, 3]),
+            route_result_ok: Some(vec![4, 5, 6]),
+            route_deadline_exceeded: false,
             compile_calls: 0,
             descriptor_calls: 0,
             declaration_calls: 0,
+            app_descriptor_calls: 0,
             prepare_calls: 0,
             instantiate_calls: 0,
             asset_reads: 0,
             action_calls: 0,
+            route_calls: 0,
             drains: Vec::new(),
         }
     }
@@ -612,6 +636,22 @@ impl FakeRuntime {
     pub(crate) fn action_calls(&self) -> usize {
         match self.state.lock() {
             Ok(guard) => guard.action_calls,
+            Err(_) => test_failure("fake runtime state lock poisoned"),
+        }
+    }
+
+    /// 0.4.0（§42.2）：app-descriptor 读取调用计数。
+    pub(crate) fn app_descriptor_calls(&self) -> usize {
+        match self.state.lock() {
+            Ok(guard) => guard.app_descriptor_calls,
+            Err(_) => test_failure("fake runtime state lock poisoned"),
+        }
+    }
+
+    /// 0.4.0（§42.2）：typed route 调用计数。
+    pub(crate) fn route_calls(&self) -> usize {
+        match self.state.lock() {
+            Ok(guard) => guard.route_calls,
             Err(_) => test_failure("fake runtime state lock poisoned"),
         }
     }
@@ -751,6 +791,55 @@ impl FakeRuntime {
         };
         state.action_result_ok = result.ok();
     }
+
+    /// 0.4.0（§42.2）：脚本化 app-descriptor（按字节内容定制，两次
+    /// 确定性读取返回同一结果）。
+    pub(crate) fn with_app_descriptor_for(&self, bytes: &[u8], descriptor: GuestAppDescriptor) {
+        let mut state = match self.state.lock() {
+            Ok(guard) => guard,
+            Err(_) => test_failure("fake runtime state lock poisoned"),
+        };
+        state
+            .app_descriptors_by_bytes
+            .insert(bytes.to_vec(), descriptor);
+    }
+
+    /// 0.4.0（§42.2）：脚本化 app-descriptor 序列（第 i 次读取返回第 i 个
+    /// 结果；`None` = 注入失败；§19.3 确定性比对测试用）。
+    pub(crate) fn with_app_descriptors(&self, descriptors: Vec<GuestAppDescriptor>) {
+        let mut state = match self.state.lock() {
+            Ok(guard) => guard,
+            Err(_) => test_failure("fake runtime state lock poisoned"),
+        };
+        state.app_descriptors = descriptors.into_iter().map(Some).collect();
+    }
+
+    /// 0.4.0（§42.2）：注入 app-descriptor 读取失败。
+    pub(crate) fn with_app_descriptor_failure(&self) {
+        let mut state = match self.state.lock() {
+            Ok(guard) => guard,
+            Err(_) => test_failure("fake runtime state lock poisoned"),
+        };
+        state.app_descriptors.push(None);
+    }
+
+    /// 0.4.0（§42.2）：脚本化 typed route 结果（`Err` = 注入失败）。
+    pub(crate) fn with_route_result(&self, result: Result<Vec<u8>, RuntimeExecutionError>) {
+        let mut state = match self.state.lock() {
+            Ok(guard) => guard,
+            Err(_) => test_failure("fake runtime state lock poisoned"),
+        };
+        state.route_result_ok = result.ok();
+    }
+
+    /// 0.4.0（§42.2）：注入 route 调用 deadline 到期（§7.5 epoch 语义）。
+    pub(crate) fn with_route_deadline(&self) {
+        let mut state = match self.state.lock() {
+            Ok(guard) => guard,
+            Err(_) => test_failure("fake runtime state lock poisoned"),
+        };
+        state.route_deadline_exceeded = true;
+    }
 }
 
 impl WasmRuntime for FakeRuntime {
@@ -827,6 +916,33 @@ impl WasmRuntime for FakeRuntime {
             };
         }
         // 默认：无 declaration 导出 = 无状态组件（0.1 语义保持）。
+        Ok(None)
+    }
+
+    fn read_app_descriptor(
+        &self,
+        _component: &Arc<dyn CompiledWasm>,
+    ) -> Result<Option<GuestAppDescriptor>, RuntimeExecutionError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| RuntimeExecutionError::Internal("fake state poisoned"))?;
+        state.app_descriptor_calls += 1;
+        if let Some(descriptor) = state
+            .app_descriptors_by_bytes
+            .get(&state.last_compiled_bytes)
+        {
+            return Ok(Some(descriptor.clone()));
+        }
+        if state.app_descriptor_index < state.app_descriptors.len() {
+            let result = state.app_descriptors[state.app_descriptor_index].clone();
+            state.app_descriptor_index += 1;
+            return match result {
+                Some(descriptor) => Ok(Some(descriptor)),
+                None => Err(compile_error("injected app descriptor failure")),
+            };
+        }
+        // 默认：无 app-descriptor 导出 = 0.1-only surface（0.1 语义保持）。
         Ok(None)
     }
 
@@ -958,6 +1074,21 @@ impl ActiveRuntime for FakeActive {
         }
     }
 
+    fn invoke_route(&self, _request: &GuestRouteRequest) -> Result<Vec<u8>, RuntimeExecutionError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| RuntimeExecutionError::Internal("fake state poisoned"))?;
+        state.route_calls += 1;
+        if state.route_deadline_exceeded {
+            return Err(RuntimeExecutionError::DeadlineExceeded);
+        }
+        match state.route_result_ok.clone() {
+            Some(bytes) => Ok(bytes),
+            None => Err(compile_error("injected route failure")),
+        }
+    }
+
     fn drain(self: Arc<Self>, deadline: Duration) -> Result<(), RuntimeExecutionError> {
         let mut state = self
             .state
@@ -1001,6 +1132,9 @@ pub(crate) struct Harness {
     pub(crate) state_store: Arc<FakeStateStore>,
     pub(crate) state_audit: Arc<FakeStatefulAudit>,
     pub(crate) migration_runner: Arc<FakeStateMigrationRunner>,
+    /// 0.4.0（§42.2）：WebAppService（已接线进 install/upgrade 管线；
+    /// 默认 permission policy = grants 后端，默认 quota = 全上限）。
+    pub(crate) web_app: Arc<WebAppService>,
 }
 
 impl Harness {
@@ -1059,6 +1193,21 @@ impl Harness {
             policy,
             Arc::clone(&audit) as Arc<dyn AuditPort>,
         );
+        // 0.4.0（§42.2）：WebAppService——permission 检查点（grants 后端）
+        // + per-Component quota（全上限）+ config/audit；接线进 install /
+        // upgrade 管线（app-descriptor 激活期校验，§42.2）。
+        let web_app = Arc::new(WebAppService::new(
+            Arc::clone(&active),
+            Arc::new(crate::ports::InProcessWebPermissionPolicy::new(
+                Arc::clone(&grants) as Arc<dyn GrantStorePort>,
+            )),
+            match crate::ports::InProcessWebQuota::new(crate::ports::WebQuotaLimits::default()) {
+                Ok(quota) => Arc::new(quota) as Arc<dyn crate::ports::WebQuotaPort>,
+                Err(_) => test_failure("web quota construction failed"),
+            },
+            Arc::clone(&config_port) as Arc<dyn ConfigPort>,
+            Arc::clone(&audit) as Arc<dyn AuditPort>,
+        ));
         // 0.2.0 composition 接线（§40）：同一 composition 服务注入
         // install / upgrade 两条用例路径。
         let composition = if wired {
@@ -1106,6 +1255,16 @@ impl Harness {
             Ok(()) => {}
             Err(_) => test_failure("state wiring failed"),
         }
+        // 0.4.0（§42.2）：WebAppService 接线（app-descriptor 激活期校验 +
+        // typed route registry 随 Active 快照切换）。
+        match install.set_web_app(Arc::clone(&web_app)) {
+            Ok(()) => {}
+            Err(_) => test_failure("web app wiring failed"),
+        }
+        match upgrade.set_web_app(Arc::clone(&web_app)) {
+            Ok(()) => {}
+            Err(_) => test_failure("web app wiring failed"),
+        }
         Self {
             registry,
             grants,
@@ -1122,6 +1281,7 @@ impl Harness {
             state_store,
             state_audit,
             migration_runner,
+            web_app,
         }
     }
 }

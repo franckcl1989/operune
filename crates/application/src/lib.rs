@@ -21,6 +21,10 @@
 //!   有界 drain、旧 grant 不静默继承 §17.5）。
 //! - [`web`]：最小 Component Web bridge 用例（§21.3：激活期 web descriptor +
 //!   资产清单与缓存、Core-mediated bounded action、服务端重做检查）。
+//! - [`web_app`]：0.4.0 Web Application Runtime（§42.2）：app-descriptor
+//!   激活期校验与冲突诊断、typed route registry / dispatch、page/action
+//!   permission 检查点、bounded + cancellation baseline、per-Component
+//!   HTTP quotas（0.1 → 0.2 surface 分发，优先 0.2.0 回退 0.1.0）。
 //! - [`runtime`]：wasm 执行边界（`WasmRuntime` / `CompiledWasm` /
 //!   `ActiveRuntime` port + `WasmtimeRuntime` 生产实现）。生产实现通过
 //!   runtime-wasm 的公开 API（`EngineHandle::engine()` /
@@ -93,10 +97,14 @@ pub mod state;
 pub mod stateful_imports;
 pub mod upgrade;
 pub mod web;
+pub mod web_app;
 pub mod wit_bindings;
 
 #[cfg(test)]
 mod test_support;
+
+#[cfg(test)]
+mod web_app_tests;
 
 pub use active::ActiveRuntimeRegistry;
 // 注：0.3 component config 服务的 `ConfigService` 在根重导出，但其错误
@@ -116,14 +124,17 @@ pub use model::{
     ActionDenied, ActionName, CandidateRecord, ContractSurface, DigestVersionBinding,
     GrantApproval, GrantScope, GrantSnapshot, ImportClass, InstallOutcome, InstallRequest,
     InstallationGrant, InstallationRecord, PipelineTargetKind, RollbackRequest, RuntimeConfig,
-    UpgradeOutcome, UpgradeRequest, WebAssetEntry, WebAssetPath, WebManifestData,
+    UpgradeOutcome, UpgradeRequest, WebAssetEntry, WebAssetPath, WebManifestData, WebSurfaceKind,
 };
 pub use ports::{
     ActionContext, ActionPolicyPort, AuditError, AuditEvent, AuditPort, ComponentConfigStorePort,
     ComponentRegistryPort, ConfigError, ConfigPort, ConfigStoreError, GrantError, GrantStorePort,
-    GraphRecords, GraphStoreError, InProcessActionPolicy, ProviderGraphPort, RegistryError,
-    SecretCiphertextRecord, SecretGrantPort, SecretStoreError, SecretStorePort, StateStoreError,
-    StateStorePort, StatefulAuditEvent, StatefulAuditPort,
+    GraphRecords, GraphStoreError, InProcessActionPolicy, InProcessWebPermissionPolicy,
+    InProcessWebQuota, PermissionDenied, ProviderGraphPort, RegistryError, SecretCiphertextRecord,
+    SecretGrantPort, SecretStoreError, SecretStorePort, StateStoreError, StateStorePort,
+    StatefulAuditEvent, StatefulAuditPort, WEB_PERMISSIONS_CAPABILITY, WebPermissionContext,
+    WebPermissionPolicyPort, WebQuotaContext, WebQuotaDenied, WebQuotaGuard, WebQuotaLimits,
+    WebQuotaPort,
 };
 pub use runtime::{
     ActiveRuntime, CompiledWasm, EventRuntimeDelivery, PreparedRuntime, RuntimePlan,
@@ -135,3 +146,7 @@ pub use state::{CasOutcome, MigrationGate, StateError, StateService};
 pub use stateful_imports::StatefulHostServices;
 pub use upgrade::UpgradeService;
 pub use web::{AssetCache, AssetResponse, WebBridge};
+pub use web_app::{
+    AppDescriptorFailure, RouteMatchError, RouteRegistry, RouteResolution, WebAppContext,
+    WebAppService, WebDispatchError, WebPageDenied,
+};

@@ -566,6 +566,673 @@ pub(crate) fn parse_action_result_val(val: &Val) -> Result<Vec<u8>, GuestActionE
 }
 
 // ---------------------------------------------------------------------------
+// operune:web@0.2.0 镜像类型（§42.2 0.4.0 Web Application Runtime）
+// ---------------------------------------------------------------------------
+//
+// 契约对齐目标（WIT 权威版本 = wit/operune/web@0.2.0/，已提交稳定）：
+// - `app-descriptor`（`app-descriptor` / `app-features` / `app-descriptor-error`；
+//   permissions / pages / routes 声明面）；
+// - `routes`（`route-declaration` / `route-param` / `param-type` /
+//   `http-method`）；
+// - `route-dispatch`（`route-request` / `typed-param` / `param-value` /
+//   `route-error`）。
+//
+// 解析全部按 **record 字段顺序**（canonical ABI 编码的是顺序而非名字），
+// 字段名同时校验；声明面列表（permissions/pages/routes）与请求参数列表
+// 都有宿主侧体积上限（§7.4 host-buffer 纪律）。
+
+/// 声明面 permissions 列表上限（§7.4 有界清单）。
+pub(crate) const MAX_APP_PERMISSIONS_LEN: usize = 256;
+/// 声明面 pages 列表上限。
+pub(crate) const MAX_APP_PAGES_LEN: usize = 512;
+/// 声明面 routes 列表上限。
+pub(crate) const MAX_APP_ROUTES_LEN: usize = 1024;
+/// 单条 route 的 params 声明上限。
+pub(crate) const MAX_APP_ROUTE_PARAMS_LEN: usize = 64;
+/// 单次 route-request 的 typed params 上限（对齐声明面上限）。
+pub(crate) const MAX_APP_REQUEST_PARAMS_LEN: usize = 64;
+
+/// `app-features` flags 镜像（0.4.0 可组合 Web 能力声明；§42.2）。
+///
+/// 五个 flag 与 WIT `app-features` 一一对应；`static-assets` /
+/// `backend-actions` 语义继承 0.1；`navigation` / `typed-routes` /
+/// `permissions` 是 0.4 新增声明面。本版本**没有** realtime/stream flag
+/// （§42.3 条件未满足，不进本版本 production scope）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GuestAppFeatures {
+    /// `static-assets`（语义继承 0.1）。
+    pub static_assets: bool,
+    /// `backend-actions`（语义继承 0.1）。
+    pub backend_actions: bool,
+    /// `navigation`（页面声明）。
+    pub navigation: bool,
+    /// `typed-routes`（typed route / action 注册）。
+    pub typed_routes: bool,
+    /// `permissions`（权限声明）。
+    pub permissions: bool,
+}
+
+/// `permission-declaration` 镜像。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuestPermissionDeclaration {
+    /// `name.value`。
+    pub name: String,
+    /// `description`（option；Core 不解析）。
+    pub description: Option<String>,
+}
+
+/// `page-declaration` 镜像。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuestPageDeclaration {
+    /// `page-id.value`。
+    pub page_id: String,
+    /// `path.value`（静态路径，无模板段）。
+    pub path: String,
+    /// `display-name`（option）。
+    pub display_name: Option<String>,
+    /// `required-permission`（option；引用 permissions 声明）。
+    pub required_permission: Option<String>,
+}
+
+/// `route-param` 镜像（声明侧：名称 + `param-type` 变体名）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuestRouteParamDecl {
+    /// `name`。
+    pub name: String,
+    /// `value-type`（WIT `param-type` 变体名：text/integer/unsigned/
+    /// boolean/decimal）。
+    pub value_type: String,
+}
+
+/// `route-declaration` 镜像。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuestRouteDeclaration {
+    /// `route-id.value`。
+    pub route_id: String,
+    /// `method`（WIT `http-method` 变体名：get/post/put/patch/delete）。
+    pub method: String,
+    /// `path.value`（路径模板）。
+    pub path: String,
+    /// `params`（参数声明，与路径模板一致）。
+    pub params: Vec<GuestRouteParamDecl>,
+    /// `required-permission`（option）。
+    pub required_permission: Option<String>,
+}
+
+/// `app-descriptor` 镜像（§42.2 app descriptor 声明契约）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuestAppDescriptor {
+    /// `entry.value`（入口资产路径）。
+    pub entry: String,
+    /// `features`。
+    pub features: GuestAppFeatures,
+    /// `display-name`（option）。
+    pub display_name: Option<String>,
+    /// `permissions`（权限声明集合）。
+    pub permissions: Vec<GuestPermissionDeclaration>,
+    /// `pages`（页面声明集合）。
+    pub pages: Vec<GuestPageDeclaration>,
+    /// `routes`（typed route / action 声明集合）。
+    pub routes: Vec<GuestRouteDeclaration>,
+    /// `default-page`（option；导航语义）。
+    pub default_page: Option<String>,
+}
+
+/// `app-descriptor-error` 镜像（guest 返回值空间的预期失败，§42.2
+/// conflict diagnostics 闭集）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuestAppDescriptorError {
+    /// `malformed`。
+    Malformed,
+    /// `unsupported-contract-version`。
+    UnsupportedContractVersion,
+    /// `route-id-conflict`。
+    RouteIdConflict,
+    /// `page-id-conflict`。
+    PageIdConflict,
+    /// `path-conflict`。
+    PathConflict,
+    /// `invalid-path-template`。
+    InvalidPathTemplate,
+    /// `param-mismatch`。
+    ParamMismatch,
+    /// `invalid-permission`。
+    InvalidPermission,
+    /// `internal`。
+    Internal,
+}
+
+/// 把 `app-descriptor` 编成 guest 返回值空间的 `Val`（测试用；record
+/// 字段顺序对齐 WIT：entry、features、display-name、permissions、pages、
+/// routes、default-page）。
+#[cfg(test)]
+pub(crate) fn build_app_descriptor_val(descriptor: &GuestAppDescriptor) -> Val {
+    let mut flags = Vec::new();
+    if descriptor.features.static_assets {
+        flags.push("static-assets".to_owned());
+    }
+    if descriptor.features.backend_actions {
+        flags.push("backend-actions".to_owned());
+    }
+    if descriptor.features.navigation {
+        flags.push("navigation".to_owned());
+    }
+    if descriptor.features.typed_routes {
+        flags.push("typed-routes".to_owned());
+    }
+    if descriptor.features.permissions {
+        flags.push("permissions".to_owned());
+    }
+    let permissions = descriptor
+        .permissions
+        .iter()
+        .map(|permission| {
+            Val::Record(vec![
+                (
+                    "name".to_owned(),
+                    Val::Record(vec![(
+                        "value".to_owned(),
+                        Val::String(permission.name.clone()),
+                    )]),
+                ),
+                (
+                    "description".to_owned(),
+                    opt_string(&permission.description),
+                ),
+            ])
+        })
+        .collect();
+    let pages = descriptor
+        .pages
+        .iter()
+        .map(|page| {
+            Val::Record(vec![
+                (
+                    "page-id".to_owned(),
+                    Val::Record(vec![(
+                        "value".to_owned(),
+                        Val::String(page.page_id.clone()),
+                    )]),
+                ),
+                (
+                    "path".to_owned(),
+                    Val::Record(vec![("value".to_owned(), Val::String(page.path.clone()))]),
+                ),
+                ("display-name".to_owned(), opt_string(&page.display_name)),
+                (
+                    "required-permission".to_owned(),
+                    opt_permission_name(&page.required_permission),
+                ),
+            ])
+        })
+        .collect();
+    let routes = descriptor
+        .routes
+        .iter()
+        .map(|route| {
+            let params = route
+                .params
+                .iter()
+                .map(|param| {
+                    Val::Record(vec![
+                        ("name".to_owned(), Val::String(param.name.clone())),
+                        ("value-type".to_owned(), Val::Enum(param.value_type.clone())),
+                    ])
+                })
+                .collect();
+            Val::Record(vec![
+                (
+                    "route-id".to_owned(),
+                    Val::Record(vec![(
+                        "value".to_owned(),
+                        Val::String(route.route_id.clone()),
+                    )]),
+                ),
+                ("method".to_owned(), Val::Enum(route.method.clone())),
+                (
+                    "path".to_owned(),
+                    Val::Record(vec![("value".to_owned(), Val::String(route.path.clone()))]),
+                ),
+                ("params".to_owned(), Val::List(params)),
+                (
+                    "required-permission".to_owned(),
+                    opt_permission_name(&route.required_permission),
+                ),
+            ])
+        })
+        .collect();
+    Val::Result(Ok(Some(Box::new(Val::Record(vec![
+        (
+            "entry".to_owned(),
+            Val::Record(vec![(
+                "value".to_owned(),
+                Val::String(descriptor.entry.clone()),
+            )]),
+        ),
+        ("features".to_owned(), Val::Flags(flags)),
+        (
+            "display-name".to_owned(),
+            opt_string(&descriptor.display_name),
+        ),
+        ("permissions".to_owned(), Val::List(permissions)),
+        ("pages".to_owned(), Val::List(pages)),
+        ("routes".to_owned(), Val::List(routes)),
+        (
+            "default-page".to_owned(),
+            opt_permission_name(&descriptor.default_page),
+        ),
+    ])))))
+}
+
+/// 把 `app-descriptor-error` 编成 guest 返回值空间的 `Val`（测试用）。
+#[cfg(test)]
+pub(crate) fn build_app_descriptor_error_val(error: GuestAppDescriptorError) -> Val {
+    let name = match error {
+        GuestAppDescriptorError::Malformed => "malformed",
+        GuestAppDescriptorError::UnsupportedContractVersion => "unsupported-contract-version",
+        GuestAppDescriptorError::RouteIdConflict => "route-id-conflict",
+        GuestAppDescriptorError::PageIdConflict => "page-id-conflict",
+        GuestAppDescriptorError::PathConflict => "path-conflict",
+        GuestAppDescriptorError::InvalidPathTemplate => "invalid-path-template",
+        GuestAppDescriptorError::ParamMismatch => "param-mismatch",
+        GuestAppDescriptorError::InvalidPermission => "invalid-permission",
+        GuestAppDescriptorError::Internal => "internal",
+    };
+    Val::Result(Err(Some(Box::new(Val::Enum(name.to_owned())))))
+}
+
+/// 解析 `get-app-descriptor` 的返回 `Val`（§13.3 边界解析一次；声明面
+/// 列表与字符串都有宿主侧体积上限）。
+pub(crate) fn parse_app_descriptor_val(
+    val: &Val,
+) -> Result<GuestAppDescriptor, ContractValueError> {
+    let inner = as_result_ok(val, "get-app-descriptor")?;
+    let fields = as_record(inner, "app-descriptor")?;
+    let entry_record = as_record(field(fields, 0, "entry")?, "asset-path")?;
+    let entry = string_field(entry_record, 0, "value", MAX_WEB_ASSET_PATH_LEN)?;
+    let features = as_flags(field(fields, 1, "features")?, "app-features")?;
+    let features = GuestAppFeatures {
+        static_assets: features.iter().any(|name| name == "static-assets"),
+        backend_actions: features.iter().any(|name| name == "backend-actions"),
+        navigation: features.iter().any(|name| name == "navigation"),
+        typed_routes: features.iter().any(|name| name == "typed-routes"),
+        permissions: features.iter().any(|name| name == "permissions"),
+    };
+    let display_name = match option_field(fields, 2, "display-name")? {
+        None => None,
+        Some(value) => {
+            let text = as_string(&value, "app-descriptor.display-name")?;
+            if text.len() > MAX_DISPLAY_TEXT_LEN {
+                return Err(ContractValueError::ValueTooLarge {
+                    field: "display-name",
+                    limit: MAX_DISPLAY_TEXT_LEN,
+                });
+            }
+            Some(text.to_owned())
+        }
+    };
+    let permissions = parse_permission_list(field(fields, 3, "permissions")?)?;
+    let pages = parse_page_list(field(fields, 4, "pages")?)?;
+    let routes = parse_route_list(field(fields, 5, "routes")?)?;
+    let default_page = match option_field(fields, 6, "default-page")? {
+        None => None,
+        Some(value) => {
+            let record = as_record(&value, "page-id")?;
+            Some(string_field(record, 0, "value", MAX_COMPONENT_ID_LEN)?)
+        }
+    };
+    Ok(GuestAppDescriptor {
+        entry,
+        features,
+        display_name,
+        permissions,
+        pages,
+        routes,
+        default_page,
+    })
+}
+
+/// 解析 `permissions` 列表（`list<permission-declaration>`）。
+fn parse_permission_list(val: &Val) -> Result<Vec<GuestPermissionDeclaration>, ContractValueError> {
+    let list = as_list(val, "permission-declaration list")?;
+    if list.len() > MAX_APP_PERMISSIONS_LEN {
+        return Err(ContractValueError::ValueTooLarge {
+            field: "permissions",
+            limit: MAX_APP_PERMISSIONS_LEN,
+        });
+    }
+    let mut permissions = Vec::with_capacity(list.len());
+    for item in list {
+        let fields = as_record(item, "permission-declaration")?;
+        let name_record = as_record(field(fields, 0, "name")?, "permission-name")?;
+        let name = string_field(name_record, 0, "value", MAX_COMPONENT_ID_LEN)?;
+        let description = match option_field(fields, 1, "description")? {
+            None => None,
+            Some(value) => {
+                let text = as_string(&value, "permission-declaration.description")?;
+                if text.len() > MAX_DISPLAY_TEXT_LEN {
+                    return Err(ContractValueError::ValueTooLarge {
+                        field: "description",
+                        limit: MAX_DISPLAY_TEXT_LEN,
+                    });
+                }
+                Some(text.to_owned())
+            }
+        };
+        permissions.push(GuestPermissionDeclaration { name, description });
+    }
+    Ok(permissions)
+}
+
+/// 解析 `pages` 列表（`list<page-declaration>`）。
+fn parse_page_list(val: &Val) -> Result<Vec<GuestPageDeclaration>, ContractValueError> {
+    let list = as_list(val, "page-declaration list")?;
+    if list.len() > MAX_APP_PAGES_LEN {
+        return Err(ContractValueError::ValueTooLarge {
+            field: "pages",
+            limit: MAX_APP_PAGES_LEN,
+        });
+    }
+    let mut pages = Vec::with_capacity(list.len());
+    for item in list {
+        let fields = as_record(item, "page-declaration")?;
+        let page_id_record = as_record(field(fields, 0, "page-id")?, "page-id")?;
+        let page_id = string_field(page_id_record, 0, "value", MAX_COMPONENT_ID_LEN)?;
+        let path_record = as_record(field(fields, 1, "path")?, "page-path")?;
+        let path = string_field(path_record, 0, "value", MAX_WEB_ASSET_PATH_LEN)?;
+        let display_name = match option_field(fields, 2, "display-name")? {
+            None => None,
+            Some(value) => {
+                let text = as_string(&value, "page-declaration.display-name")?;
+                if text.len() > MAX_DISPLAY_TEXT_LEN {
+                    return Err(ContractValueError::ValueTooLarge {
+                        field: "display-name",
+                        limit: MAX_DISPLAY_TEXT_LEN,
+                    });
+                }
+                Some(text.to_owned())
+            }
+        };
+        let required_permission = match option_field(fields, 3, "required-permission")? {
+            None => None,
+            Some(value) => {
+                let record = as_record(&value, "permission-name")?;
+                Some(string_field(record, 0, "value", MAX_COMPONENT_ID_LEN)?)
+            }
+        };
+        pages.push(GuestPageDeclaration {
+            page_id,
+            path,
+            display_name,
+            required_permission,
+        });
+    }
+    Ok(pages)
+}
+
+/// 解析 `routes` 列表（`list<route-declaration>`）。
+fn parse_route_list(val: &Val) -> Result<Vec<GuestRouteDeclaration>, ContractValueError> {
+    let list = as_list(val, "route-declaration list")?;
+    if list.len() > MAX_APP_ROUTES_LEN {
+        return Err(ContractValueError::ValueTooLarge {
+            field: "routes",
+            limit: MAX_APP_ROUTES_LEN,
+        });
+    }
+    let mut routes = Vec::with_capacity(list.len());
+    for item in list {
+        let fields = as_record(item, "route-declaration")?;
+        let route_id_record = as_record(field(fields, 0, "route-id")?, "route-id")?;
+        let route_id = string_field(route_id_record, 0, "value", MAX_COMPONENT_ID_LEN)?;
+        let method = match field(fields, 1, "method")? {
+            Val::Enum(name) => name.clone(),
+            _ => {
+                return Err(ContractValueError::ShapeMismatch {
+                    field: "method",
+                    expected: "enum",
+                });
+            }
+        };
+        // http-method 是闭集（routes.wit：get/post/put/patch/delete）；
+        // 闭集外变体在组装期以 malformed 拒绝（web_app 层）。
+        let path_record = as_record(field(fields, 2, "path")?, "path-template")?;
+        let path = string_field(path_record, 0, "value", MAX_WEB_ASSET_PATH_LEN)?;
+        let params = match field(fields, 3, "params")? {
+            Val::List(items) => {
+                if items.len() > MAX_APP_ROUTE_PARAMS_LEN {
+                    return Err(ContractValueError::ValueTooLarge {
+                        field: "params",
+                        limit: MAX_APP_ROUTE_PARAMS_LEN,
+                    });
+                }
+                let mut params = Vec::with_capacity(items.len());
+                for item in items {
+                    let param_fields = as_record(item, "route-param")?;
+                    let name = string_field(param_fields, 0, "name", MAX_COMPONENT_ID_LEN)?;
+                    let value_type = match field(param_fields, 1, "value-type")? {
+                        Val::Enum(name) => name.clone(),
+                        _ => {
+                            return Err(ContractValueError::ShapeMismatch {
+                                field: "value-type",
+                                expected: "enum",
+                            });
+                        }
+                    };
+                    params.push(GuestRouteParamDecl { name, value_type });
+                }
+                params
+            }
+            _ => {
+                return Err(ContractValueError::ShapeMismatch {
+                    field: "params",
+                    expected: "list",
+                });
+            }
+        };
+        let required_permission = match option_field(fields, 4, "required-permission")? {
+            None => None,
+            Some(value) => {
+                let record = as_record(&value, "permission-name")?;
+                Some(string_field(record, 0, "value", MAX_COMPONENT_ID_LEN)?)
+            }
+        };
+        routes.push(GuestRouteDeclaration {
+            route_id,
+            method,
+            path,
+            params,
+            required_permission,
+        });
+    }
+    Ok(routes)
+}
+
+/// 解析 `app-descriptor-error` 载荷（result 的 Err 侧）。
+pub(crate) fn parse_app_descriptor_error_val(
+    val: &Val,
+) -> Result<GuestAppDescriptorError, ContractValueError> {
+    let payload = as_result_err(val, "get-app-descriptor")?;
+    let name = as_enum(payload, "app-descriptor-error")?;
+    match name {
+        "malformed" => Ok(GuestAppDescriptorError::Malformed),
+        "unsupported-contract-version" => Ok(GuestAppDescriptorError::UnsupportedContractVersion),
+        "route-id-conflict" => Ok(GuestAppDescriptorError::RouteIdConflict),
+        "page-id-conflict" => Ok(GuestAppDescriptorError::PageIdConflict),
+        "path-conflict" => Ok(GuestAppDescriptorError::PathConflict),
+        "invalid-path-template" => Ok(GuestAppDescriptorError::InvalidPathTemplate),
+        "param-mismatch" => Ok(GuestAppDescriptorError::ParamMismatch),
+        "invalid-permission" => Ok(GuestAppDescriptorError::InvalidPermission),
+        "internal" => Ok(GuestAppDescriptorError::Internal),
+        other => Err(ContractValueError::InvalidVariant(other.to_owned())),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// operune:web@0.2.0 route-dispatch 镜像类型（§42.2 typed route dispatch）
+// ---------------------------------------------------------------------------
+
+/// `param-value` 镜像（闭集 variant，与 `routes.param-type` 一一对应；
+/// §42.2 typed 参数运行期形态）。
+#[derive(Debug, Clone, PartialEq)]
+pub enum GuestParamValue {
+    /// `text(string)`。
+    Text(String),
+    /// `integer(s64)`。
+    Integer(i64),
+    /// `unsigned(u64)`。
+    Unsigned(u64),
+    /// `boolean(bool)`。
+    Boolean(bool),
+    /// `decimal(f64)`。
+    Decimal(f64),
+}
+
+impl GuestParamValue {
+    /// 与 WIT `param-type` 一一对应（分发前按声明校验值类型的映射面）。
+    pub(crate) fn param_type(&self) -> operune_domain::ParamType {
+        match self {
+            Self::Text(_) => operune_domain::ParamType::Text,
+            Self::Integer(_) => operune_domain::ParamType::Integer,
+            Self::Unsigned(_) => operune_domain::ParamType::Unsigned,
+            Self::Boolean(_) => operune_domain::ParamType::Boolean,
+            Self::Decimal(_) => operune_domain::ParamType::Decimal,
+        }
+    }
+}
+
+/// `typed-param` 镜像（名称 + 值；名称与值由 Core 按声明校验，§42.2）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct GuestTypedParam {
+    /// `name`。
+    pub name: String,
+    /// `value`。
+    pub value: GuestParamValue,
+}
+
+/// `route-request` 镜像（§42.2 typed route 请求；无凭据字段，§21.3
+/// 凭据边界）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct GuestRouteRequest {
+    /// `route-id.value`（分发键）。
+    pub route_id: String,
+    /// `params`（结构化参数，顺序与声明一致）。
+    pub params: Vec<GuestTypedParam>,
+    /// `payload`（可选辅助载荷）。
+    pub payload: Option<GuestActionPayload>,
+}
+
+/// `route-error` 镜像（guest 返回值空间；Core 侧拒绝不进入该空间）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuestRouteError {
+    /// `not-found`（防御性闭集：Core 分发前已按声明路由表检查）。
+    NotFound,
+    /// `invalid-params`（防御性闭集：Core 分发前已校验）。
+    InvalidParams,
+    /// `invalid-payload`。
+    InvalidPayload,
+    /// `internal`。
+    Internal,
+}
+
+/// 把 `route-request` 编成调用 guest 的 `Val`（record 顺序对齐 WIT：
+/// route-id、params、payload）。
+pub(crate) fn build_route_request_val(request: &GuestRouteRequest) -> Val {
+    let params = request
+        .params
+        .iter()
+        .map(|param| {
+            Val::Record(vec![
+                ("name".to_owned(), Val::String(param.name.clone())),
+                ("value".to_owned(), build_param_value_val(&param.value)),
+            ])
+        })
+        .collect();
+    let payload = match &request.payload {
+        Some(payload) => Val::Option(Some(Box::new(build_action_payload_val(payload)))),
+        None => Val::Option(None),
+    };
+    Val::Record(vec![
+        (
+            "route-id".to_owned(),
+            Val::Record(vec![(
+                "value".to_owned(),
+                Val::String(request.route_id.clone()),
+            )]),
+        ),
+        ("params".to_owned(), Val::List(params)),
+        ("payload".to_owned(), payload),
+    ])
+}
+
+/// 把 `param-value` 编成 `Val`（WIT variant 形态）。
+fn build_param_value_val(value: &GuestParamValue) -> Val {
+    match value {
+        GuestParamValue::Text(text) => {
+            Val::Variant("text".to_owned(), Some(Box::new(Val::String(text.clone()))))
+        }
+        GuestParamValue::Integer(value) => {
+            Val::Variant("integer".to_owned(), Some(Box::new(Val::S64(*value))))
+        }
+        GuestParamValue::Unsigned(value) => {
+            Val::Variant("unsigned".to_owned(), Some(Box::new(Val::U64(*value))))
+        }
+        GuestParamValue::Boolean(value) => {
+            Val::Variant("boolean".to_owned(), Some(Box::new(Val::Bool(*value))))
+        }
+        GuestParamValue::Decimal(value) => {
+            Val::Variant("decimal".to_owned(), Some(Box::new(Val::Float64(*value))))
+        }
+    }
+}
+
+/// 把 `action-payload` 编成 `Val`（route-request 的辅助载荷复用 0.1 形态）。
+fn build_action_payload_val(payload: &GuestActionPayload) -> Val {
+    match payload {
+        GuestActionPayload::Json(value) => Val::Variant(
+            "json".to_owned(),
+            Some(Box::new(Val::String(value.clone()))),
+        ),
+        GuestActionPayload::Raw(bytes) => Val::Variant(
+            "raw".to_owned(),
+            Some(Box::new(Val::List(
+                bytes.iter().map(|byte| Val::U8(*byte)).collect(),
+            ))),
+        ),
+    }
+}
+
+/// 解析 `handle-route` 的返回 `Val`（`result<list<u8>, route-error>`）。
+pub(crate) fn parse_route_result_val(val: &Val) -> Result<Vec<u8>, GuestRouteError> {
+    match val {
+        Val::Result(Ok(Some(inner))) => {
+            let items = match inner.as_ref() {
+                Val::List(items) => items,
+                _ => return Err(GuestRouteError::InvalidPayload),
+            };
+            let mut bytes = Vec::with_capacity(items.len());
+            for item in items {
+                match item {
+                    Val::U8(byte) => bytes.push(*byte),
+                    _ => return Err(GuestRouteError::InvalidPayload),
+                }
+            }
+            Ok(bytes)
+        }
+        Val::Result(Err(Some(inner))) => match inner.as_ref() {
+            Val::Enum(name) => match name.as_str() {
+                "not-found" => Err(GuestRouteError::NotFound),
+                "invalid-params" => Err(GuestRouteError::InvalidParams),
+                "invalid-payload" => Err(GuestRouteError::InvalidPayload),
+                "internal" => Err(GuestRouteError::Internal),
+                _ => Err(GuestRouteError::Internal),
+            },
+            _ => Err(GuestRouteError::InvalidPayload),
+        },
+        _ => Err(GuestRouteError::InvalidPayload),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 基础 Val 访问器（全部只读匹配，失败返回封闭 typed 错误）
 // ---------------------------------------------------------------------------
 
@@ -573,6 +1240,19 @@ pub(crate) fn parse_action_result_val(val: &Val) -> Result<Vec<u8>, GuestActionE
 fn opt_string(value: &Option<String>) -> Val {
     match value {
         Some(value) => Val::Option(Some(Box::new(Val::String(value.clone())))),
+        None => Val::Option(None),
+    }
+}
+
+/// `option<record { value: string }>` 的测试编码（permission-name /
+/// page-id / 一般命名 record wrapper 形态，§13.5）。
+#[cfg(test)]
+fn opt_permission_name(value: &Option<String>) -> Val {
+    match value {
+        Some(value) => Val::Option(Some(Box::new(Val::Record(vec![(
+            "value".to_owned(),
+            Val::String(value.clone()),
+        )])))),
         None => Val::Option(None),
     }
 }
@@ -589,7 +1269,6 @@ fn as_result_ok<'a>(val: &'a Val, what: &'static str) -> Result<&'a Val, Contrac
 }
 
 /// `result<_, E>` 的 Err 载荷。
-#[cfg(test)]
 fn as_result_err<'a>(val: &'a Val, what: &'static str) -> Result<&'a Val, ContractValueError> {
     match val {
         Val::Result(Err(Some(inner))) => Ok(inner),
@@ -679,7 +1358,6 @@ fn as_string<'a>(val: &'a Val, what: &'static str) -> Result<&'a str, ContractVa
     }
 }
 
-#[cfg(test)]
 fn as_enum<'a>(val: &'a Val, what: &'static str) -> Result<&'a str, ContractValueError> {
     match val {
         Val::Enum(name) => Ok(name),
@@ -974,6 +1652,281 @@ mod tests {
         assert_eq!(
             parse_action_result_val(&val),
             Err(GuestActionError::InvalidPayload)
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // 0.4.0（§42.2）：operune:web@0.2.0 app-descriptor / route-dispatch
+    // ------------------------------------------------------------------
+
+    /// 一个覆盖全部声明面形态的 app-descriptor 夹具。
+    fn sample_app_descriptor() -> GuestAppDescriptor {
+        GuestAppDescriptor {
+            entry: "/index.html".to_owned(),
+            features: GuestAppFeatures {
+                static_assets: true,
+                backend_actions: true,
+                navigation: true,
+                typed_routes: true,
+                permissions: true,
+            },
+            display_name: Some("Example UI".to_owned()),
+            permissions: vec![
+                GuestPermissionDeclaration {
+                    name: "view".to_owned(),
+                    description: Some("可以查看".to_owned()),
+                },
+                GuestPermissionDeclaration {
+                    name: "admin".to_owned(),
+                    description: None,
+                },
+            ],
+            pages: vec![
+                GuestPageDeclaration {
+                    page_id: "home".to_owned(),
+                    path: "/home".to_owned(),
+                    display_name: Some("Home".to_owned()),
+                    required_permission: None,
+                },
+                GuestPageDeclaration {
+                    page_id: "admin".to_owned(),
+                    path: "/admin".to_owned(),
+                    display_name: None,
+                    required_permission: Some("admin".to_owned()),
+                },
+            ],
+            routes: vec![
+                GuestRouteDeclaration {
+                    route_id: "get-item".to_owned(),
+                    method: "get".to_owned(),
+                    path: "/api/{id}".to_owned(),
+                    params: vec![GuestRouteParamDecl {
+                        name: "id".to_owned(),
+                        value_type: "integer".to_owned(),
+                    }],
+                    required_permission: None,
+                },
+                GuestRouteDeclaration {
+                    route_id: "create-item".to_owned(),
+                    method: "post".to_owned(),
+                    path: "/api/items".to_owned(),
+                    params: vec![GuestRouteParamDecl {
+                        name: "label".to_owned(),
+                        value_type: "text".to_owned(),
+                    }],
+                    required_permission: Some("admin".to_owned()),
+                },
+            ],
+            default_page: Some("home".to_owned()),
+        }
+    }
+
+    #[test]
+    fn app_descriptor_val_roundtrip() {
+        let original = sample_app_descriptor();
+        let val = build_app_descriptor_val(&original);
+        let parsed = match parse_app_descriptor_val(&val) {
+            Ok(parsed) => parsed,
+            Err(e) => test_failure(format_args!("parse failed: {e}")),
+        };
+        assert_eq!(parsed, original);
+    }
+
+    #[test]
+    fn app_descriptor_flags_missing_means_false() {
+        // 0.2.0 组件只声明 static-assets / backend-actions 时与 0.1 组件
+        // 行为等价（app-descriptor.wit 兼容路径）。
+        let original = GuestAppDescriptor {
+            features: GuestAppFeatures {
+                static_assets: true,
+                backend_actions: true,
+                navigation: false,
+                typed_routes: false,
+                permissions: false,
+            },
+            ..sample_app_descriptor()
+        };
+        let val = build_app_descriptor_val(&original);
+        let parsed = match parse_app_descriptor_val(&val) {
+            Ok(parsed) => parsed,
+            Err(e) => test_failure(format_args!("parse failed: {e}")),
+        };
+        assert!(!parsed.features.navigation);
+        assert!(!parsed.features.typed_routes);
+        assert!(!parsed.features.permissions);
+    }
+
+    #[test]
+    fn app_descriptor_rejects_oversized_declaration_lists() {
+        // §7.4 host-buffer 纪律：声明面列表超宿主侧上限 → contract
+        // violation。
+        let mut oversized = sample_app_descriptor();
+        oversized.routes = (0..(MAX_APP_ROUTES_LEN + 1))
+            .map(|index| GuestRouteDeclaration {
+                route_id: format!("r{index}"),
+                method: "get".to_owned(),
+                path: format!("/r/{index}"),
+                params: Vec::new(),
+                required_permission: None,
+            })
+            .collect();
+        let val = build_app_descriptor_val(&oversized);
+        let result = parse_app_descriptor_val(&val);
+        assert!(
+            matches!(
+                result,
+                Err(ContractValueError::ValueTooLarge {
+                    field: "routes",
+                    ..
+                })
+            ),
+            "oversized routes list must be rejected: {result:?}"
+        );
+    }
+
+    #[test]
+    fn app_descriptor_rejects_oversized_identifier() {
+        let mut oversized = sample_app_descriptor();
+        oversized.pages[0].page_id = "x".repeat(MAX_COMPONENT_ID_LEN + 1);
+        let val = build_app_descriptor_val(&oversized);
+        let result = parse_app_descriptor_val(&val);
+        assert!(
+            matches!(
+                result,
+                Err(ContractValueError::ValueTooLarge { field: "value", .. })
+            ),
+            "oversized page-id must be rejected: {result:?}"
+        );
+    }
+
+    #[test]
+    fn app_descriptor_error_val_parses() {
+        for (error, name) in [
+            (GuestAppDescriptorError::Malformed, "malformed"),
+            (
+                GuestAppDescriptorError::UnsupportedContractVersion,
+                "unsupported-contract-version",
+            ),
+            (
+                GuestAppDescriptorError::RouteIdConflict,
+                "route-id-conflict",
+            ),
+            (GuestAppDescriptorError::PageIdConflict, "page-id-conflict"),
+            (GuestAppDescriptorError::PathConflict, "path-conflict"),
+            (
+                GuestAppDescriptorError::InvalidPathTemplate,
+                "invalid-path-template",
+            ),
+            (GuestAppDescriptorError::ParamMismatch, "param-mismatch"),
+            (
+                GuestAppDescriptorError::InvalidPermission,
+                "invalid-permission",
+            ),
+            (GuestAppDescriptorError::Internal, "internal"),
+        ] {
+            let val = build_app_descriptor_error_val(error);
+            match parse_app_descriptor_error_val(&val) {
+                Ok(parsed) if parsed == error => {}
+                Ok(parsed) => test_failure(format_args!("expected {name}, got {parsed:?}")),
+                Err(e) => test_failure(format_args!("parse {name} failed: {e}")),
+            }
+        }
+        // 闭集外变体 → contract violation。
+        let unknown = Val::Result(Err(Some(Box::new(Val::Enum("bogus".to_owned())))));
+        assert!(parse_app_descriptor_error_val(&unknown).is_err());
+    }
+
+    #[test]
+    fn route_request_val_roundtrip() {
+        let original = GuestRouteRequest {
+            route_id: "get-item".to_owned(),
+            params: vec![
+                GuestTypedParam {
+                    name: "id".to_owned(),
+                    value: GuestParamValue::Integer(42),
+                },
+                GuestTypedParam {
+                    name: "active".to_owned(),
+                    value: GuestParamValue::Boolean(true),
+                },
+                GuestTypedParam {
+                    name: "ratio".to_owned(),
+                    value: GuestParamValue::Decimal(1.5),
+                },
+            ],
+            payload: Some(GuestActionPayload::Json("{}".to_owned())),
+        };
+        let val = build_route_request_val(&original);
+        // 结构断言（§21.3 凭据边界）：route-id + params + payload，无凭据
+        // 字段。
+        match &val {
+            Val::Record(fields) => {
+                assert_eq!(fields.len(), 3);
+                assert_eq!(fields[0].0, "route-id");
+                assert_eq!(fields[1].0, "params");
+                assert_eq!(fields[2].0, "payload");
+            }
+            other => test_failure(format_args!("unexpected val shape: {other:?}")),
+        }
+    }
+
+    #[test]
+    fn route_result_val_parses() {
+        let ok_val = Val::Result(Ok(Some(Box::new(Val::List(
+            vec![9u8, 8, 7].into_iter().map(Val::U8).collect(),
+        )))));
+        assert_eq!(
+            match parse_route_result_val(&ok_val) {
+                Ok(bytes) => bytes,
+                Err(e) => test_failure(format_args!("parse failed: {e:?}")),
+            },
+            vec![9u8, 8, 7]
+        );
+        for (name, error) in [
+            ("not-found", GuestRouteError::NotFound),
+            ("invalid-params", GuestRouteError::InvalidParams),
+            ("invalid-payload", GuestRouteError::InvalidPayload),
+            ("internal", GuestRouteError::Internal),
+        ] {
+            let err_val = Val::Result(Err(Some(Box::new(Val::Enum(name.to_owned())))));
+            assert_eq!(parse_route_result_val(&err_val), Err(error), "{name}");
+        }
+        // 闭集外变体 → Internal（防御性闭集）。
+        let unknown = Val::Result(Err(Some(Box::new(Val::Enum("bogus".to_owned())))));
+        assert_eq!(
+            parse_route_result_val(&unknown),
+            Err(GuestRouteError::Internal)
+        );
+        // 非字节列表 → InvalidPayload。
+        let bad_list = Val::Result(Ok(Some(Box::new(Val::List(vec![Val::U32(1)])))));
+        assert_eq!(
+            parse_route_result_val(&bad_list),
+            Err(GuestRouteError::InvalidPayload)
+        );
+    }
+
+    #[test]
+    fn guest_param_value_maps_to_param_type() {
+        // §42.2：param-value 与 param-type 一一对应。
+        assert_eq!(
+            GuestParamValue::Text("x".to_owned()).param_type(),
+            operune_domain::ParamType::Text
+        );
+        assert_eq!(
+            GuestParamValue::Integer(-1).param_type(),
+            operune_domain::ParamType::Integer
+        );
+        assert_eq!(
+            GuestParamValue::Unsigned(1).param_type(),
+            operune_domain::ParamType::Unsigned
+        );
+        assert_eq!(
+            GuestParamValue::Boolean(true).param_type(),
+            operune_domain::ParamType::Boolean
+        );
+        assert_eq!(
+            GuestParamValue::Decimal(1.0).param_type(),
+            operune_domain::ParamType::Decimal
         );
     }
 

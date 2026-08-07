@@ -1733,10 +1733,12 @@ name = "operune-web-component"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64",
  "operune-application",
  "operune-domain",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror",
  "tokio",
  "tower",

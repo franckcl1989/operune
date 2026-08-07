@@ -54,6 +54,16 @@
 //! - [`CheckpointPort`]：checkpoint 编排的最小 flush 入口（§41.2
 //!   checkpoint；StateService 无独立 flush 语义，见模块文档），进程内
 //!   实现 [`InProcessCheckpoint`]。
+//!
+//! # 0.4.0 Web Application Runtime（§42.2）——permission / quota 端口
+//!
+//! - [`WebPermissionPolicyPort`]：page/action permission 检查点（§17.5
+//!   第四层 Grant；permission-name → grant scope 的映射是 Core 政策，
+//!   默认实现 [`InProcessWebPermissionPolicy`] 以 `operune:web/permissions`
+//!   能力 + Unscoped / Action 命名 scope 表达）。
+//! - [`WebQuotaPort`]：per-Component HTTP quotas / backpressure（速率 /
+//!   并发 / 队列上限，§15.2 有界；超限确定拒绝 429 / 503 语义，不进 guest
+//!   错误空间），默认实现 [`InProcessWebQuota`]。
 
 mod audit;
 mod component_config;
@@ -67,6 +77,8 @@ mod registry;
 mod scheduler;
 mod secret;
 mod state;
+mod web;
+mod web_quota;
 
 pub use audit::{
     AuditError, AuditEvent, AuditPort, RejectReason, StatefulAuditEvent, StatefulAuditPort,
@@ -84,3 +96,10 @@ pub use scheduler::{
 };
 pub use secret::{SecretCiphertextRecord, SecretGrantPort, SecretStoreError, SecretStorePort};
 pub use state::{StateStoreError, StateStorePort};
+pub use web::{
+    InProcessWebPermissionPolicy, PermissionDenied, WEB_PERMISSIONS_CAPABILITY,
+    WebPermissionContext, WebPermissionPolicyPort,
+};
+pub use web_quota::{
+    InProcessWebQuota, WebQuotaContext, WebQuotaDenied, WebQuotaGuard, WebQuotaLimits, WebQuotaPort,
+};
