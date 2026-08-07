@@ -510,6 +510,90 @@ impl<'a> Repository<'a> {
         Ok(())
     }
 
+    /// `upsert_candidate`：写入 / 更新 digest 主键的 candidate 记录
+    ///（§19.2 "字节事实"阶段完成即持久化；§12.2 生命周期）。application 的
+    /// `ComponentRegistryPort::upsert_candidate` 语义（管线重新进入时重置
+    /// 该次尝试的生命周期）。字节事实必须先持久化（`record_quarantine`），
+    /// 否则 NotFound fail closed（§19.2 两阶段顺序，不擅自补造字节事实）。
+    /// audit 与写入同事务（§18.7 fail closed）。
+    pub(crate) fn upsert_candidate(
+        &mut self,
+        record: &operune_application::model::CandidateRecord,
+        audit: &AuditEvent,
+        cancel: &AtomicBool,
+    ) -> Result<(), StorageError> {
+        check_cancel(cancel)?;
+        if self.read_artifact(record.digest)?.is_none() {
+            return Err(StorageError::NotFound(format!(
+                "artifact {} is not recorded; persist the byte fact first (§19.2)",
+                record.digest
+            )));
+        }
+        let now = self.sql_now()?;
+        self.run_tx("begin candidate upsert transaction", |tx| {
+            tx.execute(
+                "UPDATE artifacts SET lifecycle_state = ?1 WHERE digest = ?2",
+                params![record.state.to_string(), record.digest.to_string()],
+            )
+            .map_err(|e| StorageError::sqlite("upsert candidate lifecycle", e))?;
+            Self::insert_audit(tx, audit, now)
+        })
+    }
+
+    /// `update_candidate_state`：推进 digest 主键的 candidate 领域生命周期
+    ///（§12.2：显式转换由用例层执行后落盘；转换合法性由 domain 判定）。
+    /// 记录不存在 → NotFound（fail closed，不静默新建）。audit 与写入
+    /// 同事务（§18.7 fail closed）。
+    pub(crate) fn update_candidate_state(
+        &mut self,
+        digest: ContentDigest,
+        state: ComponentLifecycleState,
+        audit: &AuditEvent,
+        cancel: &AtomicBool,
+    ) -> Result<(), StorageError> {
+        check_cancel(cancel)?;
+        let now = self.sql_now()?;
+        self.run_tx("begin candidate state transaction", |tx| {
+            let changed = tx
+                .execute(
+                    "UPDATE artifacts SET lifecycle_state = ?1 WHERE digest = ?2",
+                    params![state.to_string(), digest.to_string()],
+                )
+                .map_err(|e| StorageError::sqlite("update candidate lifecycle", e))?;
+            if changed == 0 {
+                return Err(StorageError::NotFound(format!(
+                    "candidate record for {digest}"
+                )));
+            }
+            Self::insert_audit(tx, audit, now)
+        })
+    }
+
+    /// `get_candidate`：读取 digest 主键的 candidate 记录（领域生命周期 +
+    /// 字节大小事实；`None` = 字节事实尚未持久化，§19.2）。
+    pub(crate) fn get_candidate(
+        &self,
+        digest: ContentDigest,
+    ) -> Result<Option<operune_application::model::CandidateRecord>, StorageError> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT byte_size, lifecycle_state FROM artifacts WHERE digest = ?1",
+                [digest.to_string()],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(|e| StorageError::sqlite("read candidate record", e))?;
+        match row {
+            Some((byte_size, lifecycle)) => Ok(Some(operune_application::model::CandidateRecord {
+                digest,
+                state: Self::parse_lifecycle_state(&lifecycle)?,
+                byte_len: self.byte_size_from_i64(byte_size)?,
+            })),
+            None => Ok(None),
+        }
+    }
+
     /// `commit_candidate`：quarantine → candidate（验证通过、建立注册表绑定，
     /// §19.2 应用身份阶段）。同版本不同 digest 显式阻断（§19.4
     /// DigestConflict，绝不静默覆盖）。
@@ -612,6 +696,23 @@ impl<'a> Repository<'a> {
         Ok(())
     }
 
+    /// `resolve_version`：查询 `ComponentId + ComponentVersion` 的既有绑定
+    ///（§19.4：同一逻辑版本默认只能绑定一个已接受 digest）。
+    pub(crate) fn resolve_version(
+        &self,
+        component_id: &ComponentId,
+        version: ComponentVersion,
+    ) -> Result<Option<operune_application::model::DigestVersionBinding>, StorageError> {
+        match self.read_registry_digest(component_id, version)? {
+            Some(digest) => Ok(Some(operune_application::model::DigestVersionBinding {
+                component_id: component_id.clone(),
+                version,
+                digest,
+            })),
+            None => Ok(None),
+        }
+    }
+
     // ------------------------------------------------------------------
     // 安装实例（§18.3 / §19.2）
     // ------------------------------------------------------------------
@@ -661,6 +762,52 @@ impl<'a> Repository<'a> {
         Ok(installation_id)
     }
 
+    /// `create_installation_with_id`：以调用方给定的 InstallationId 创建
+    /// 安装实例（application 的 `ComponentRegistryPort::insert_installation`
+    /// 语义：InstallationId 由用例层生成，§19.4——Core 只持久化）。
+    /// 初始 lifecycle = `Installed`（§12.2 初始状态），默认未启用
+    /// （deny-by-default，§17.2；由管理面显式启用）。幂等：同 id 重复
+    /// 创建不做任何事（管线重入安全）。
+    pub(crate) fn create_installation_with_id(
+        &mut self,
+        installation_id: InstallationId,
+        component_id: ComponentId,
+        audit: &AuditEvent,
+        cancel: &AtomicBool,
+    ) -> Result<(), StorageError> {
+        check_cancel(cancel)?;
+        // 两阶段安装（§19.2）：安装实例必须先有注册表事实（commit_candidate）。
+        let component_exists: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT component_id FROM components WHERE component_id = ?1",
+                [component_id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| StorageError::sqlite("check component", e))?;
+        if component_exists.is_none() {
+            return Err(StorageError::NotFound(format!(
+                "component {component_id} is not registered; commit a candidate first \
+                 (§19.2 two-phase install)"
+            )));
+        }
+        if self.read_installation(installation_id)?.is_some() {
+            return Ok(()); // 幂等重入（§19.2 管线重入）：同 id 已存在。
+        }
+        let now = self.sql_now()?;
+        self.run_tx("begin installation transaction", |tx| {
+            tx.execute(
+                "INSERT INTO installations
+                     (installation_id, component_id, enabled, lifecycle_state, created_at, updated_at)
+                 VALUES (?1, ?2, 0, 'installed', ?3, ?3)",
+                params![installation_id.to_string(), component_id.to_string(), now],
+            )
+            .map_err(|e| StorageError::sqlite("insert installation", e))?;
+            Self::insert_audit(tx, audit, now)
+        })
+    }
+
     /// `bind_installation_version`：把逻辑版本绑定到安装实例（candidate 记录，
     /// §18.3 installation 表语义）。绑定必须在注册表事实之后（§19.2）。
     pub(crate) fn bind_installation_version(
@@ -690,6 +837,64 @@ impl<'a> Repository<'a> {
                 "digest {digest} does not match the registered digest {registered} for \
                  {component_id} {version}"
             )));
+        }
+        let now = self.sql_now()?;
+        self.run_tx("begin bind transaction", |tx| {
+            tx.execute(
+                "INSERT INTO installation_versions
+                     (installation_id, component_id, component_version, content_digest, state, created_at)
+                 VALUES (?1, ?2, ?3, ?4, 'candidate', ?5)",
+                params![
+                    installation_id.to_string(),
+                    component_id.to_string(),
+                    version.to_string(),
+                    digest.to_string(),
+                    now
+                ],
+            )
+            .map_err(|e| StorageError::sqlite("insert installation version", e))?;
+            Self::insert_audit(tx, audit, now)
+        })
+    }
+
+    /// `bind_installation_version_once`：把逻辑版本绑定到安装实例（幂等变体，
+    /// §18.3）。与 `bind_installation_version` 同前置校验（安装存在、注册表
+    /// 事实存在、digest 一致），但重复绑定同一版本不做任何事——application
+    /// 的 `ComponentRegistryPort` 在激活时按安装记录补绑定（其模型没有
+    /// 独立的逐安装绑定步骤），管线重入 / 升级迭代时安全。
+    pub(crate) fn bind_installation_version_once(
+        &mut self,
+        installation_id: InstallationId,
+        component_id: ComponentId,
+        version: ComponentVersion,
+        digest: ContentDigest,
+        audit: &AuditEvent,
+        cancel: &AtomicBool,
+    ) -> Result<(), StorageError> {
+        check_cancel(cancel)?;
+        if self.read_installation(installation_id)?.is_none() {
+            return Err(StorageError::NotFound(format!(
+                "installation {installation_id}"
+            )));
+        }
+        let registered = self
+            .read_registry_digest(&component_id, version)?
+            .ok_or_else(|| {
+                StorageError::NotFound(format!(
+                    "component {component_id} version {version} is not registered"
+                ))
+            })?;
+        if registered != digest {
+            return Err(StorageError::InvalidArgument(format!(
+                "digest {digest} does not match the registered digest {registered} for \
+                 {component_id} {version}"
+            )));
+        }
+        if self
+            .read_installation_version(installation_id, version)?
+            .is_some()
+        {
+            return Ok(()); // 幂等：版本已绑定。
         }
         let now = self.sql_now()?;
         self.run_tx("begin bind transaction", |tx| {
@@ -1105,6 +1310,52 @@ impl<'a> Repository<'a> {
                 return Err(StorageError::NotFound(format!(
                     "installation {installation_id} has no active grant for {capability_id}"
                 )));
+            }
+            Self::insert_audit(tx, audit, now)
+        })
+    }
+
+    /// `replace_grants`：整体替换安装实例的授权集（§17.5：显式重新批准的
+    /// 落盘；原子替换——同一事务内撤销全部当前生效 grant 并按新集合授权，
+    /// 不存在"新旧并存"的中间观；audit 与替换同事务，fail closed，§18.7）。
+    pub(crate) fn replace_grants(
+        &mut self,
+        installation_id: InstallationId,
+        grants: &[(CapabilityId, CapabilityScope)],
+        audit: &AuditEvent,
+        cancel: &AtomicBool,
+    ) -> Result<(), StorageError> {
+        check_cancel(cancel)?;
+        if self.read_installation(installation_id)?.is_none() {
+            return Err(StorageError::NotFound(format!(
+                "installation {installation_id}"
+            )));
+        }
+        let now = self.sql_now()?;
+        self.run_tx("begin replace grants transaction", |tx| {
+            tx.execute(
+                "UPDATE grants SET state = 'revoked', revoked_at = ?1
+                 WHERE installation_id = ?2 AND state = 'granted'",
+                params![now, installation_id.to_string()],
+            )
+            .map_err(|e| StorageError::sqlite("revoke all current grants", e))?;
+            for (capability_id, scope) in grants {
+                tx.execute(
+                    "INSERT INTO grants (installation_id, capability_id, scope, state, granted_at, revoked_at)
+                     VALUES (?1, ?2, ?3, 'granted', ?4, NULL)
+                     ON CONFLICT(installation_id, capability_id) DO UPDATE SET
+                         scope = excluded.scope,
+                         state = 'granted',
+                         granted_at = excluded.granted_at,
+                         revoked_at = NULL",
+                    params![
+                        installation_id.to_string(),
+                        capability_id.to_string(),
+                        scope.as_str(),
+                        now
+                    ],
+                )
+                .map_err(|e| StorageError::sqlite("upsert grant", e))?;
             }
             Self::insert_audit(tx, audit, now)
         })
@@ -1753,6 +2004,28 @@ impl<'a> Repository<'a> {
         digest: ContentDigest,
     ) -> Result<Option<ArtifactRecord>, StorageError> {
         self.read_artifact(digest)
+    }
+
+    /// `read_artifact_bytes`：按 digest 读取制品字节（§18.7 rollback
+    /// retention：回滚目标字节按 ContentDigest 读取）。记录不存在 → `None`；
+    /// 记录存在但文件缺失 → CorruptState fail closed（打开时 recovery 对账
+    /// 已保证文件-记录一致，§18.5；此处不一致 = 持久化状态损坏）。
+    pub(crate) fn read_artifact_bytes(
+        &self,
+        digest: ContentDigest,
+    ) -> Result<Option<Vec<u8>>, StorageError> {
+        if self.read_artifact(digest)?.is_none() {
+            return Ok(None);
+        }
+        // final 优先（candidate 提交后文件在 final 空间）；quarantine 兜底。
+        for space in [ArtifactSpace::Final, ArtifactSpace::Quarantine] {
+            if let Some(bytes) = self.store.read_digest_file(space, digest)? {
+                return Ok(Some(bytes));
+            }
+        }
+        Err(StorageError::CorruptState(format!(
+            "artifact {digest} record exists but its file is missing"
+        )))
     }
 
     /// `get_installation`。

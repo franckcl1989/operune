@@ -13,6 +13,21 @@ description = "Operune SQLite persistence: schema, migration, repository adapter
 # typed 类型（§13.3 边界解析一次：SQL 边界接触字符串/整数 wire 表示，立即 parse
 # 成领域类型）。crate 包名为 operune-domain（见 crates/domain/Cargo.toml）。
 operune-domain = { path = "../domain" }
+# §24.3 依赖方向：adapters ---> application ---> domain。本 crate 实现
+# application 的 port traits（ComponentRegistryPort / GrantStorePort /
+# AuditPort / ConfigPort，§24.2），port 签名使用 application 的用例级类型
+#（crates/application/src/model.rs）与其事件形状（ports/audit.rs），因此
+# 依赖 application；application 不依赖本 crate（其 Cargo.toml 依赖面为
+# domain / runtime-wasm / runtime-wasi-p2 / wasmtime / serde / arc-swap），
+# 无环。SQL / rusqlite / schema 细节仍不向 application 泄漏（§18.1）。
+operune-application = { path = "../application" }
+# RuntimeConfig（application 的 config 快照类型）内嵌 operune_runtime_wasm
+# 的 ResourceBudget / ByteSize 等预算类型（§7.4）；`ConfigPort` 的快照
+# 序列化 / 解析需要直接读写这些类型的字段与构造函数（§13.3 边界解析一次）。
+# 该依赖经 application 已传递存在（storage-sqlite → application →
+# runtime-wasm），直接声明只为命名类型；无新增边、无环（runtime-wasm 不
+# 依赖 storage-sqlite）。
+operune-runtime-wasm = { path = "../runtime-wasm" }
 # §22.4 / §18.1：rusqlite 0.40.1，必须启用 bundled——内嵌 SQLite，不依赖目标 OS 的
 # SQLite 版本（§18.1）；0.1.0 单节点权威元数据（§18.3）。
 rusqlite = { workspace = true, features = ["bundled"] }
@@ -23,6 +38,10 @@ rusqlite = { workspace = true, features = ["bundled"] }
 tokio = { workspace = true, features = ["rt", "sync", "macros", "rt-multi-thread", "time"] }
 # §14.1：封闭、可匹配的 typed error（thiserror 2.0.19）。
 thiserror = { workspace = true }
+# §22.4：application 的 GrantScope（typed enum）与存储侧的字符串 scope
+# newtype 之间的规范化转换（§17.3 / §13.3 边界解析一次；见 ports.rs 的
+# 转换层说明）。
+serde_json = { workspace = true }
 
 # §22.8：tempfile 3.27.0 只用于隔离文件系统测试。
 [dev-dependencies]

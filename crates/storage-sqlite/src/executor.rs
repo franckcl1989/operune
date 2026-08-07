@@ -344,6 +344,71 @@ pub(crate) enum Command {
         /// 条数上限（≤ 1000）。
         limit: usize,
     },
+    /// 写入 / 更新 digest 主键的 candidate 记录（§19.2 / §12.2；
+    /// application 的 `ComponentRegistryPort` 面）。
+    UpsertCandidate {
+        /// 字节事实主键 + 领域生命周期 + 字节大小。
+        record: operune_application::model::CandidateRecord,
+        /// audit 事件（同事务，§18.7）。
+        audit: AuditEvent,
+    },
+    /// 推进 candidate 的领域生命周期（§12.2）。
+    UpdateCandidateState {
+        /// 字节事实主键。
+        digest: ContentDigest,
+        /// 目标领域生命周期状态。
+        state: ComponentLifecycleState,
+        /// audit 事件（同事务，§18.7）。
+        audit: AuditEvent,
+    },
+    /// 读取 candidate 记录。
+    GetCandidate {
+        /// 字节事实主键。
+        digest: ContentDigest,
+    },
+    /// 查询 `ComponentId + ComponentVersion` 的既有绑定（§19.4）。
+    ResolveVersion {
+        /// 逻辑产品身份。
+        component_id: ComponentId,
+        /// 逻辑版本。
+        version: ComponentVersion,
+    },
+    /// 以调用方给定的 InstallationId 创建安装实例（§19.4）。
+    CreateInstallationWithId {
+        /// 安装实例身份（用例层生成）。
+        installation_id: InstallationId,
+        /// 逻辑产品身份。
+        component_id: ComponentId,
+        /// audit 事件（同事务，§18.7）。
+        audit: AuditEvent,
+    },
+    /// 幂等绑定安装版本（§18.3；application 激活路径按安装记录补绑定）。
+    BindInstallationVersionOnce {
+        /// 安装实例。
+        installation_id: InstallationId,
+        /// 逻辑产品身份。
+        component_id: ComponentId,
+        /// 逻辑版本。
+        version: ComponentVersion,
+        /// 绑定 digest。
+        digest: ContentDigest,
+        /// audit 事件（同事务，§18.7）。
+        audit: AuditEvent,
+    },
+    /// 按 digest 读取制品字节（§18.7 rollback retention）。
+    ReadArtifactBytes {
+        /// 内容摘要。
+        digest: ContentDigest,
+    },
+    /// 整体替换安装实例的授权集（§17.5，原子替换）。
+    ReplaceGrants {
+        /// 安装实例。
+        installation_id: InstallationId,
+        /// 新授权集（能力 + 资源级 scope）。
+        grants: Vec<(CapabilityId, CapabilityScope)>,
+        /// audit 事件（同事务，§18.7）。
+        audit: AuditEvent,
+    },
     /// 测试专用 gate（仅 cfg(test)：阻塞 worker 以验证有界队列 / 取消 /
     /// shutdown 排空语义，§29）。
     #[cfg(test)]
@@ -430,6 +495,22 @@ pub(crate) enum Response {
     UpgradeTransactions(Vec<UpgradeTransactionRecord>),
     /// 审计列表。
     AuditRecent(Vec<AuditRecord>),
+    /// candidate 记录已写入 / 更新。
+    CandidateUpserted,
+    /// candidate 领域生命周期已推进。
+    CandidateStateUpdated,
+    /// candidate 记录。
+    Candidate(Option<operune_application::model::CandidateRecord>),
+    /// 版本绑定。
+    VersionBinding(Option<operune_application::model::DigestVersionBinding>),
+    /// 安装实例已创建（调用方给定 ID 形态）。
+    InstallationCreatedWithId,
+    /// 版本已绑定（幂等）。
+    VersionBoundOnce,
+    /// 制品字节。
+    ArtifactBytes(Option<Vec<u8>>),
+    /// 授权集已整体替换。
+    GrantsReplaced,
 }
 
 /// 单个请求（命令 + 取消探针 + 单答复）。
@@ -515,6 +596,51 @@ impl StorageExecutor {
             .await
             .map_err(|_| StorageError::Shutdown)?;
         reply_rx.await.map_err(|_| StorageError::Shutdown)?
+    }
+
+    /// 同步提交（application port 适配层专用，见 `crate::ports`）：
+    /// `try_send` + 短等待重试（有界背压，§15.2）+ `try_recv` 轮询答复。
+    ///
+    /// 用途：application 的 port traits 是同步接口（§24.2），而本 executor
+    /// 是 async facade（§18.2）——同步桥接在**调用线程**上等待通道，
+    /// SQLite 执行仍全部发生在 worker 线程（§18.2：SQLite blocking 调用
+    /// 不运行在 Tokio core worker 上）。
+    ///
+    /// 为什么不用 `blocking_send` / `blocking_recv`：tokio 的 blocking_*
+    /// 经 `crate::future::block_on` 实现，在 async 上下文（如 axum worker、
+    /// tokio 测试）内调用会 panic（"Cannot block the current thread from
+    /// within a runtime"）——port 的调用方可能是 async 上下文。`try_send` /
+    /// `try_recv` 无此限制；队列满 / 答复未就绪时短等待（1ms）重试——
+    /// worker 快速排空（每个请求耗时都有界，§18.2），等待有界。与异步
+    /// `submit` 的取消语义差异：同步调用方无法在等待中结构化取消（没有
+    /// async future 可 drop），取消探针保持未置位，请求执行到完成。
+    pub(crate) fn submit_blocking(&self, cmd: Command) -> Result<Response, StorageError> {
+        let (reply_tx, mut reply_rx) = oneshot::channel();
+        let sender = self.sender.as_ref().ok_or(StorageError::Shutdown)?;
+        let mut request = Request {
+            cmd,
+            cancel: Arc::new(AtomicBool::new(false)),
+            reply: reply_tx,
+        };
+        loop {
+            match sender.try_send(request) {
+                Ok(()) => break,
+                Err(mpsc::error::TrySendError::Full(returned)) => {
+                    request = returned;
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => return Err(StorageError::Shutdown),
+            }
+        }
+        loop {
+            match reply_rx.try_recv() {
+                Ok(result) => return result,
+                Err(oneshot::error::TryRecvError::Empty) => {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Err(oneshot::error::TryRecvError::Closed) => return Err(StorageError::Shutdown),
+            }
+        }
     }
 
     /// try 提交（有界队列拒绝测试用；队列满 ⇒ [`StorageError::QueueFull`]）。
@@ -1091,6 +1217,155 @@ impl StorageExecutor {
             _ => Err(unexpected_response("ListAuditRecent")),
         }
     }
+
+    // ------------------------------------------------------------------
+    // application port 面命令（§24.2：本 crate 实现 application 的
+    // ComponentRegistryPort / GrantStorePort；命令语义见仓库方法文档）
+    // ------------------------------------------------------------------
+
+    /// 写入 / 更新 digest 主键的 candidate 记录（§19.2 / §12.2）。
+    pub async fn upsert_candidate(
+        &self,
+        record: &operune_application::model::CandidateRecord,
+        audit: AuditEvent,
+    ) -> Result<(), StorageError> {
+        let response = self
+            .submit(Command::UpsertCandidate {
+                record: record.clone(),
+                audit,
+            })
+            .await?;
+        match response {
+            Response::CandidateUpserted => Ok(()),
+            _ => Err(unexpected_response("UpsertCandidate")),
+        }
+    }
+
+    /// 推进 candidate 的领域生命周期（§12.2）。
+    pub async fn update_candidate_state(
+        &self,
+        digest: ContentDigest,
+        state: ComponentLifecycleState,
+        audit: AuditEvent,
+    ) -> Result<(), StorageError> {
+        let response = self
+            .submit(Command::UpdateCandidateState {
+                digest,
+                state,
+                audit,
+            })
+            .await?;
+        match response {
+            Response::CandidateStateUpdated => Ok(()),
+            _ => Err(unexpected_response("UpdateCandidateState")),
+        }
+    }
+
+    /// 读取 digest 主键的 candidate 记录。
+    pub async fn get_candidate(
+        &self,
+        digest: ContentDigest,
+    ) -> Result<Option<operune_application::model::CandidateRecord>, StorageError> {
+        let response = self.submit(Command::GetCandidate { digest }).await?;
+        match response {
+            Response::Candidate(record) => Ok(record),
+            _ => Err(unexpected_response("GetCandidate")),
+        }
+    }
+
+    /// 查询 `ComponentId + ComponentVersion` 的既有绑定（§19.4）。
+    pub async fn resolve_version(
+        &self,
+        component_id: ComponentId,
+        version: ComponentVersion,
+    ) -> Result<Option<operune_application::model::DigestVersionBinding>, StorageError> {
+        let response = self
+            .submit(Command::ResolveVersion {
+                component_id,
+                version,
+            })
+            .await?;
+        match response {
+            Response::VersionBinding(binding) => Ok(binding),
+            _ => Err(unexpected_response("ResolveVersion")),
+        }
+    }
+
+    /// 以调用方给定的 InstallationId 创建安装实例（§19.4）。
+    pub async fn create_installation_with_id(
+        &self,
+        installation_id: InstallationId,
+        component_id: ComponentId,
+        audit: AuditEvent,
+    ) -> Result<(), StorageError> {
+        let response = self
+            .submit(Command::CreateInstallationWithId {
+                installation_id,
+                component_id,
+                audit,
+            })
+            .await?;
+        match response {
+            Response::InstallationCreatedWithId => Ok(()),
+            _ => Err(unexpected_response("CreateInstallationWithId")),
+        }
+    }
+
+    /// 幂等绑定安装版本（§18.3）。
+    pub async fn bind_installation_version_once(
+        &self,
+        installation_id: InstallationId,
+        component_id: ComponentId,
+        version: ComponentVersion,
+        digest: ContentDigest,
+        audit: AuditEvent,
+    ) -> Result<(), StorageError> {
+        let response = self
+            .submit(Command::BindInstallationVersionOnce {
+                installation_id,
+                component_id,
+                version,
+                digest,
+                audit,
+            })
+            .await?;
+        match response {
+            Response::VersionBoundOnce => Ok(()),
+            _ => Err(unexpected_response("BindInstallationVersionOnce")),
+        }
+    }
+
+    /// 按 digest 读取制品字节（§18.7 rollback retention）。
+    pub async fn read_artifact_bytes(
+        &self,
+        digest: ContentDigest,
+    ) -> Result<Option<Vec<u8>>, StorageError> {
+        let response = self.submit(Command::ReadArtifactBytes { digest }).await?;
+        match response {
+            Response::ArtifactBytes(bytes) => Ok(bytes),
+            _ => Err(unexpected_response("ReadArtifactBytes")),
+        }
+    }
+
+    /// 整体替换安装实例的授权集（§17.5，原子替换）。
+    pub async fn replace_grants(
+        &self,
+        installation_id: InstallationId,
+        grants: Vec<(CapabilityId, CapabilityScope)>,
+        audit: AuditEvent,
+    ) -> Result<(), StorageError> {
+        let response = self
+            .submit(Command::ReplaceGrants {
+                installation_id,
+                grants,
+                audit,
+            })
+            .await?;
+        match response {
+            Response::GrantsReplaced => Ok(()),
+            _ => Err(unexpected_response("ReplaceGrants")),
+        }
+    }
 }
 
 impl Drop for StorageExecutor {
@@ -1331,6 +1606,58 @@ fn worker_main(
             Command::ListAuditRecent { limit } => Repository::new(&mut conn, &store)
                 .list_audit_recent(limit)
                 .map(Response::AuditRecent),
+            Command::UpsertCandidate { record, audit } => Repository::new(&mut conn, &store)
+                .upsert_candidate(&record, &audit, &request.cancel)
+                .map(|()| Response::CandidateUpserted),
+            Command::UpdateCandidateState {
+                digest,
+                state,
+                audit,
+            } => Repository::new(&mut conn, &store)
+                .update_candidate_state(digest, state, &audit, &request.cancel)
+                .map(|()| Response::CandidateStateUpdated),
+            Command::GetCandidate { digest } => Repository::new(&mut conn, &store)
+                .get_candidate(digest)
+                .map(Response::Candidate),
+            Command::ResolveVersion {
+                component_id,
+                version,
+            } => Repository::new(&mut conn, &store)
+                .resolve_version(&component_id, version)
+                .map(Response::VersionBinding),
+            Command::CreateInstallationWithId {
+                installation_id,
+                component_id,
+                audit,
+            } => Repository::new(&mut conn, &store)
+                .create_installation_with_id(installation_id, component_id, &audit, &request.cancel)
+                .map(|()| Response::InstallationCreatedWithId),
+            Command::BindInstallationVersionOnce {
+                installation_id,
+                component_id,
+                version,
+                digest,
+                audit,
+            } => Repository::new(&mut conn, &store)
+                .bind_installation_version_once(
+                    installation_id,
+                    component_id,
+                    version,
+                    digest,
+                    &audit,
+                    &request.cancel,
+                )
+                .map(|()| Response::VersionBoundOnce),
+            Command::ReadArtifactBytes { digest } => Repository::new(&mut conn, &store)
+                .read_artifact_bytes(digest)
+                .map(Response::ArtifactBytes),
+            Command::ReplaceGrants {
+                installation_id,
+                grants,
+                audit,
+            } => Repository::new(&mut conn, &store)
+                .replace_grants(installation_id, &grants, &audit, &request.cancel)
+                .map(|()| Response::GrantsReplaced),
             #[cfg(test)]
             Command::TestGate { entered, release } => {
                 let _ = entered.send(());
@@ -1794,7 +2121,7 @@ mod tests {
             "reopen with newer schema",
         );
         assert!(
-            matches!(error, StorageError::SchemaTooNew { db: 99, current: 1 }),
+            matches!(error, StorageError::SchemaTooNew { db: 99, current: 2 }),
             "expected SchemaTooNew, got {error:?}"
         );
     }

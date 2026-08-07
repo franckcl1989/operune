@@ -69,7 +69,10 @@ impl Migration {
 /// 0.1.0 production migration 集合（§18.4 release contract 的版本事实源）。
 ///
 /// 0.1.0 最低可直接升级来源版本 = 0（空库 / 全新初始化）。
-pub const PRODUCTION_MIGRATIONS: &[Migration] = &[Migration::new(1, "core-schema-v1", apply_v1)];
+pub const PRODUCTION_MIGRATIONS: &[Migration] = &[
+    Migration::new(1, "core-schema-v1", apply_v1),
+    Migration::new(2, "candidate-lifecycle-v2", apply_v2),
+];
 
 /// 本构建支持的当前 schema 版本（= 最后一个 production migration 版本）。
 pub fn current_schema_version() -> u32 {
@@ -218,6 +221,37 @@ fn apply_v1(tx: &rusqlite::Transaction<'_>) -> Result<(), StorageError> {
         .map_err(|e| StorageError::sqlite("apply core schema v1", e))
 }
 
+/// Migration v2：`artifacts` 表增加 digest 主键的领域生命周期状态列
+///（§12.2 / §19.2 的 candidate 生命周期；§18.3 至少持久化
+/// quarantine/candidate/install/enable/active state）。
+///
+/// 背景：v1 的 `artifacts.state`（quarantine/candidate/installed）是存储侧
+/// 记录种类（model.rs 文档明确"非 domain 生命周期状态"），只有 3 个取值，
+/// 无法表达 application 的 `ComponentRegistryPort` 所需的 domain 状态机
+/// 全状态（`installed`/`validated`/`activating`/`active`/`draining`/
+/// `disabled`/`failed`）。v2 新增 `lifecycle_state` 列承载该状态：
+/// - 新增行默认 `installed`（CHECK 约束对新写入生效）；
+/// - 既有行按 `artifacts.state` 回填：quarantine → installed（字节已接收、
+///   未验证），candidate → validated（已绑定、等待激活），installed →
+///   active（已被某安装 active 引用）。
+///
+/// SQLite 的 `ALTER TABLE ADD COLUMN` 允许 CHECK 约束（对新写入生效）；
+/// 本 migration 在单个事务内执行（§18.4：失败整体回滚）。
+fn apply_v2(tx: &rusqlite::Transaction<'_>) -> Result<(), StorageError> {
+    tx.execute_batch(
+        "ALTER TABLE artifacts ADD COLUMN lifecycle_state TEXT NOT NULL DEFAULT 'installed'
+             CHECK (lifecycle_state IN
+                 ('installed', 'validated', 'activating', 'active', 'draining', 'disabled', 'failed'));
+         UPDATE artifacts SET lifecycle_state =
+             CASE state
+                 WHEN 'quarantine' THEN 'installed'
+                 WHEN 'candidate' THEN 'validated'
+                 ELSE 'active'
+             END;",
+    )
+    .map_err(|e| StorageError::sqlite("apply candidate lifecycle v2", e))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -236,7 +270,7 @@ mod tests {
             ok(read_schema_version(&conn), "version"),
             current_schema_version()
         );
-        assert_eq!(current_schema_version(), 1);
+        assert_eq!(current_schema_version(), 2);
     }
 
     #[test]
@@ -265,7 +299,7 @@ mod tests {
         }
         let error = err(open_authoritative_db(&path), "reopen newer db");
         assert!(
-            matches!(error, StorageError::SchemaTooNew { db: 99, current: 1 }),
+            matches!(error, StorageError::SchemaTooNew { db: 99, current: 2 }),
             "expected SchemaTooNew, got {error:?}"
         );
     }

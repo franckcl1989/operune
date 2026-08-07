@@ -27,7 +27,10 @@
 //!   （§13.3），事务边界与安装/升级 crash consistency 协议（§18.5）；
 //! - [`recovery`]：打开时确定性对账（§18.5 crash recovery 决策表）；
 //! - [`executor`]：Storage Executor（§18.2）：专用线程 + 有界队列 +
-//!   typed request/response + 提交前取消语义 + shutdown 等待。
+//!   typed request/response + 提交前取消语义 + shutdown 等待；
+//! - [`ports`]：application port traits 的实现（§24.2：ComponentRegistry /
+//!   GrantStore / Audit / Config），同步桥接到 executor 并做用例级类型
+//!   与存储侧记录之间的转换（§13.3）。
 //!
 //! # 权威性边界（§18.1）
 //!
@@ -44,6 +47,7 @@ pub mod error;
 pub mod executor;
 pub mod migration;
 pub mod model;
+pub mod ports;
 mod recovery;
 mod repository;
 mod schema;
@@ -60,4 +64,5 @@ pub use model::{
     InstallationVersionRecord, RollbackResult, SessionId, SessionRecord, StagedArtifact, Timestamp,
     UpgradePhase, UpgradeTransactionId, UpgradeTransactionRecord, UserId, UserRecord, VersionState,
 };
+pub use ports::StoragePorts;
 pub use recovery::RecoveryAction;

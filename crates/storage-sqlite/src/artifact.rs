@@ -444,6 +444,25 @@ impl ArtifactStore {
             .is_file())
     }
 
+    /// 读取 digest 文件字节（不存在返回 `None`；读取失败 fail closed）。
+    ///
+    /// 用途：application 的 `ComponentRegistryPort::artifact_bytes`
+    ///（§18.7 rollback retention：回滚目标字节按 digest 读取）。读取大小
+    /// 以写入时的硬上限为界（§19.1：写入前已拒绝超限字节），此处不做
+    /// 额外上限——文件是写入时校验过的字节事实（§6.7）。
+    pub(crate) fn read_digest_file(
+        &self,
+        space: ArtifactSpace,
+        digest: ContentDigest,
+    ) -> Result<Option<Vec<u8>>, StorageError> {
+        let path = space.dir(&self.data_root).join(digest.to_string());
+        match std::fs::read(&path) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(StorageError::io("read artifact file", e)),
+        }
+    }
+
     /// 扫描空间目录中 digest 命名的文件（跳过非 digest 命名条目，
     /// 如平台元数据文件）。
     pub(crate) fn scan_digest_files(
