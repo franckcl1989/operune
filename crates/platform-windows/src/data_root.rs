@@ -60,7 +60,6 @@ impl<E: Environment> DataRootResolver for WindowsDataRootResolver<E> {
 mod tests {
     use super::*;
     use std::ffi::OsString;
-    use std::path::Path;
 
     #[derive(Debug, Clone)]
     struct StaticEnvironment {
@@ -104,6 +103,8 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn resolves_windows_literal_path() {
+        use std::path::Path;
+
         let resolver = WindowsDataRootResolver::new(environment(&[(
             "LOCALAPPDATA",
             "C:\\Users\\dev\\AppData\\Local",
