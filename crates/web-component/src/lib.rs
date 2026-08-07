@@ -44,15 +44,26 @@
 //! - [`mount`]：mount namespace（§21.3）；
 //! - [`csp`]：隔离底线 CSP 与 Core-owned 头（§21.3）；
 //! - [`bridge`]：用例 port + application `WebBridge` 适配；
-//! - [`router`]：Axum 路由与强制点；
-//! - [`error`]：封闭 typed 错误 → 确定 HTTP 响应。
+//! - [`router`]：Axum 路由与强制点（0.1 + 0.4 HTTP 面）；
+//! - [`error`]：封闭 typed 错误 → 确定 HTTP 响应；
+//! - [`quota`]：per-Component HTTP quotas / backpressure（§42.2）；
+//! - [`dispatch`]：typed route 分发（方法/路径匹配 + 参数解析，§42.2）；
+//! - [`navigation`]：0.4 导航服务的文档面（页面列表 + 默认页，§42.2）；
+//! - [`integrity`]：Web asset caching / integrity（§42.2；RFC 9530
+//!   Content-Digest）。
 
 pub mod bridge;
 pub mod csp;
+pub mod dispatch;
 pub mod error;
+pub mod integrity;
 pub mod mount;
+pub mod navigation;
+pub mod quota;
 pub mod router;
 
+#[cfg(test)]
+mod http_04_tests;
 #[cfg(test)]
 mod http_tests;
 #[cfg(test)]
@@ -61,4 +72,5 @@ mod test_support;
 pub use bridge::{AppWebBridge, ComponentWebPort};
 pub use error::BridgeError;
 pub use mount::ComponentMount;
+pub use quota::{QuotaDenied, QuotaGate};
 pub use router::{BridgeLimits, component_router};

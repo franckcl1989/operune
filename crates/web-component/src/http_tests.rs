@@ -49,6 +49,7 @@ fn default_limits() -> BridgeLimits {
     BridgeLimits {
         max_action_body_bytes: 1024,
         max_action_response_bytes: 4096,
+        ..Default::default()
     }
 }
 
@@ -330,7 +331,7 @@ async fn action_body_over_limit_rejected_early() {
     // 且不进入 guest（action_calls == 0）。
     let app = app(BridgeLimits {
         max_action_body_bytes: 64,
-        max_action_response_bytes: 4096,
+        ..Default::default()
     });
     let (installation, _) = installed(&app.port);
     let response = send(
@@ -349,8 +350,8 @@ async fn action_body_over_limit_rejected_early() {
 async fn action_response_over_limit_rejected() {
     // §21.3：响应体积宿主侧硬上限 → 502。
     let app = app(BridgeLimits {
-        max_action_body_bytes: 1024,
         max_action_response_bytes: 8,
+        ..Default::default()
     });
     let (installation, _) = installed(&app.port);
     app.port.with_action_result(installation, Ok(vec![0u8; 64]));

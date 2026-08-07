@@ -33,6 +33,20 @@ pub const CORE_HEADERS: &[&str] = &[
     "x-frame-options",
 ];
 
+// ---------------------------------------------------------------------------
+// 0.4.0 Web asset caching（§42.2；Core 生成缓存语义，组件不可改写）
+// ---------------------------------------------------------------------------
+
+/// 资产响应的缓存语义（§42.2 immutable 长缓存 + digest 可验证 URL）：
+/// 资产 URL 绑定激活 digest（§21.5），升级后旧 URL 立即 404——URL 即
+/// 内容版本，内容不可变，浏览器可长缓存。
+pub const IMMUTABLE_CACHE: &str = "public, max-age=31536000, immutable";
+
+/// 页面 / 导航响应的缓存语义：版本无关 URL（§42.2 页面路径不携带
+/// digest），升级后同一 URL 必须解析到新的 active version（§21.5），
+/// 因此每次请求重验证（no-cache）。
+pub const NO_CACHE: &str = "no-cache";
+
 #[cfg(test)]
 mod tests {
     use super::*;

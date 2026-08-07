@@ -7,7 +7,7 @@
 //! 的 URL 在升级后立即 404）。
 
 use operune_application::{ActionName, WebAssetPath};
-use operune_domain::{ContentDigest, InstallationId};
+use operune_domain::{ContentDigest, InstallationId, PagePath};
 
 /// 命名空间的第一段（固定）。
 pub const MOUNT_PREFIX: &str = "component";
@@ -17,6 +17,15 @@ pub const ASSETS_SEGMENT: &str = "assets";
 
 /// 动作 URL 的第二段（固定）。
 pub const ACTIONS_SEGMENT: &str = "actions";
+
+/// 导航索引 URL 的第二段（0.4，§42.2）。
+pub const NAVIGATION_SEGMENT: &str = "navigation";
+
+/// 页面导航 URL 的第二段（0.4，§42.2；页面路径在其下）。
+pub const PAGES_SEGMENT: &str = "pages";
+
+/// typed route 分发 URL 的第二段（0.4，§42.2；route 路径在其下）。
+pub const ROUTES_SEGMENT: &str = "routes";
 
 /// 路由路径前缀（axum 路由写法：`/component/{installation}/…`）。
 pub const ROUTE_PREFIX: &str = "/component/{installation}";
@@ -61,6 +70,25 @@ impl ComponentMount {
             self.installation,
             action.as_str()
         )
+    }
+
+    /// 页面 URL（`/component/{uuid}/pages{path}`；§42.2 页面导航——页面
+    /// 路径是挂载命名空间下的静态路径）。
+    ///
+    /// 页面 URL 不携带 digest（§42.2 页面路径无版本绑定；升级后同一 URL
+    /// 解析到新的 active version，§21.5——页面响应以 no-cache 交付）。
+    pub fn page_url(&self, path: &PagePath) -> String {
+        format!(
+            "/{MOUNT_PREFIX}/{}/{PAGES_SEGMENT}{}",
+            self.installation,
+            path.as_str()
+        )
+    }
+
+    /// 导航索引 URL（`/component/{uuid}/navigation`；§42.2 页面列表 /
+    /// 默认页）。
+    pub fn navigation_url(&self) -> String {
+        format!("/{MOUNT_PREFIX}/{}/{NAVIGATION_SEGMENT}", self.installation)
     }
 }
 
@@ -109,6 +137,26 @@ mod tests {
         assert_eq!(
             mount.action_url(&action),
             format!("/component/{}/actions/run-check", mount.installation())
+        );
+    }
+
+    #[test]
+    fn page_and_navigation_urls_live_under_mount_namespace() {
+        let mount = ComponentMount::new(InstallationId::new());
+        let path = ok(PagePath::new("/about"), "page path");
+        assert_eq!(
+            mount.page_url(&path),
+            format!("/component/{}/pages/about", mount.installation())
+        );
+        assert_eq!(
+            mount.navigation_url(),
+            format!("/component/{}/navigation", mount.installation())
+        );
+        // 页面路径不以 "/" 结尾时 URL 形态仍正确（路径已规范化）。
+        let nested = ok(PagePath::new("/a/b"), "page path");
+        assert_eq!(
+            mount.page_url(&nested),
+            format!("/component/{}/pages/a/b", mount.installation())
         );
     }
 }
