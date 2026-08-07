@@ -70,16 +70,20 @@ interface scheduler {
         millis: u64,
     }
 
+    /// 周期触发参数（`periodic` case 的单一类型载荷；variant case
+    /// 只携带单类型，named payload 由 record 承载，§6.3/§13.5）。
+    record periodic-trigger {
+        next-fire-at: datetime,
+        interval: duration,
+    }
+
     /// 任务触发形态（variant 表达互斥形态，§6.3）。
     variant schedule-trigger {
         /// 一次性：在 `fire-at` 时刻触发一次。
         one-shot(datetime),
         /// 周期：`next-fire-at` 时刻首次触发，此后每 `interval` 触发。
         /// 错过不补投（见本文件顶部交付语义）。
-        periodic {
-            next-fire-at: datetime,
-            interval: duration,
-        },
+        periodic(periodic-trigger),
     }
 
     /// 待注册的定时任务（0.1.0 只携带触发形态）。

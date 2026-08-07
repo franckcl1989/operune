@@ -9,7 +9,7 @@ package operune:state@0.1.0;
 // 1. 新 ComponentVersion 激活前，Core 比较其 `state-declaration` 的
 //    schema-version 与 store 当前存储版本；不同则进入迁移路径；
 // 2. Core 创建排他的 migration 事务，调用本 interface 的 `migrate`
-//    （from = 存储版本，to = 新声明版本）；
+//    （from-version = 存储版本，to = 新声明版本）；
 // 3. guest 读取旧版本数据、写入新版本形态，返回 ok → Core 原子 commit，
 //    store 存储版本更新为 to；
 // 4. guest 返回错误 / trap / 超时 / 超预算 → Core abort，store 不变，
@@ -18,7 +18,7 @@ package operune:state@0.1.0;
 //    崩溃恢复由 Core 基于持久化迁移日志完成（§18.5），guest 只观测
 //    到 not-ready 窗口。
 //
-// 本契约只支持单跳迁移（from → to 一次调用）。多跳迁移链
+// 本契约只支持单跳迁移（from-version → to 一次调用）。多跳迁移链
 // （V0→V1→V2）是未来 interface 演进，0.1.0 不定义。
 
 /// stateful upgrade 的显式 migration handler（Core 消费）。
@@ -27,10 +27,10 @@ interface migration {
 
     /// migration 的预期失败（guest 返回值空间）。
     enum migration-error {
-        /// from/to 超出本 ComponentVersion 支持的迁移范围。
+        /// from-version/to 超出本 ComponentVersion 支持的迁移范围。
         /// Core 以此拒绝升级并提供明确诊断，store 不变。
         unsupported-version-range,
-        /// 旧版本数据无法读取/解析（数据损坏或与 from 版本不符）。
+        /// 旧版本数据无法读取/解析（数据损坏或与 from-version 版本不符）。
         malformed-source,
         /// 迁移超出操作数/体积预算（§7.4）。
         over-budget,
@@ -48,11 +48,11 @@ interface migration {
     /// - 返回 ok 即承诺迁移可提交；此后发生的一切失败（包括宿主侧
     ///   观测）按"未提交迁移"回滚，不得产生部分迁移状态（§41.3：
     ///   不得出现"代码版本已切换但状态 schema 不确定"）；
-    /// - 迁移必须可重试幂等地设计（崩溃恢复后 Core 可能以相同 from/to
+    /// - 迁移必须可重试幂等地设计（崩溃恢复后 Core 可能以相同 from-version/to
     ///   再次调用）——平台保证事务原子性，但 guest 的迁移逻辑本身
     ///   应不依赖"仅调用一次"。
     migrate: func(
-        from: state-schema-version,
+        from-version: state-schema-version,
         to: state-schema-version,
         transaction: state-transaction,
     ) -> result<_, migration-error>;
