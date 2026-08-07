@@ -28,6 +28,36 @@
 //! - 封闭 typed error（§14.1）：[`DomainError`]，禁止 anyhow / eyre /
 //!   `Box<dyn Error>` / String error。
 //!
+//! # 0.3.0 公开面（§41 Stateful Runtime 中的 domain 部分）
+//!
+//! 契约面 = `operune:state|config|secret|scheduler|event@0.1.0`（已提交
+//! 稳定；类型语义与 WIT 契约严格对齐，§41.2）：
+//! - State（typed Component state service，§41.2 MUST）：
+//!   [`StateKey`]（`state-key`，字符集 `[A-Za-z0-9._-/]`，安装实例私有
+//!   命名空间，§19.4）、[`StateValue`]（`state-value`，有界字节，平台
+//!   不透明，P6）、[`StateSchemaVersion`]（`state-schema-version`，u32，
+//!   显式 migration 的版本面，§20.5）、[`StateTransactionId`]（Core 侧
+//!   事务标识，§18.5 / §41.2 audit；非 WIT 类型）；
+//! - Config（Component config storage/validation，§41.2 MUST）：
+//!   [`ConfigRevision`]（`config-version.revision`，快照修订号）、
+//!   [`ConfigFormat`]（`config-format` 闭集：json/toml/raw）、
+//!   [`ConfigSchemaVersion`]（`config-schema-version`）、
+//!   [`ConfigValue`] / [`ConfigSnapshot`]（`config-value` / `config-snapshot`
+//!   原子快照；只读语义——Config 是输入，guest 只读，§41.2）；
+//! - Secret（SecretStore port，§41.2 MUST / §16.6）：[`SecretName`]
+//!   （`secret-name`，grant scope 的键，§17.3）、[`SecretVersion`]
+//!   （`secret-version`，轮换检测）、[`SecretMetadata`]（`secret-metadata`，
+//!   非敏感元数据，**不含值**，§16.6 防泄漏）；
+//! - Scheduler（§41.2 MUST）：[`UtcInstant`]（`datetime`，UTC 硬时刻，
+//!   §13.2 OffsetDateTime 语义）、[`ScheduleTrigger`]（`schedule-trigger`
+//!   闭集：one-shot / periodic）、[`ScheduledTaskId`]（`scheduled-task-id`）、
+//!   [`TaskState`] / [`TaskStatus`]（`task-state` / `task-status` 闭集）、
+//!   [`TriggerPayload`]（`trigger-payload`：task-id/sequence/scheduled-at/
+//!   missed-fires）；
+//! - Event（event bus，§41.2 MUST / §17.3）：[`EventTopic`]（`topic`，grant
+//!   scope 的键）、[`EventId`]（`event-id`，审计关联）、[`EventPayload`]
+//!   （`event-payload` 闭集：json/raw 有界形态，§22.4 禁止万能动态值）。
+//!
 //! # 0.2.0 公开面（§40 Capability Composition 中的 domain 部分）
 //!
 //! - Capability Provider identity（§40.2）：[`ProviderId`]——"提供某能力的
@@ -60,21 +90,29 @@
 #[cfg(test)]
 mod test_support;
 
+mod bytes;
+mod config;
 mod digest;
 mod error;
+mod event;
 mod graph;
 mod id;
 mod interface;
 mod lifecycle;
 mod path;
 mod provider;
+mod scheduler;
+mod secret;
 mod size;
+mod state;
 mod time;
 mod upgrade;
 mod version;
 
+pub use config::{ConfigFormat, ConfigRevision, ConfigSchemaVersion, ConfigSnapshot, ConfigValue};
 pub use digest::ContentDigest;
 pub use error::{DomainError, ValueKind};
+pub use event::{EventId, EventPayload, EventPayloadBytes, EventPayloadText, EventTopic};
 pub use graph::{
     ConsumerRecord, InterfaceCandidate, ProviderGraph, ProviderGraphError, ProviderNode,
     ProviderRecord, ResolvedEdge,
@@ -86,8 +124,11 @@ pub use interface::{
 pub use lifecycle::{ComponentLifecycleEvent, ComponentLifecycleState};
 pub use path::ArtifactPath;
 pub use provider::ProviderId;
+pub use scheduler::{ScheduleTrigger, ScheduledTaskId, TaskState, TaskStatus, TriggerPayload};
+pub use secret::{SecretMetadata, SecretName, SecretVersion};
 pub use size::ByteSize;
-pub use time::{Deadline, Duration};
+pub use state::{StateKey, StateSchemaVersion, StateTransactionId, StateValue};
+pub use time::{Deadline, Duration, UtcInstant};
 pub use upgrade::{
     ConsumerUpgradeImpact, UpgradeCompatibilityReport, UpgradeImpact, UpgradeIncompatibility,
 };

@@ -33,6 +33,53 @@ pub(crate) fn validate_identifier(value: &str, kind: ValueKind) -> Result<(), Do
     Ok(())
 }
 
+/// 名称类键（state key / secret name / event topic）共用的结构性校验
+/// （validate-on-construct，§13.3）：非空、≤ `max` 字节、且仅含白名单
+/// 可打印 ASCII 字符 `[A-Za-z0-9._-]`（`allow_slash` 为 true 时额外允许
+/// `/`）。
+///
+/// 与 WIT 契约的字符集不变量逐字对齐：
+/// - `operune:state` `state-key`：`[A-Za-z0-9._-/]`（含 `/`）；
+/// - `operune:secret` `secret-name`：`[A-Za-z0-9._-]`；
+/// - `operune:event` `topic`：`[A-Za-z0-9._-]`。
+///
+/// 白名单即校验：控制字符、空白、`\`（Windows 路径分隔符）及其它任意
+/// 字符自动被拒绝（§14.2 日志注入防护；`\` 在任何契约字符集中都不存在）。
+pub(crate) fn validate_name_key(
+    value: &str,
+    max: usize,
+    allow_slash: bool,
+    kind: ValueKind,
+) -> Result<(), DomainError> {
+    if value.is_empty() {
+        return Err(DomainError::invalid_value(kind, "must not be empty"));
+    }
+    if value.len() > max {
+        return Err(DomainError::invalid_value(
+            kind,
+            format!("must not exceed {max} bytes"),
+        ));
+    }
+    let all_ascii = value.bytes().all(|b| {
+        matches!(b, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'.' | b'_' | b'-')
+            || (allow_slash && b == b'/')
+    });
+    if !all_ascii {
+        let charset = if allow_slash {
+            "[A-Za-z0-9._-/]"
+        } else {
+            "[A-Za-z0-9._-]"
+        };
+        return Err(DomainError::invalid_value(
+            kind,
+            format!(
+                "must only contain printable ASCII {charset} (no control characters, whitespace, or other characters)"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// 作者声明的逻辑产品/应用身份（§6.7 / §19.4 `ComponentId`），与 WIT
 /// `operune:component@0.1.0` 的 `component-id` record（唯一稳定逻辑键，Core
 /// 只按字符串等价比较并作为注册表逻辑键，不做语义解析）语义一致。

@@ -82,6 +82,24 @@ pub enum ValueKind {
     InterfaceId,
     /// [`InterfaceRequirement`](crate::InterfaceRequirement)（0.2.0 契约面，§40.2）。
     InterfaceRequirement,
+    /// [`StateKey`](crate::StateKey)（0.3.0 stateful runtime，§41.2）。
+    StateKey,
+    /// [`StateValue`](crate::StateValue)（0.3.0 stateful runtime，§41.2）。
+    StateValue,
+    /// [`ConfigFormat`](crate::ConfigFormat)（0.3.0 stateful runtime，§41.2）。
+    ConfigFormat,
+    /// [`ConfigValue`](crate::ConfigValue)（0.3.0 stateful runtime，§41.2）。
+    ConfigValue,
+    /// [`SecretName`](crate::SecretName)（0.3.0 stateful runtime，§41.2 / §16.6）。
+    SecretName,
+    /// [`UtcInstant`](crate::UtcInstant)（0.3.0 scheduler，§41.2；WIT `datetime`）。
+    UtcInstant,
+    /// [`TaskState`](crate::TaskState)（0.3.0 scheduler，§41.2）。
+    TaskState,
+    /// [`EventTopic`](crate::EventTopic)（0.3.0 event bus，§41.2 / §17.3）。
+    EventTopic,
+    /// [`EventPayload`](crate::EventPayload) 载荷（0.3.0 event bus，§41.2）。
+    EventPayload,
 }
 
 impl fmt::Display for ValueKind {
@@ -103,6 +121,15 @@ impl fmt::Display for ValueKind {
             Self::InterfaceName => "interface-name",
             Self::InterfaceId => "interface-id",
             Self::InterfaceRequirement => "interface-requirement",
+            Self::StateKey => "state-key",
+            Self::StateValue => "state-value",
+            Self::ConfigFormat => "config-format",
+            Self::ConfigValue => "config-value",
+            Self::SecretName => "secret-name",
+            Self::UtcInstant => "utc-instant",
+            Self::TaskState => "task-state",
+            Self::EventTopic => "event-topic",
+            Self::EventPayload => "event-payload",
         };
         f.write_str(s)
     }

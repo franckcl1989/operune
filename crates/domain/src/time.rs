@@ -1,5 +1,7 @@
 use std::time::{Duration as StdDuration, Instant};
 
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
 use crate::error::{DomainError, ValueKind};
 
 /// 非负时间间隔（§13.1 Duration；§13.2 推荐 `std::time::Duration` 作为基础
@@ -99,6 +101,40 @@ impl Duration {
     }
 }
 
+/// `Duration` 的持久化形态：`{seconds, nanoseconds}`（与 `std::time::Duration`
+/// 的内部表示一致，无精度损失；nanoseconds < 1e9）。供内部持久 / 配置边界
+/// 序列化（§13.3；0.3.0 scheduler 的 periodic interval 等携带 Duration 的
+/// 记录因此可以 derive serde）。
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+struct WireDuration {
+    seconds: u64,
+    nanoseconds: u32,
+}
+
+impl Serialize for Duration {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        WireDuration {
+            seconds: self.0.as_secs(),
+            nanoseconds: self.0.subsec_nanos(),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for Duration {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let wire = WireDuration::deserialize(deserializer)?;
+        // `std::time::Duration::new` 在 nanoseconds >= 1e9 时 panic（§14.2
+        // 禁止）；先显式校验，失败返回 serde 错误而非 panic。
+        if wire.nanoseconds >= 1_000_000_000 {
+            return Err(serde::de::Error::custom(
+                "nanoseconds must be < 1_000_000_000",
+            ));
+        }
+        Ok(Duration(StdDuration::new(wire.seconds, wire.nanoseconds)))
+    }
+}
+
 /// 绝对截止时间（§13.1 Deadline），基于单调时钟 `std::time::Instant`，
 /// 不受墙上时钟跳变影响。
 ///
@@ -145,10 +181,150 @@ impl Deadline {
     }
 }
 
+/// `UtcInstant` 的持久化形态：WIT `datetime` 的 wire 形状 `{seconds, nanoseconds}`
+/// （秒 + 纳秒偏移，§13.3 边界形态与领域内部表示分离）。
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+struct WireUtcInstant {
+    seconds: u64,
+    nanoseconds: u32,
+}
+
+/// UTC 硬时刻（绝对墙上时钟时刻，§13.2 Timestamp 语义；0.3.0 scheduler 的
+/// `datetime` 契约表达，§41.2）。
+///
+/// 与 WIT `operune:scheduler@0.1.0` 的 `datetime` record 严格对齐：语义为
+/// 自 Unix epoch 起的 UTC 秒 + 纳秒偏移，不变量 `nanoseconds < 1_000_000_000`
+/// （WIT 明文）；WIT 的 wire 形态不含时区/日历语义（"不含时区/日历语义"），
+/// 本类型同样不暴露日历/时区运算。
+///
+/// 内部表示 `time::OffsetDateTime`（UTC 偏移；§13.2："UTC 时间：
+/// `time::OffsetDateTime`，但 Domain API 应区分 Timestamp/Expiry 等语义"）。
+/// 与 [`Duration`]（非负间隔）和 [`Deadline`]（单调时钟截止）的类型关系：
+/// `UtcInstant` 是**墙上时钟**绝对时刻（Timestamp），`Deadline` 是**单调
+/// 时钟**绝对截止（Expiry/deadline 语义）——两者语义不同、不存在转换；
+/// 时刻的**算术**（计划时刻偏移）使用 [`Duration`]（checked 运算，§14.4）。
+///
+/// 表示范围（确定性文档边界）：`time` crate 的 `OffsetDateTime` 可表示
+/// 公元 -9999..=9999 年；WIT 的 u64 秒值超出该范围时构造返回
+/// [`DomainError::InvalidValue`]（超出范围的调度时刻无实际语义；
+/// WIT 的宿主侧上限由 Core 策略施加，§7.4）。自 Unix epoch 之前的时刻
+/// 不可表示（WIT `seconds: u64` 非负）。
+///
+/// 不变量（validate-on-construct，§13.3）：`nanoseconds < 1_000_000_000`；
+/// 时刻 ≥ Unix epoch；可被 `time` crate 表示（年 -9999..=9999）。
+///
+/// 错误：构造失败返回 [`DomainError::InvalidValue`]；算术溢出返回
+/// [`DomainError::Overflow`]。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct UtcInstant(time::OffsetDateTime);
+
+impl UtcInstant {
+    /// 从 WIT `datetime` wire 形态构造（§13.3 边界解析一次）：
+    /// 自 Unix epoch 起的 `seconds` 秒 + `nanoseconds` 纳秒偏移。
+    ///
+    /// 校验（validate-on-construct，§13.3）：`nanoseconds < 1_000_000_000`
+    /// （WIT 不变量）；秒值必须可被内部表示承载（见类型文档范围边界）。
+    pub fn from_unix_parts(seconds: u64, nanoseconds: u32) -> Result<Self, DomainError> {
+        if nanoseconds >= 1_000_000_000 {
+            return Err(DomainError::invalid_value(
+                ValueKind::UtcInstant,
+                "nanoseconds must be < 1_000_000_000 (WIT datetime invariant)",
+            ));
+        }
+        let nanos_total = i128::from(seconds) * 1_000_000_000 + i128::from(nanoseconds);
+        let datetime =
+            time::OffsetDateTime::from_unix_timestamp_nanos(nanos_total).map_err(|e| {
+                DomainError::invalid_value(
+                    ValueKind::UtcInstant,
+                    format!("{seconds}s + {nanoseconds}ns is outside the representable range: {e}"),
+                )
+            })?;
+        Ok(Self(datetime))
+    }
+
+    /// WIT `datetime` wire 形态视图（与 [`UtcInstant::from_unix_parts`]
+    /// 互为逆操作；§13.3 适配层边界输出）。
+    ///
+    /// 不可失败：构造不变量保证时刻 ≥ Unix epoch 且可表示（见类型文档），
+    /// 因此 `unix_timestamp_nanos()` 恒非负，拆分为秒/纳秒后必在
+    /// u64/u32 范围内（下式 `try_from` 在不变式下不可失败，`unwrap_or_default`
+    /// 仅防御性占位，绝不产生错误的 wire 值）。
+    pub fn as_unix_parts(self) -> (u64, u32) {
+        let nanos_total = self.0.unix_timestamp_nanos();
+        let seconds = u64::try_from(nanos_total / 1_000_000_000).unwrap_or_default();
+        let nanoseconds = u32::try_from(nanos_total % 1_000_000_000).unwrap_or_default();
+        (seconds, nanoseconds)
+    }
+
+    /// 内部表示视图（UTC）：供宿主侧与墙上时钟（`time::OffsetDateTime` /
+    /// wasi:clocks 适配结果）比较，如 scheduler 的"目标时刻已过去"
+    /// （`invalid-trigger`，scheduler.wit）判定在 application 层执行。
+    pub fn as_offset_date_time(self) -> time::OffsetDateTime {
+        self.0
+    }
+
+    /// 检查加法（溢出即 Err，§14.4；如接近表示范围边界的计划时刻）。
+    ///
+    /// 内部表示（`time::OffsetDateTime`）的加法接受 time crate 的
+    /// 有符号 `Duration`；本类型以 [`Duration`]（非负 std 间隔）为领域
+    /// 算术单位，转换失败（超出有符号可表示范围，§14.4 禁止回绕）与
+    /// 时刻溢出统一为 [`DomainError::Overflow`]。
+    pub fn checked_add(self, duration: Duration) -> Result<UtcInstant, DomainError> {
+        let duration = time::Duration::try_from(duration.0).map_err(|_| DomainError::Overflow {
+            operation: "utc-instant addition",
+        })?;
+        self.0
+            .checked_add(duration)
+            .map(UtcInstant)
+            .ok_or(DomainError::Overflow {
+                operation: "utc-instant addition",
+            })
+    }
+
+    /// 检查减法（`duration > self` 即 Err，§14.4）。
+    ///
+    /// 不变量补强：结果必须仍 ≥ Unix epoch（[`UtcInstant`] 构造不变量——
+    /// WIT `datetime.seconds` 是 u64，无负时刻）；减到 epoch 之前的时刻
+    /// 统一为 [`DomainError::Overflow`]。
+    pub fn checked_sub(self, duration: Duration) -> Result<UtcInstant, DomainError> {
+        let duration = time::Duration::try_from(duration.0).map_err(|_| DomainError::Overflow {
+            operation: "utc-instant subtraction",
+        })?;
+        let result = self.0.checked_sub(duration).ok_or(DomainError::Overflow {
+            operation: "utc-instant subtraction",
+        })?;
+        if result < time::OffsetDateTime::UNIX_EPOCH {
+            return Err(DomainError::Overflow {
+                operation: "utc-instant subtraction",
+            });
+        }
+        Ok(UtcInstant(result))
+    }
+}
+
+impl Serialize for UtcInstant {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let (seconds, nanoseconds) = self.as_unix_parts();
+        WireUtcInstant {
+            seconds,
+            nanoseconds,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for UtcInstant {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let wire = WireUtcInstant::deserialize(deserializer)?;
+        Self::from_unix_parts(wire.seconds, wire.nanoseconds).map_err(serde::de::Error::custom)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_support::ok;
+    use proptest::prelude::*;
 
     #[test]
     fn secs_millis_roundtrip() {
@@ -278,5 +454,158 @@ mod tests {
             deadline.is_expired(),
             "deadline did not expire within 100ms"
         );
+    }
+
+    #[test]
+    fn duration_serde_roundtrip() {
+        let duration = Duration::from_millis(1500);
+        let json = ok(serde_json::to_string(&duration), "serialize");
+        assert_eq!(json, "{\"seconds\":1,\"nanoseconds\":500000000}");
+        assert_eq!(
+            ok(serde_json::from_str::<Duration>(&json), "deserialize"),
+            duration
+        );
+        // 反序列化边界同样校验 nanoseconds < 1e9（§13.3）。
+        assert!(
+            serde_json::from_str::<Duration>("{\"seconds\":1,\"nanoseconds\":1000000000}").is_err()
+        );
+    }
+
+    #[test]
+    fn utc_instant_from_unix_parts_accepts_wit_shape() {
+        let epoch = ok(UtcInstant::from_unix_parts(0, 0), "epoch");
+        assert_eq!(epoch.as_unix_parts(), (0, 0));
+        let noon = ok(
+            UtcInstant::from_unix_parts(1_752_000_000, 123_456_789),
+            "noon",
+        );
+        assert_eq!(noon.as_unix_parts(), (1_752_000_000, 123_456_789));
+        // WIT 不变量边界：nanoseconds == 1_000_000_000 - 1 合法。
+        let boundary = ok(
+            UtcInstant::from_unix_parts(1_752_000_000, 999_999_999),
+            "boundary",
+        );
+        assert_eq!(boundary.as_unix_parts(), (1_752_000_000, 999_999_999));
+    }
+
+    #[test]
+    fn utc_instant_rejects_invalid_parts() {
+        // WIT 明文不变量：nanoseconds < 1_000_000_000。
+        assert!(matches!(
+            UtcInstant::from_unix_parts(0, 1_000_000_000),
+            Err(DomainError::InvalidValue {
+                kind: ValueKind::UtcInstant,
+                ..
+            })
+        ));
+        assert!(matches!(
+            UtcInstant::from_unix_parts(0, u32::MAX),
+            Err(DomainError::InvalidValue {
+                kind: ValueKind::UtcInstant,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn utc_instant_rejects_out_of_representable_range() {
+        // time crate 表示范围：年 -9999..=9999（类型文档明文边界）。
+        // 公元 10000-01-01T00:00:00Z = 253_402_300_800 秒。
+        assert!(matches!(
+            UtcInstant::from_unix_parts(253_402_300_800, 0),
+            Err(DomainError::InvalidValue {
+                kind: ValueKind::UtcInstant,
+                ..
+            })
+        ));
+        assert!(matches!(
+            UtcInstant::from_unix_parts(u64::MAX, 0),
+            Err(DomainError::InvalidValue {
+                kind: ValueKind::UtcInstant,
+                ..
+            })
+        ));
+        // 边界内（公元 9999-12-31T23:59:59Z = 253_402_300_799 秒）合法。
+        assert!(UtcInstant::from_unix_parts(253_402_300_799, 999_999_999).is_ok());
+    }
+
+    #[test]
+    fn utc_instant_checked_arithmetic() {
+        let t = ok(UtcInstant::from_unix_parts(1_752_000_000, 500_000_000), "t");
+        let plus = ok(t.checked_add(Duration::from_millis(1500)), "add");
+        assert_eq!(plus.as_unix_parts(), (1_752_000_002, 0));
+        let minus = ok(t.checked_sub(Duration::from_millis(500)), "sub");
+        assert_eq!(minus.as_unix_parts(), (1_752_000_000, 0));
+        // 减法下溢：duration 大于自身 → Overflow（§14.4）。
+        assert!(matches!(
+            t.checked_sub(Duration::from_secs(1_752_000_001)),
+            Err(DomainError::Overflow { .. })
+        ));
+        // 加法溢出：接近表示范围边界 → Overflow。
+        let top = ok(
+            UtcInstant::from_unix_parts(253_402_300_799, 999_999_999),
+            "top",
+        );
+        assert!(matches!(
+            top.checked_add(Duration::from_millis(1)),
+            Err(DomainError::Overflow { .. })
+        ));
+        // 单位往返：+60s 再 -60s 回到原时刻。
+        assert_eq!(
+            ok(t.checked_add(Duration::from_secs(60)), "add 60s")
+                .checked_sub(Duration::from_secs(60)),
+            Ok(t)
+        );
+    }
+
+    #[test]
+    fn utc_instant_ord_follows_wall_clock() {
+        let early = ok(UtcInstant::from_unix_parts(1_752_000_000, 0), "early");
+        let late = ok(UtcInstant::from_unix_parts(1_752_000_000, 1), "late");
+        let later = ok(UtcInstant::from_unix_parts(1_752_000_001, 0), "later");
+        assert!(early < late);
+        assert!(late < later);
+        assert_eq!(
+            ok(UtcInstant::from_unix_parts(1_752_000_000, 0), "same"),
+            early
+        );
+    }
+
+    #[test]
+    fn utc_instant_serde_roundtrip() {
+        let t = ok(UtcInstant::from_unix_parts(1_752_000_000, 123_456_789), "t");
+        let json = ok(serde_json::to_string(&t), "serialize");
+        // 持久化形态 = WIT datetime wire 形状（秒 + 纳秒偏移）。
+        assert_eq!(json, "{\"seconds\":1752000000,\"nanoseconds\":123456789}");
+        assert_eq!(
+            ok(serde_json::from_str::<UtcInstant>(&json), "deserialize"),
+            t
+        );
+        // 反序列化边界同样执行 WIT 不变量校验（§13.3）。
+        assert!(
+            serde_json::from_str::<UtcInstant>("{\"seconds\":0,\"nanoseconds\":1000000000}")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn utc_instant_offset_date_time_interop() {
+        // §13.2 互操作：内部表示是 time::OffsetDateTime（UTC）。
+        let t = ok(UtcInstant::from_unix_parts(1_752_000_000, 0), "t");
+        let dt = t.as_offset_date_time();
+        assert_eq!(dt.unix_timestamp(), 1_752_000_000);
+        // 与墙上时钟比较的用途：scheduler 的"目标时刻已过去"判定
+        // （application 层执行，本契约不含时间读取）。
+        let epoch = ok(UtcInstant::from_unix_parts(0, 0), "epoch");
+        assert!(epoch < t);
+        assert!(epoch.as_offset_date_time() < dt);
+    }
+
+    proptest! {
+        #[test]
+        fn utc_instant_parts_roundtrip(seconds in 0u64..253_402_300_800, nanoseconds in 0u32..1_000_000_000) {
+            let t = ok(UtcInstant::from_unix_parts(seconds, nanoseconds), "instant");
+            prop_assert_eq!(t.as_unix_parts(), (seconds, nanoseconds));
+        }
     }
 }
