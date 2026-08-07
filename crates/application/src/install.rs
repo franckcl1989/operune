@@ -37,7 +37,7 @@
 //! 中止（fail closed）；被拒绝的输入也写审计（拒绝原因），audit 失败时
 //! 以 audit 错误中止。
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use operune_domain::{
     ByteSize, CapabilityId, ComponentId, ComponentLifecycleEvent, ComponentLifecycleState,
@@ -48,6 +48,7 @@ use operune_runtime_wasi_p2::capability::{
 };
 
 use crate::active::{ActiveEntry, ActiveInstallation, ActiveRuntimeRegistry};
+use crate::composition::{CompositionService, records_from_surface};
 use crate::contract::GuestComponentDescriptor;
 use crate::error::ApplicationError;
 use crate::model::{
@@ -92,6 +93,10 @@ pub struct InstallService {
 
 impl InstallService {
     /// 构造（注入全部端口与运行依赖；composition root 组装）。
+    ///
+    /// 0.2.0 Capability Composition 默认不接线（composition = None，保持
+    /// 0.1.0 语义：非宿主 import 以 §19.5 UnsupportedCapability 拒绝）；
+    /// 接线见 [`InstallService::set_composition`]。
     pub fn new(
         registry: Arc<dyn ComponentRegistryPort>,
         grants: Arc<dyn GrantStorePort>,
@@ -104,6 +109,20 @@ impl InstallService {
         Self {
             pipeline: Pipeline::new(registry, grants, audit, config, runtime, active, assets),
         }
+    }
+
+    /// 接线 0.2.0 Capability Composition（§40：激活前先构建/解析 provider
+    /// graph，consumer 激活依赖 provider 先激活；graph records 提交 +
+    /// 快照原子切换）。composition root 在启动装配期调用一次；重复接线
+    /// → typed 拒绝（§12.4 无全局可变状态，wiring 是一次性事实）。
+    pub fn set_composition(
+        &self,
+        composition: Arc<CompositionService>,
+    ) -> Result<(), ApplicationError> {
+        self.pipeline
+            .composition
+            .set(composition)
+            .map_err(|_| ApplicationError::Internal("composition is already wired"))
     }
 
     /// 两阶段安装（§19.2）：成功返回激活结果；失败返回 typed error，
@@ -140,6 +159,9 @@ pub(crate) struct Pipeline {
     runtime: Arc<dyn WasmRuntime>,
     active: Arc<ActiveRuntimeRegistry>,
     assets: Arc<AssetCache>,
+    /// 0.2.0 Capability Composition 接线（§40；`None` = 0.1.0 语义）。
+    /// `OnceLock`：composition root 装配期一次性设置，运行期只读。
+    composition: OnceLock<Arc<CompositionService>>,
 }
 
 impl Pipeline {
@@ -160,6 +182,7 @@ impl Pipeline {
             runtime,
             active,
             assets,
+            composition: OnceLock::new(),
         }
     }
 
@@ -237,9 +260,16 @@ impl Pipeline {
             ));
         }
 
-        // 初步依赖 + 权限需要计划（§19.2 顺序 6）。跨 Component import
-        // （0.2 Provider Graph 之外）0.1.0 明确判定为不支持并拒绝（§19.5）。
-        let required = match classify_imports(&surface) {
+        // 初步依赖 + 权限需要计划（§19.2 顺序 6）。composition 未接线
+        // （0.1.0）：跨 Component import 明确判定为不支持并拒绝（§19.5）；
+        // composition 接线（0.2.0）：非宿主 import 属于 provider graph
+        // （§40.3），只推导宿主能力需求（wasi:/operune:，§17.5），
+        // Component-to-Component 需求由 graph 门控校验。
+        let required = match if self.composition.get().is_some() {
+            classify_host_imports(&surface)
+        } else {
+            classify_imports(&surface)
+        } {
             Ok(capabilities) => capabilities,
             Err(error) => {
                 return Err(self.reject(
@@ -404,6 +434,57 @@ impl Pipeline {
         // "应用身份"阶段完成（§19.2 / §12.2：Installed → Validated）。
         self.transition_candidate(digest, ComponentLifecycleEvent::ValidationSucceeded)?;
 
+        // —— 阶段二b-0：0.2.0 provider graph 门控（§40.2 / §40.3）——
+        // composition 接线后，激活前先构建/解析 graph：consumer 的激活
+        // 依赖其 provider 已先激活（records 已持久化——缺失则以
+        // MissingProvider 诊断拒绝，天然强制 activation ordering）；环 /
+        // 歧义 / provider 升级不兼容全部 typed 拒绝。任何失败 → candidate
+        // 保持 Failed，当前 Active 不受污染（§19.2）。
+        if let Some(composition) = self.composition.get() {
+            let records = match records_from_surface(installation_id, &surface) {
+                Ok(records) => records,
+                Err(error) => {
+                    return Err(self.fail_candidate(
+                        digest,
+                        AuditEvent::ProviderGraphRejected {
+                            installation: installation_id,
+                            reason: "surface",
+                        },
+                        ComponentLifecycleEvent::ResolutionFailed,
+                        error,
+                    ));
+                }
+            };
+            // provider 升级 / 回滚：先做 consumer 兼容分析门控（§40.2）。
+            composition
+                .check_upgrade(installation_id, &records)
+                .map_err(|error| {
+                    self.fail_candidate(
+                        digest,
+                        AuditEvent::ProviderGraphRejected {
+                            installation: installation_id,
+                            reason: "upgrade-analysis",
+                        },
+                        ComponentLifecycleEvent::ResolutionFailed,
+                        error,
+                    )
+                })?;
+            // 全量重建门控（含新增 consumer 需求 / 新提供面引发的重新解析）。
+            composition
+                .check_activation(installation_id, &records)
+                .map_err(|error| {
+                    self.fail_candidate(
+                        digest,
+                        AuditEvent::ProviderGraphRejected {
+                            installation: installation_id,
+                            reason: "resolution",
+                        },
+                        ComponentLifecycleEvent::ResolutionFailed,
+                        error,
+                    )
+                })?;
+        }
+
         // —— 阶段二b：imports 解析与 grant（§17.2 / §17.5 / §19.5）——
 
         let grants = self.target_grants(&target, &request, installation_id)?;
@@ -505,6 +586,7 @@ impl Pipeline {
                 active,
                 manifest,
                 cached,
+                &surface,
             ),
             PipelineTarget::Upgrade { current } => self.activate_upgrade(
                 AuditEvent::UpgradeSwapped {
@@ -523,6 +605,7 @@ impl Pipeline {
                 manifest,
                 cached,
                 &config,
+                &surface,
             ),
             PipelineTarget::Rollback { current } => self.activate_upgrade(
                 AuditEvent::Rollback {
@@ -541,6 +624,7 @@ impl Pipeline {
                 manifest,
                 cached,
                 &config,
+                &surface,
             ),
         }
     }
@@ -746,7 +830,12 @@ impl Pipeline {
         active: Arc<dyn ActiveRuntime>,
         manifest: Option<WebManifestData>,
         cached: u64,
+        surface: &ContractSurface,
     ) -> Result<PipelineResult, ApplicationError> {
+        // 0.2.0：graph records 提交 + 快照原子切换（§40.2）。在任何
+        // durable "激活成功" 写入之前执行：失败 → candidate Failed，
+        // 无持久化 / 运行时变化。
+        self.commit_graph(digest, installation_id, surface)?;
         // §18.7：durable audit 先行（fail closed）。
         self.audit_ok(AuditEvent::ActivationSucceeded {
             installation: installation_id,
@@ -810,6 +899,7 @@ impl Pipeline {
         manifest: Option<WebManifestData>,
         cached: u64,
         config: &RuntimeConfig,
+        surface: &ContractSurface,
     ) -> Result<PipelineResult, ApplicationError> {
         let old_digest = current.active_digest.ok_or(ApplicationError::Internal(
             "active installation lacks an active digest",
@@ -821,6 +911,9 @@ impl Pipeline {
                 digest,
             });
         }
+        // 0.2.0：graph records 提交（升级 = 新提供面/需求面整组替换）+ 快照
+        // 原子切换（§40.2）。在任何 durable "激活成功" 写入之前执行。
+        self.commit_graph(digest, installation_id, surface)?;
         let previous =
             self.active
                 .take_previous(installation_id)
@@ -913,6 +1006,54 @@ impl Pipeline {
     }
 
     // —— 内部辅助：audit fail-closed 与状态机 ——
+
+    /// 0.2.0：composition 提交（§40.2 graph snapshot atomic switch）——
+    /// records 持久化 + graph 快照单指针交换，在管线任何 durable
+    /// "激活成功" 写入**之前**执行（§18.5 crash consistency 边界在存储层
+    /// 事务；门控/audit 失败发生在落盘前，不产生持久化变化）。返回新图
+    /// （运行时层经 `composition.graph()` 读取 `topological_order()` 驱动
+    /// 实例化顺序，§40.2 activation ordering）。
+    fn commit_graph(
+        &self,
+        digest: ContentDigest,
+        installation_id: InstallationId,
+        surface: &ContractSurface,
+    ) -> Result<(), ApplicationError> {
+        let Some(composition) = self.composition.get() else {
+            return Ok(());
+        };
+        let records = match records_from_surface(installation_id, surface) {
+            Ok(records) => records,
+            Err(error) => {
+                return Err(self.fail_candidate(
+                    digest,
+                    AuditEvent::ProviderGraphRejected {
+                        installation: installation_id,
+                        reason: "surface",
+                    },
+                    ComponentLifecycleEvent::ResolutionFailed,
+                    error,
+                ));
+            }
+        };
+        // commit 内部重跑 gate（build_candidate）：与门控阶段相同的输入
+        // （surface → records 纯函数、store 不变）必然通过；并发变更以
+        // typed 错误拒绝。
+        composition
+            .commit_activation(installation_id, &records)
+            .map_err(|error| {
+                self.fail_candidate(
+                    digest,
+                    AuditEvent::ProviderGraphRejected {
+                        installation: installation_id,
+                        reason: "commit",
+                    },
+                    ComponentLifecycleEvent::ResolutionFailed,
+                    error,
+                )
+            })?;
+        Ok(())
+    }
 
     fn audit_ok(&self, event: AuditEvent) -> Result<(), ApplicationError> {
         self.audit.append(event).map_err(ApplicationError::Audit)
@@ -1007,14 +1148,33 @@ pub(crate) fn classify_imports(
     Ok(capabilities)
 }
 
+/// 0.2.0 变体（composition 接线时使用）：只推导宿主能力
+/// （`wasi:` / `operune:`，§17.5）的权限需求；非宿主 import 属于 provider
+/// graph（§40.3 事实源），由 composition 门控校验，不在本分类中拒绝。
+pub(crate) fn classify_host_imports(
+    surface: &ContractSurface,
+) -> Result<Vec<CapabilityId>, ApplicationError> {
+    let mut capabilities = Vec::new();
+    for import in &surface.imports {
+        match ImportClass::normalize(import) {
+            ImportClass::Wasi | ImportClass::Operune => {
+                capabilities.push(ImportClass::capability_id(import)?);
+            }
+            ImportClass::Unsupported => {}
+        }
+    }
+    Ok(capabilities)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::model::{
-        GrantScope, WebAssetEntry, WebAssetPath, WebManifestData, WebManifestFeatures,
+        GrantScope, RollbackRequest, UpgradeOutcome, UpgradeRequest, WebAssetEntry, WebAssetPath,
+        WebManifestData, WebManifestFeatures,
     };
     use crate::test_support::{
-        Harness, default_descriptor, grant, ok, plain_install_request, some,
+        Harness, default_descriptor, grant, ok, plain_install_request, some, test_failure,
     };
     use operune_domain::ComponentVersion;
 
@@ -1545,5 +1705,463 @@ mod tests {
                 "audit must not contain env grant values (§16.6): {serialized}"
             );
         }
+    }
+
+    // ------------------------------------------------------------------
+    // 0.2.0 composition 接线（§40）：graph 门控与快照切换的管线集成
+    // ------------------------------------------------------------------
+
+    /// provider 组件 surface（导出 acme:svc/checkout@1.0.0）。
+    fn provider_surface(version: &str) -> ContractSurface {
+        ContractSurface {
+            imports: vec!["wasi:cli/run@0.2.0".to_owned()],
+            exports: vec![
+                "descriptor".to_owned(),
+                format!("acme:svc/checkout@{version}"),
+            ],
+        }
+    }
+
+    /// consumer 组件 surface（导入 acme:svc/checkout@1.0.0）。
+    fn consumer_surface() -> ContractSurface {
+        ContractSurface {
+            imports: vec![
+                "wasi:cli/run@0.2.0".to_owned(),
+                "acme:svc/checkout@1.0.0".to_owned(),
+            ],
+            exports: vec!["descriptor".to_owned()],
+        }
+    }
+
+    /// 全 0.2.0 流程：composition 接线 + provider/consumer 表面。
+    fn composition_harness() -> Harness {
+        Harness::with_composition(RuntimeConfig::default())
+    }
+
+    /// 携带 wasi:cli/run grant 的安装请求（composition 测试的组件表面
+    /// 都带宿主 import，须先满足 §17.5 grant 才能走到 graph 门控）。
+    fn graph_install_request(bytes: Vec<u8>) -> InstallRequest {
+        InstallRequest {
+            bytes,
+            grants: GrantApproval::Explicit(vec![grant("wasi:cli/run")]),
+        }
+    }
+
+    /// consumer 组件 descriptor（独立逻辑身份，避免与 provider 的
+    /// demo 1.0.0 绑定冲突，§19.4）。
+    fn consumer_descriptor() -> crate::contract::GuestComponentDescriptor {
+        crate::contract::GuestComponentDescriptor {
+            component_id: "demo-consumer".to_owned(),
+            major: 1,
+            minor: 0,
+            patch: 0,
+            display_name: "Demo Consumer".to_owned(),
+            author: None,
+        }
+    }
+
+    /// provider v2 descriptor（同一逻辑产品的新版本，§20 升级语义）。
+    fn provider_v2_descriptor() -> crate::contract::GuestComponentDescriptor {
+        crate::contract::GuestComponentDescriptor {
+            component_id: "demo".to_owned(),
+            major: 2,
+            minor: 0,
+            patch: 0,
+            display_name: "Demo Component".to_owned(),
+            author: None,
+        }
+    }
+
+    /// consumer v2 descriptor（consumer 升级到新版本，§20）。
+    fn consumer_v2_descriptor() -> crate::contract::GuestComponentDescriptor {
+        crate::contract::GuestComponentDescriptor {
+            component_id: "demo-consumer".to_owned(),
+            major: 2,
+            minor: 0,
+            patch: 0,
+            display_name: "Demo Consumer".to_owned(),
+            author: None,
+        }
+    }
+
+    #[test]
+    fn composition_wired_install_commits_graph_records() {
+        // §40.2：composition 接线后，组件激活 = 0.1 管线 + graph records
+        // 提交 + 快照原子切换。
+        let harness = composition_harness();
+        harness.runtime.with_surface(provider_surface("1.0.0"));
+        let bytes = b"provider bytes".to_vec();
+        let outcome = ok(
+            harness
+                .install
+                .install(graph_install_request(bytes.clone())),
+            "install provider",
+        );
+        let installation = match outcome {
+            InstallOutcome::Activated { installation, .. } => installation,
+        };
+        // graph 快照已切换：provider 在图中，激活顺序含该安装。
+        let graph = match &harness.composition {
+            Some(composition) => composition.graph(),
+            None => test_failure("composition must be wired"),
+        };
+        assert!(
+            graph
+                .providers()
+                .any(|node| node.installation() == installation)
+        );
+        assert_eq!(graph.topological_order(), &[installation]);
+        // records 已持久化（恢复输入）。
+        assert!(harness.graph_store.provider(installation).is_some());
+        // 宿主 import（wasi:）仍走 0.1 grant 路径：grant 已按 §17.5 落盘。
+        assert_eq!(harness.grants.stored(installation).len(), 1);
+    }
+
+    #[test]
+    fn composition_wired_consumer_without_provider_is_rejected() {
+        // §40.2 activation ordering：provider 未先激活时，consumer 的安装
+        // 被缺失 provider 诊断拒绝；candidate Failed，Active 快照不受污染。
+        let harness = composition_harness();
+        harness.runtime.with_surface(consumer_surface());
+        let bytes = b"consumer bytes".to_vec();
+        let digest = ContentDigest::from_bytes(&bytes);
+        let result = harness.install.install(graph_install_request(bytes));
+        match result {
+            Err(ApplicationError::ProviderGraphResolution { source }) => {
+                assert!(
+                    matches!(
+                        source,
+                        operune_domain::ProviderGraphError::MissingProvider { .. }
+                    ),
+                    "expected missing provider diagnostics: {source}"
+                );
+            }
+            other => test_failure(format_args!(
+                "consumer without provider must be rejected: {other:?}"
+            )),
+        }
+        assert_eq!(
+            harness.registry.candidate_state(digest),
+            Some(ComponentLifecycleState::Failed)
+        );
+        assert!(harness.active.is_empty());
+        // 门控拒绝已审计（§18.7 fail-closed 语义）。
+        assert!(
+            harness
+                .audit
+                .contains(|event| matches!(event, AuditEvent::ProviderGraphRejected { .. }))
+        );
+        // 未提交任何 records（gate 在落盘前）。
+        assert_eq!(harness.graph_store.count(), 0);
+    }
+
+    #[test]
+    fn composition_wired_consumer_activates_after_provider() {
+        // provider 先激活 → consumer 后激活：图按拓扑序解析。
+        let harness = composition_harness();
+        harness.runtime.with_surface(provider_surface("1.0.0"));
+        let provider_outcome = ok(
+            harness
+                .install
+                .install(graph_install_request(b"provider bytes".to_vec())),
+            "install provider",
+        );
+        let provider_installation = match provider_outcome {
+            InstallOutcome::Activated { installation, .. } => installation,
+        };
+        harness
+            .runtime
+            .with_surface_for(b"consumer bytes", consumer_surface());
+        harness
+            .runtime
+            .with_descriptor_for(b"consumer bytes", consumer_descriptor());
+        let consumer_outcome = ok(
+            harness
+                .install
+                .install(graph_install_request(b"consumer bytes".to_vec())),
+            "install consumer",
+        );
+        let consumer_installation = match consumer_outcome {
+            InstallOutcome::Activated { installation, .. } => installation,
+        };
+        let graph = match &harness.composition {
+            Some(composition) => composition.graph(),
+            None => test_failure("composition must be wired"),
+        };
+        // §40.2 activation ordering：provider 先于 consumer。
+        assert_eq!(
+            graph.topological_order(),
+            &[provider_installation, consumer_installation]
+        );
+        assert!(harness.active.get(consumer_installation).is_some());
+    }
+
+    #[test]
+    fn composition_wired_0_1_semantics_for_host_only_components() {
+        // composition 接线后，纯宿主组件（无 graph 参与）行为与 0.1 相同：
+        // 激活成功、无 records 提交、图不变（空）。
+        let harness = composition_harness();
+        harness.runtime.with_surface(ContractSurface {
+            imports: vec!["wasi:cli/run@0.2.0".to_owned()],
+            exports: vec!["descriptor".to_owned()],
+        });
+        let outcome = ok(
+            harness
+                .install
+                .install(graph_install_request(b"plain bytes".to_vec())),
+            "install plain component",
+        );
+        assert!(matches!(outcome, InstallOutcome::Activated { .. }));
+        assert_eq!(harness.graph_store.count(), 0);
+        let graph = match &harness.composition {
+            Some(composition) => composition.graph(),
+            None => test_failure("composition must be wired"),
+        };
+        assert_eq!(graph.providers().count(), 0);
+    }
+
+    #[test]
+    fn composition_wired_breaking_provider_upgrade_rejected() {
+        // §40.2 provider upgrade 前 consumer 兼容分析门控：破坏性升级被
+        // 拒绝，v1 保持 active（graph 快照未切换）。
+        let harness = composition_harness();
+        harness.runtime.with_surface(provider_surface("1.0.0"));
+        let provider_outcome = ok(
+            harness
+                .install
+                .install(graph_install_request(b"provider v1".to_vec())),
+            "install provider v1",
+        );
+        let provider_installation = match provider_outcome {
+            InstallOutcome::Activated { installation, .. } => installation,
+        };
+        harness
+            .runtime
+            .with_surface_for(b"consumer bytes", consumer_surface());
+        harness
+            .runtime
+            .with_descriptor_for(b"consumer bytes", consumer_descriptor());
+        ok(
+            harness
+                .install
+                .install(graph_install_request(b"consumer bytes".to_vec())),
+            "install consumer",
+        );
+        // provider v2：移除 checkout（只导出 analytics）→ 直接 consumer 破坏。
+        harness.runtime.with_surface_for(
+            b"provider v2",
+            ContractSurface {
+                imports: vec!["wasi:cli/run@0.2.0".to_owned()],
+                exports: vec![
+                    "descriptor".to_owned(),
+                    "acme:svc/analytics@0.1.0".to_owned(),
+                ],
+            },
+        );
+        harness
+            .runtime
+            .with_descriptor_for(b"provider v2", provider_v2_descriptor());
+        let result = harness.upgrade.upgrade(UpgradeRequest {
+            installation: provider_installation,
+            bytes: b"provider v2".to_vec(),
+            grants: GrantApproval::ReuseExisting,
+        });
+        match result {
+            Err(ApplicationError::ProviderUpgradeIncompatible {
+                installation,
+                report,
+            }) => {
+                assert!(!report.is_safe());
+                assert_eq!(report.impacts().len(), 1);
+                assert!(
+                    report.impacts()[0].requirement().interface().as_str() == "checkout",
+                    "impact must name the checkout requirement"
+                );
+                // 影响面含被破坏的 consumer（diagnostics 向上传）。
+                assert!(report.impacts()[0].consumer() != installation);
+            }
+            other => test_failure(format_args!(
+                "breaking provider upgrade must be rejected: {other:?}"
+            )),
+        }
+        // v1 仍在图与运行时（快照未切换）。
+        let graph = match &harness.composition {
+            Some(composition) => composition.graph(),
+            None => test_failure("composition must be wired"),
+        };
+        assert_eq!(graph.edges().count(), 1);
+        assert!(!harness.active.is_empty());
+    }
+
+    #[test]
+    fn composition_wired_safe_provider_upgrade_swaps_graph() {
+        // 同 major 内升级（1.0.0 → 1.2.0）：consumer 仍满足 → 允许切换。
+        let harness = composition_harness();
+        harness.runtime.with_surface(provider_surface("1.0.0"));
+        let provider_outcome = ok(
+            harness
+                .install
+                .install(graph_install_request(b"provider v1".to_vec())),
+            "install provider v1",
+        );
+        let provider_installation = match provider_outcome {
+            InstallOutcome::Activated { installation, .. } => installation,
+        };
+        harness
+            .runtime
+            .with_surface_for(b"consumer bytes", consumer_surface());
+        harness
+            .runtime
+            .with_descriptor_for(b"consumer bytes", consumer_descriptor());
+        ok(
+            harness
+                .install
+                .install(graph_install_request(b"consumer bytes".to_vec())),
+            "install consumer",
+        );
+        harness
+            .runtime
+            .with_surface_for(b"provider v2", provider_surface("1.2.0"));
+        harness
+            .runtime
+            .with_descriptor_for(b"provider v2", provider_v2_descriptor());
+        let outcome = ok(
+            harness.upgrade.upgrade(UpgradeRequest {
+                installation: provider_installation,
+                bytes: b"provider v2".to_vec(),
+                grants: GrantApproval::ReuseExisting,
+            }),
+            "safe provider upgrade",
+        );
+        assert!(matches!(outcome, UpgradeOutcome::Swapped { .. }));
+        // 快照已切换：edge 解析到 1.2.0。
+        let graph = match &harness.composition {
+            Some(composition) => composition.graph(),
+            None => test_failure("composition must be wired"),
+        };
+        let edge = some(
+            graph
+                .edges()
+                .find(|edge| edge.consumer() != provider_installation),
+            "consumer edge",
+        );
+        assert_eq!(
+            edge.provided().version(),
+            ComponentVersion::from_parts(1, 2, 0)
+        );
+    }
+
+    #[test]
+    fn composition_wired_consumer_upgrade_to_missing_provider_rejected() {
+        // consumer 升级引入不可解析的新需求 → 全量重建门控拒绝；v1 保持。
+        let harness = composition_harness();
+        harness.runtime.with_surface(provider_surface("1.0.0"));
+        let provider_outcome = ok(
+            harness
+                .install
+                .install(graph_install_request(b"provider bytes".to_vec())),
+            "install provider",
+        );
+        let provider_installation = match provider_outcome {
+            InstallOutcome::Activated { installation, .. } => installation,
+        };
+        harness
+            .runtime
+            .with_surface_for(b"consumer v1", consumer_surface());
+        harness
+            .runtime
+            .with_descriptor_for(b"consumer v1", consumer_descriptor());
+        ok(
+            harness
+                .install
+                .install(graph_install_request(b"consumer v1".to_vec())),
+            "install consumer v1",
+        );
+        // consumer 安装实例 = 图中唯一非 provider 的边（consumer 端）。
+        let graph_before = match &harness.composition {
+            Some(composition) => composition.graph(),
+            None => test_failure("composition must be wired"),
+        };
+        let consumer_installation = graph_before
+            .edges()
+            .find(|edge| edge.consumer() != provider_installation)
+            .map(|edge| edge.consumer())
+            .unwrap_or_else(|| test_failure("consumer edge missing"));
+        harness.runtime.with_surface_for(
+            b"consumer v2",
+            ContractSurface {
+                imports: vec![
+                    "wasi:cli/run@0.2.0".to_owned(),
+                    "acme:svc/analytics@1.0.0".to_owned(),
+                ],
+                exports: vec!["descriptor".to_owned()],
+            },
+        );
+        harness
+            .runtime
+            .with_descriptor_for(b"consumer v2", consumer_v2_descriptor());
+        let result = harness.upgrade.upgrade(UpgradeRequest {
+            installation: consumer_installation,
+            bytes: b"consumer v2".to_vec(),
+            grants: GrantApproval::ReuseExisting,
+        });
+        assert!(
+            matches!(
+                result,
+                Err(ApplicationError::ProviderGraphResolution { .. })
+            ),
+            "consumer upgrade to missing provider must be rejected: {result:?}"
+        );
+        // v1 快照保持。
+        let graph = match &harness.composition {
+            Some(composition) => composition.graph(),
+            None => test_failure("composition must be wired"),
+        };
+        assert_eq!(graph.edges().count(), 1);
+    }
+
+    #[test]
+    fn composition_wired_rollback_swaps_graph_records() {
+        // 回滚 provider 到 v1：graph records 整组替换为旧版本的提供面。
+        let harness = composition_harness();
+        harness.runtime.with_surface(provider_surface("1.0.0"));
+        let provider_outcome = ok(
+            harness
+                .install
+                .install(graph_install_request(b"provider v1".to_vec())),
+            "install provider v1",
+        );
+        let provider_installation = match provider_outcome {
+            InstallOutcome::Activated { installation, .. } => installation,
+        };
+        harness
+            .runtime
+            .with_surface_for(b"provider v2", provider_surface("1.2.0"));
+        harness
+            .runtime
+            .with_descriptor_for(b"provider v2", provider_v2_descriptor());
+        ok(
+            harness.upgrade.upgrade(UpgradeRequest {
+                installation: provider_installation,
+                bytes: b"provider v2".to_vec(),
+                grants: GrantApproval::ReuseExisting,
+            }),
+            "upgrade provider v2",
+        );
+        ok(
+            harness.upgrade.rollback(RollbackRequest {
+                installation: provider_installation,
+            }),
+            "rollback provider",
+        );
+        let stored = some(
+            harness.graph_store.provider(provider_installation),
+            "rolled back record",
+        );
+        // 回滚目标 digest 的字节 → surface（v1）→ records（checkout@1.0.0）。
+        assert_eq!(
+            stored.provided().iter().next().map(|id| id.version()),
+            Some(ComponentVersion::from_parts(1, 0, 0))
+        );
     }
 }

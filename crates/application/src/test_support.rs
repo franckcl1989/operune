@@ -9,11 +9,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use operune_domain::{
-    CapabilityId, ComponentId, ComponentLifecycleState, ComponentVersion, ContentDigest,
-    InstallationId,
+    CapabilityId, ComponentId, ComponentLifecycleState, ComponentVersion, ConsumerRecord,
+    ContentDigest, InstallationId, ProviderRecord,
 };
 
 use crate::active::ActiveRuntimeRegistry;
+use crate::composition::{ActiveGraph, CompositionService, GraphPolicy};
 use crate::contract::{GuestActionRequest, GuestComponentDescriptor};
 use crate::error::RuntimeExecutionError;
 use crate::install::InstallService;
@@ -24,7 +25,7 @@ use crate::model::{
 };
 use crate::ports::{
     AuditEvent, AuditPort, ComponentRegistryPort, ConfigPort, GrantError, GrantStorePort,
-    InProcessActionPolicy, RegistryError,
+    GraphRecords, GraphStoreError, InProcessActionPolicy, ProviderGraphPort, RegistryError,
 };
 use crate::runtime::{ActiveRuntime, CompiledWasm, PreparedRuntime, RuntimePlan, WasmRuntime};
 use crate::upgrade::UpgradeService;
@@ -262,6 +263,101 @@ impl ComponentRegistryPort for FakeRegistry {
 }
 
 // ---------------------------------------------------------------------------
+// FakeGraphStore（内存实现，§40.2 graph persistence 的形状对齐）
+// ---------------------------------------------------------------------------
+
+pub(crate) struct FakeGraphStore {
+    providers: std::sync::Mutex<std::collections::BTreeMap<InstallationId, ProviderRecord>>,
+    consumers: std::sync::Mutex<std::collections::BTreeMap<InstallationId, ConsumerRecord>>,
+}
+
+impl FakeGraphStore {
+    pub(crate) fn new() -> Self {
+        Self {
+            providers: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+            consumers: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+        }
+    }
+
+    pub(crate) fn provider(&self, installation: InstallationId) -> Option<ProviderRecord> {
+        let providers = match self.providers.lock() {
+            Ok(guard) => guard,
+            Err(_) => return None,
+        };
+        providers.get(&installation).cloned()
+    }
+
+    pub(crate) fn consumer(&self, installation: InstallationId) -> Option<ConsumerRecord> {
+        let consumers = match self.consumers.lock() {
+            Ok(guard) => guard,
+            Err(_) => return None,
+        };
+        consumers.get(&installation).cloned()
+    }
+
+    /// 全部记录数（provider + consumer）。
+    pub(crate) fn count(&self) -> usize {
+        let providers = match self.providers.lock() {
+            Ok(guard) => guard,
+            Err(_) => return 0,
+        };
+        let consumers = match self.consumers.lock() {
+            Ok(guard) => guard,
+            Err(_) => return 0,
+        };
+        providers.len() + consumers.len()
+    }
+}
+
+impl ProviderGraphPort for FakeGraphStore {
+    fn replace_records(
+        &self,
+        installation: InstallationId,
+        provider: Option<&ProviderRecord>,
+        consumer: Option<&ConsumerRecord>,
+    ) -> Result<(), GraphStoreError> {
+        {
+            let mut providers = self.providers.lock().map_err(|_| {
+                GraphStoreError::Storage(Box::new(std::io::Error::other("lock poisoned")))
+            })?;
+            match provider {
+                Some(record) => {
+                    providers.insert(installation, record.clone());
+                }
+                None => {
+                    providers.remove(&installation);
+                }
+            }
+        }
+        let mut consumers = self.consumers.lock().map_err(|_| {
+            GraphStoreError::Storage(Box::new(std::io::Error::other("lock poisoned")))
+        })?;
+        match consumer {
+            Some(record) => {
+                consumers.insert(installation, record.clone());
+            }
+            None => {
+                consumers.remove(&installation);
+            }
+        }
+        Ok(())
+    }
+
+    fn load_records(&self) -> Result<GraphRecords, GraphStoreError> {
+        let providers = self.providers.lock().map_err(|_| {
+            GraphStoreError::Storage(Box::new(std::io::Error::other("lock poisoned")))
+        })?;
+        let consumers = self.consumers.lock().map_err(|_| {
+            GraphStoreError::Storage(Box::new(std::io::Error::other("lock poisoned")))
+        })?;
+        Ok(GraphRecords {
+            providers: providers.values().cloned().collect(),
+            consumers: consumers.values().cloned().collect(),
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // FakeGrants / FakeAudit / FakeConfig
 // ---------------------------------------------------------------------------
 
@@ -371,6 +467,9 @@ pub(crate) struct FakeState {
     /// compile 注入失败标志。
     pub(crate) compile_failure: bool,
     pub(crate) surface: ContractSurface,
+    /// 按字节内容定制的 contract surface（0.2.0 composition 测试：
+    /// v1/v2 不同提供面/需求面的升级场景）。
+    pub(crate) surfaces_by_bytes: std::collections::HashMap<Vec<u8>, ContractSurface>,
     /// 脚本化 descriptor 序列（按调用次序；`None` = 注入失败；
     /// §19.3 确定性比对测试用）。
     pub(crate) descriptors: Vec<Option<GuestComponentDescriptor>>,
@@ -403,6 +502,7 @@ impl Default for FakeState {
         Self {
             compile_failure: false,
             surface: default_surface(),
+            surfaces_by_bytes: std::collections::HashMap::new(),
             descriptors: Vec::new(),
             descriptor_index: 0,
             descriptors_by_bytes: HashMap::new(),
@@ -509,6 +609,16 @@ impl FakeRuntime {
         state.surface = surface;
     }
 
+    /// 按字节内容定制 contract surface（0.2.0 composition 升级场景：
+    /// v1/v2 不同提供面）。
+    pub(crate) fn with_surface_for(&self, bytes: &[u8], surface: ContractSurface) {
+        let mut state = match self.state.lock() {
+            Ok(guard) => guard,
+            Err(_) => test_failure("fake runtime state lock poisoned"),
+        };
+        state.surfaces_by_bytes.insert(bytes.to_vec(), surface);
+    }
+
     /// 按字节内容定制 descriptor（v1/v2 不同身份的升级测试）。
     pub(crate) fn with_descriptor_for(&self, bytes: &[u8], descriptor: GuestComponentDescriptor) {
         let mut state = match self.state.lock() {
@@ -607,6 +717,9 @@ impl WasmRuntime for FakeRuntime {
             .state
             .lock()
             .map_err(|_| RuntimeExecutionError::Internal("fake state poisoned"))?;
+        if let Some(surface) = state.surfaces_by_bytes.get(&state.last_compiled_bytes) {
+            return Ok(surface.clone());
+        }
         Ok(state.surface.clone())
     }
 
@@ -788,10 +901,26 @@ pub(crate) struct Harness {
     pub(crate) install: InstallService,
     pub(crate) upgrade: UpgradeService,
     pub(crate) web: WebBridge,
+    /// 0.2.0 provider graph records 存储（fake）。
+    pub(crate) graph_store: Arc<FakeGraphStore>,
+    /// 0.2.0 active graph 快照。
+    pub(crate) active_graph: Arc<ActiveGraph>,
+    /// 0.2.0 composition 服务（未接线为 `None`——0.1.0 语义）。
+    pub(crate) composition: Option<Arc<CompositionService>>,
 }
 
 impl Harness {
+    /// 0.1.0 语义 harness（composition 未接线）。
     pub(crate) fn new(config: RuntimeConfig) -> Self {
+        Self::build(config, false)
+    }
+
+    /// 0.2.0 composition 已接线的 harness（graph 门控 / 快照切换生效）。
+    pub(crate) fn with_composition(config: RuntimeConfig) -> Self {
+        Self::build(config, true)
+    }
+
+    fn build(config: RuntimeConfig, wired: bool) -> Self {
         let registry = Arc::new(FakeRegistry::new());
         let grants = Arc::new(FakeGrants::new());
         let audit = Arc::new(FakeAudit::new());
@@ -801,6 +930,11 @@ impl Harness {
         let assets = Arc::new(match AssetCache::new(&config) {
             Ok(cache) => cache,
             Err(_) => test_failure("asset cache construction failed"),
+        });
+        let graph_store = Arc::new(FakeGraphStore::new());
+        let active_graph = Arc::new(match ActiveGraph::new() {
+            Ok(graph) => graph,
+            Err(_) => test_failure("active graph construction failed"),
         });
         // 具体 fake 类型 → trait object 的显式 unsize 强制（§24.2 端口注入）。
         let policy = Arc::new(InProcessActionPolicy::new(
@@ -831,6 +965,27 @@ impl Harness {
             policy,
             Arc::clone(&audit) as Arc<dyn AuditPort>,
         );
+        // 0.2.0 composition 接线（§40）：同一 composition 服务注入
+        // install / upgrade 两条用例路径。
+        let composition = if wired {
+            let composition = Arc::new(CompositionService::new(
+                Arc::clone(&graph_store) as Arc<dyn ProviderGraphPort>,
+                Arc::clone(&active_graph),
+                Arc::clone(&audit) as Arc<dyn AuditPort>,
+                GraphPolicy::new(),
+            ));
+            match install.set_composition(Arc::clone(&composition)) {
+                Ok(()) => {}
+                Err(_) => test_failure("composition wiring failed"),
+            }
+            match upgrade.set_composition(Arc::clone(&composition)) {
+                Ok(()) => {}
+                Err(_) => test_failure("composition wiring failed"),
+            }
+            Some(composition)
+        } else {
+            None
+        };
         Self {
             registry,
             grants,
@@ -841,6 +996,9 @@ impl Harness {
             install,
             upgrade,
             web,
+            graph_store,
+            active_graph,
+            composition,
         }
     }
 }

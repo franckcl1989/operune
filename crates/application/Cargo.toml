@@ -40,6 +40,9 @@ arc-swap = { workspace = true }
 wasmtime = { workspace = true, features = ["cranelift", "wat"] }
 # §22.4：audit 事件序列化的测试断言（§16.6 不记 secret 的证明）。
 serde_json = { workspace = true }
+# §22.5：0.2.0 composition 测试的确定性 InstallationId（seed → uuid，
+# 与 domain 测试同模式；从既有 workspace 基线取值，不新增依赖）。
+uuid = { workspace = true }
 
 [lints]
 workspace = true

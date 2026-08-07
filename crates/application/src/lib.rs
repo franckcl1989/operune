@@ -28,6 +28,12 @@
 //!   `wasmtime::component::Linker` 并在 Store 上 instantiate（§22.2）。
 //! - [`active`]：[`ActiveRuntimeRegistry`]——§15.5 / §20.3 的不可变 Active
 //!   快照 + arc-swap 原子切换。
+//! - [`composition`]：0.2.0 Capability Composition（§40）——provider graph
+//!   构建管线（§40.3 事实源：WIT imports/exports 观察 + Runtime Policy
+//!   过滤）、确定性的 provider selection（§40.4 [`GraphPolicy`]）、
+//!   activation/deactivation 编排（§40.2 activation ordering）、graph
+//!   快照原子切换（§20.3 模式复用）、provider 升级前 consumer 兼容分析
+//!   门控（§40.2）、records 持久化 port（[`ProviderGraphPort`]）。
 //! - [`contract`]：`operune:*@0.1.0` WIT 契约的镜像用例类型与
 //!   `wasmtime::component::Val` 编解码（§13.3 边界解析一次）。
 //! - [`wit_bindings`]：`wasmtime::component::bindgen!` 的编译期 WIT 验证
@@ -48,6 +54,7 @@
 //! deny，§14.2 / §26.1）。
 
 pub mod active;
+pub mod composition;
 pub mod contract;
 pub mod error;
 pub mod install;
@@ -62,6 +69,10 @@ pub mod wit_bindings;
 mod test_support;
 
 pub use active::ActiveRuntimeRegistry;
+pub use composition::{
+    ActiveGraph, CompositionService, ContractRecords, GraphPolicy, GraphPolicyError, InterfaceKey,
+    records_from_surface,
+};
 pub use error::{ApplicationError, RuntimeExecutionError};
 pub use install::InstallService;
 pub use model::{
@@ -72,7 +83,8 @@ pub use model::{
 };
 pub use ports::{
     ActionContext, ActionPolicyPort, AuditError, AuditEvent, AuditPort, ComponentRegistryPort,
-    ConfigError, ConfigPort, GrantError, GrantStorePort, InProcessActionPolicy, RegistryError,
+    ConfigError, ConfigPort, GrantError, GrantStorePort, GraphRecords, GraphStoreError,
+    InProcessActionPolicy, ProviderGraphPort, RegistryError,
 };
 pub use runtime::{
     ActiveRuntime, CompiledWasm, PreparedRuntime, RuntimePlan, WasmRuntime, WasmtimeRuntime,

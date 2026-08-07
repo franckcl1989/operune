@@ -167,6 +167,33 @@ pub enum AuditEvent {
         /// 回滚目标 digest。
         to: ContentDigest,
     },
+    /// 0.2.0 provider graph 门控拒绝（§40.2：缺失 provider / 歧义 / 环 /
+    /// provider 升级不兼容——candidate 保持 Failed，当前 Active 不受污染）。
+    ProviderGraphRejected {
+        /// 安装实例。
+        installation: InstallationId,
+        /// 拒绝阶段（surface / resolution / upgrade-analysis / commit）。
+        reason: &'static str,
+    },
+    /// 0.2.0 graph records 已提交（持久化 + 快照原子切换，§40.2 graph
+    /// snapshot atomic switch / persistence）。
+    GraphRecordsCommitted {
+        /// 安装实例。
+        installation: InstallationId,
+    },
+    /// 0.2.0 graph records 已移除（管理性停用，§40.2 deactivation）。
+    GraphRecordsRemoved {
+        /// 安装实例。
+        installation: InstallationId,
+    },
+    /// 0.2.0 provider selection policy 已更新（§40.4：更新前先以当前
+    /// records 在新 policy 下重建验证，失败则状态不变）。
+    GraphPolicyUpdated {
+        /// 绑定规则数。
+        bindings: usize,
+        /// 排除规则数。
+        exclusions: usize,
+    },
 }
 
 /// 安装输入拒绝原因（§19.1 / §19.2）。

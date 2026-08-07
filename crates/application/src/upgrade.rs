@@ -74,6 +74,17 @@ impl UpgradeService {
         }
     }
 
+    /// 接线 0.2.0 Capability Composition（§40：provider 升级 / 回滚前的
+    /// consumer 兼容分析门控与 graph 快照原子切换，经共享管线执行）。
+    /// 与 [`InstallService::set_composition`] 同一接线事实；composition
+    /// root 在启动装配期调用一次。
+    pub fn set_composition(
+        &self,
+        composition: Arc<crate::composition::CompositionService>,
+    ) -> Result<(), ApplicationError> {
+        self.install.set_composition(composition)
+    }
+
     /// 热升级（§20.1）：v1 保持可用直到 v2 验证通过并原子切换。
     pub fn upgrade(&self, request: UpgradeRequest) -> Result<UpgradeOutcome, ApplicationError> {
         let current = self.require_active(request.installation)?;

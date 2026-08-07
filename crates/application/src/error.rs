@@ -7,7 +7,7 @@ use std::error::Error as StdError;
 
 use operune_domain::{
     ByteSize, CapabilityId, ComponentId, ComponentVersion, ContentDigest, DomainError,
-    InstallationId,
+    InstallationId, ProviderGraphError, UpgradeCompatibilityReport,
 };
 
 /// 可诊断错误源：第三方错误装箱（§14.1 适配层转换后保留 source；§16.6
@@ -145,6 +145,48 @@ pub enum ApplicationError {
     /// 安装请求携带非法 grant 批准（§17.1：全新安装必须显式批准）。
     #[error("grant approval required: {0}")]
     GrantApprovalRequired(&'static str),
+
+    /// 0.2.0 provider graph 解析失败（§40.2 dependency graph / §40.4：
+    /// MissingProvider / AmbiguousProvider / IncompatibleVersion /
+    /// CycleDetected，缺失 provider 诊断向上传——错误携带哪个 consumer、
+    /// 哪个需求、哪些候选）。
+    #[error("provider graph resolution failed: {source}")]
+    ProviderGraphResolution {
+        /// domain 层解析错误（含全部诊断信息）。
+        #[source]
+        source: ProviderGraphError,
+    },
+
+    /// 0.2.0 provider selection policy 无效（§40.2：显式绑定 / 排除规则
+    /// 冲突或引用不存在的 provider 能力）。
+    #[error("provider graph policy invalid: {0}")]
+    ProviderGraphPolicy(#[source] crate::composition::GraphPolicyError),
+
+    /// 0.2.0 provider 升级被 consumer 兼容分析门控拒绝（§40.2：升级会
+    /// 破坏既有直接 consumer；报告携带影响面——哪些 consumer、哪些需求、
+    /// interface 移除还是版本不兼容）。
+    #[error(
+        "provider upgrade of installation {installation} is incompatible with its consumers: {report:?}"
+    )]
+    ProviderUpgradeIncompatible {
+        /// 被升级的安装实例。
+        installation: InstallationId,
+        /// 兼容分析报告（`is_safe()` 为 false）。
+        report: UpgradeCompatibilityReport,
+    },
+
+    /// 0.2.0 Component import 无法解析为 Component-to-Component 需求
+    /// （无 package 身份的本地实例名；deny-by-default，§17.2 / §19.5——
+    /// 未解析 import 不得放行激活）。
+    #[error(
+        "component import `{0}` cannot be resolved as a component-to-component requirement (deny by default, §17.2)"
+    )]
+    UnresolvableImport(String),
+
+    /// 0.2.0 provider graph records 存储失败（§40.2 graph
+    /// persistence/recovery）。
+    #[error("provider graph store failure: {0}")]
+    GraphStore(#[source] crate::ports::GraphStoreError),
 
     /// 内部不变量破坏（视为系统故障，fail-stop 语义，§14.3）。
     #[error("application internal invariant violated: {0}")]
