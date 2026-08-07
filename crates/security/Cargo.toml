@@ -15,6 +15,14 @@ description = "Operune security: password/session/CSRF/grant policy/secret handl
 #   （CertificateDer / PrivateKeyDer），不引入 crypto provider（aws-lc-rs/ring）
 #   —— ServerConfig 装配与 provider 选择是 web-admin 的职责（§16.2 边界）。
 [dependencies]
+# chacha20poly1305：ADR-0001 批准的唯一新增 production direct dependency
+# （§23.1 Gate 结论见根 Cargo.toml 注释）。只经其 safe 公共 API 使用
+# （aead trait 经其 re-export，§11.2），不含默认 features 之外的硬件加速
+# 分支开关（crate 内部自行做架构分支，第一方无平台特定代码）。
+# default-features = false + ["alloc"]：§22.0 feature 最小化——nonce 由
+# 仓库冻结的 getrandom（[dependencies] 已有）直接生成，不启用 crate 的
+# "getrandom" feature（不引入 rand_core）。
+chacha20poly1305 = { workspace = true, default-features = false, features = ["alloc"] }
 argon2 = { workspace = true, default-features = false, features = ["std"] }
 base64 = { workspace = true, default-features = false, features = ["std"] }
 cookie = { workspace = true }
@@ -26,6 +34,10 @@ subtle = { workspace = true }
 thiserror = { workspace = true }
 time = { workspace = true }
 zeroize = { workspace = true }
+
+[dev-dependencies]
+# §22.8 Test/Dev 冻结清单：tempfile 只允许 test/dev 目标使用（KEK 隔离目录测试）。
+tempfile = { workspace = true }
 
 [lints]
 workspace = true
