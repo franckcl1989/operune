@@ -1,0 +1,11 @@
+[package]
+name = "operune-application"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Operune application layer: use-case orchestration and ports (spec 24.2)"
+
+[dependencies]
+
+[lints]
+workspace = true

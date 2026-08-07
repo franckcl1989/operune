@@ -1,0 +1,11 @@
+[package]
+name = "operune-platform"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Operune cross-platform ports and value definitions, no OS specifics (spec 24.2)"
+
+[dependencies]
+
+[lints]
+workspace = true

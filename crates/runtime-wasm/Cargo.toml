@@ -1,0 +1,11 @@
+[package]
+name = "operune-runtime-wasm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Operune wasm runtime adapter: wasmtime Engine/Component/Store, resource governance, typed ports (spec 24.2)"
+
+[dependencies]
+
+[lints]
+workspace = true

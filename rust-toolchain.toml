@@ -1,0 +1,5 @@
+# Operune toolchain freeze (spec §22.1: Rust 1.97.1 精确写入 rust-toolchain.toml)
+[toolchain]
+channel = "1.97.1"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

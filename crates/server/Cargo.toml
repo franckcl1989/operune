@@ -1,0 +1,11 @@
+[package]
+name = "operune-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Operune Core Runtime binary: the only composition root (spec 24.2)"
+
+[dependencies]
+
+[lints]
+workspace = true

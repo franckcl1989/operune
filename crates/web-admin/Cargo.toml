@@ -1,0 +1,11 @@
+[package]
+name = "operune-web-admin"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Operune Root Admin Axum/Askama HTTP adapter (spec 24.2)"
+
+[dependencies]
+
+[lints]
+workspace = true

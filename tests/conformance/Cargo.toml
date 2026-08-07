@@ -1,0 +1,11 @@
+[package]
+name = "operune-conformance-tests"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Operune Component conformance test suite harness (spec 30)"
+
+[dependencies]
+
+[lints]
+workspace = true

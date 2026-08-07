@@ -1,0 +1,11 @@
+[package]
+name = "operune-platform-linux"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Operune Linux OS-specific adapter (spec 24.2)"
+
+[dependencies]
+
+[lints]
+workspace = true

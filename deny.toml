@@ -1,0 +1,38 @@
+# Operune dependency governance configuration (cargo-deny).
+# 依据：OPERUNE_PLATFORM_ENGINEERING_MASTER_SPEC_R2_FROZEN_2026-08-07.md 第 23 章
+# 依赖与供应链治理。版本：2026-08-07 骨架基线。
+
+[advisories]
+version = 2
+# 不允许静默忽略任何 advisory；任何豁免必须走 §23 依赖更新 Gate 并留下审计记录。
+ignore = []
+# 冻结解析结果中不允许出现 yanked 版本（§22.0：Cargo.lock 是解析版本事实源）。
+yanked = "deny"
+
+[bans]
+version = 2
+# 禁止 wildcard 版本约束（§23.2）。
+wildcards = "deny"
+# 同一依赖多版本并存先警告，由依赖更新 PR 的 Gate 审查处理。
+multiple-versions = "warn"
+# 显式 deny 列表保持为空；新增条目必须走 §23.1 新增依赖 Gate。
+deny = []
+skip = []
+skip-tree = []
+
+[sources]
+version = 2
+# 仅允许官方 crates.io registry；禁止未固定 commit 的 git 依赖（§23.2）。
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
+
+# ---------------------------------------------------------------------------
+# [licenses]（占位，当前故意不启用）
+#
+# 依据 §23.4：项目自身开源许可证与依赖许可证 allowlist 均属于 Owner/治理决策，
+# AI Agent 不得自行选择。正式公开发布前必须完成许可证决策并启用本节；
+# 在此之前，任何引入明显强 copyleft / 未知许可证的 dependency 必须阻断并请求
+# 治理决定。CI 当前只运行 advisories / bans / sources 三个 section。
+# ---------------------------------------------------------------------------

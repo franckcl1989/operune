@@ -1,0 +1,11 @@
+[package]
+name = "operune-observability"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Operune core tracing/metrics/audit plumbing (spec 24.2)"
+
+[dependencies]
+
+[lints]
+workspace = true

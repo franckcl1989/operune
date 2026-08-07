@@ -1,0 +1,11 @@
+[package]
+name = "operune-storage-sqlite"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Operune SQLite persistence: schema, migration, repository adapter, storage executor (spec 24.2)"
+
+[dependencies]
+
+[lints]
+workspace = true

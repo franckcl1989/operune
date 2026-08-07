@@ -1,0 +1,11 @@
+[package]
+name = "operune-runtime-wasi-p2"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Operune WASI 0.2 linker/context/binding adapter (spec 24.2)"
+
+[dependencies]
+
+[lints]
+workspace = true

@@ -1,0 +1,11 @@
+[package]
+name = "operune-integration-tests"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Operune integration test suite harness (spec 36)"
+
+[dependencies]
+
+[lints]
+workspace = true

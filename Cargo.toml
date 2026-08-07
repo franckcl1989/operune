@@ -1,0 +1,109 @@
+# Operune workspace root
+# 依据：OPERUNE_PLATFORM_ENGINEERING_MASTER_SPEC_R2_FROZEN_2026-08-07.md
+#   §22 Rust 与核心 crate 基线；§23 依赖与供应链治理；§24 Workspace 结构与依赖方向
+# 依赖版本基线已按 crates.io 逐项校验，审计证据见 DEPENDENCY_PROBE.md（2026-08-07）。
+
+[workspace]
+resolver = "3"
+members = [
+    "crates/domain",
+    "crates/application",
+    "crates/runtime-wasm",
+    "crates/runtime-wasi-p2",
+    "crates/web-admin",
+    "crates/web-component",
+    "crates/storage-sqlite",
+    "crates/security",
+    "crates/platform",
+    "crates/platform-linux",
+    "crates/platform-windows",
+    "crates/platform-macos",
+    "crates/observability",
+    "crates/server",
+    "tests/conformance",
+    "tests/integration",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97.1"
+
+# §11.1 / §26.1：第一方代码机械强制 Safe Rust 与 panic-free 设计。
+# 限制性 lint（clippy::unwrap_used / expect_used / panic / todo / unimplemented）
+# 即 §14.2 / §26.1 要求，workspace 级固定为 deny，CI 命令行再显式固化一次。
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+
+##############################################################################
+# §22 冻结 direct-dependency 基线（2026-08-07 crates.io 校验，审计见 DEPENDENCY_PROBE.md）
+#
+# 规则：
+# - 版本约束全部精确（§23.2 禁止 wildcard）；所有 production build 使用
+#   committed Cargo.lock + --locked（§22.1）。
+# - 骨架阶段（YAGNI §12.6）暂无 crate 采用本表依赖，因此它们当前不会进入
+#   Cargo.lock 解析；各 crate 按真实需求从这里取值，不得直接写版本字面量。
+# - 本表任何升级必须走 §23 依赖更新 Gate（独立 PR + 五要素交叉审计），
+#   Agent 不得因 crates.io 出现新版本自行升级（§22.0）。
+# - Crate 采用时按 §22 各条目 feature 规则执行（如 rusqlite 启用 bundled、
+#   base64 default-features = false 等），生产 feature set 由 0.1 implementation PR 固化。
+##############################################################################
+
+[workspace.dependencies]
+# §22.2 Wasm Runtime：36.x LTS 线。36.0.13 为 2026-08-07 已发布的 36.x 最新 patch；
+# 三个 crate 必须保持同一 release line，禁止混搭（精确 patch 后续由 accepted
+# Cargo.lock / §23 Gate 决定；48 在 2026-08-20 发布并完成 promotion Gate 前不得使用）。
+wasmtime = "36.0.13"
+wasmtime-wasi = "36.0.13"
+wasmtime-wasi-http = "36.0.13"
+
+# §22.3 Async / Web / TLS
+tokio = "1.53.1"
+tokio-util = "0.7.19"
+axum = "0.8.9"
+tower = "0.5.3"
+tower-http = "0.7.0"
+rustls = "0.23.42"
+tokio-rustls = "0.26.4"
+askama = "0.16.0"
+
+# §22.4 Persistence / Serialization / Config
+rusqlite = "0.40.1"
+serde = "1.0.229"
+serde_json = "1.0.151"
+toml = "1.1.4"
+
+# §22.5 Domain Types / Errors / Snapshots
+thiserror = "2.0.19"
+uuid = "1.24.0"
+semver = "1.0.28"
+url = "2.5.8"
+time = "0.3.54"
+arc-swap = "1.9.2"
+
+# §22.6 Security
+argon2 = "0.5.3"
+secrecy = "0.10.3"
+zeroize = "1.9.0"
+getrandom = "0.4.3"
+sha2 = "0.11.0"
+subtle = "2.6.1"
+base64 = "0.23.0"
+cookie = "0.18.1"
+
+# §22.7 CLI / Observability
+clap = "4.6.4"
+tracing = "0.1.44"
+tracing-subscriber = "0.3.23"
+
+# §22.8 Test / Dev（只允许 test / dev 目标使用）
+proptest = "1.11.0"
+loom = "0.7.2"
+tempfile = "3.27.0"

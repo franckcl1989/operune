@@ -1,0 +1,78 @@
+# Operune CI（依据规范 §26.1 与 §36：PR 至少 Linux x86_64 GNU 全量 + Windows x86_64 构建/单测/集成子集）。
+# toolchain 由 rust-toolchain.toml 精确固定 1.97.1；rustup 会按该文件自动安装 clippy/rustfmt 组件。
+# 所有 cargo 构建使用 --locked（§22.1 committed lockfile）。
+# aarch64/macOS 等 target 的 CI job 由后续 milestone 在本机可验证后补充。
+
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  fmt:
+    name: fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.1
+        with:
+          components: rustfmt
+      - name: cargo fmt --check
+        run: cargo fmt --check
+
+  clippy:
+    name: clippy (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.1
+        with:
+          components: clippy
+      # 仓库默认 features 即 production set（§26.1 允许简化），故不附加 --features；
+      # 限制性 lint（§14.2 / §26.1）在 workspace.lints 中固定为 deny，此处命令行再显式固化一次。
+      - name: cargo clippy (workspace, all targets, -D warnings + restriction lints)
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings -D clippy::unwrap_used -D clippy::expect_used -D clippy::panic -D clippy::todo -D clippy::unimplemented
+
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.1
+      - name: cargo test (workspace, locked)
+        run: cargo test --workspace --locked
+
+  cargo-deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install cargo-deny (pinned)
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny@0.20.2
+      # §23.4：licenses 属 Owner 决策，暂不启用；只跑 advisories / bans / sources。
+      - name: cargo deny check
+        run: cargo deny check advisories bans sources
+
+  cargo-audit:
+    name: cargo-audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install cargo-audit (pinned)
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit@0.22.2
+      - name: cargo audit
+        run: cargo audit
