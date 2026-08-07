@@ -1,23 +1,24 @@
-/// operune:component@0.1.0 — 参考 world（作者侧便利，非运行时事实源）
-///
-/// 本 world 仅供 Component 作者参考，便于一次性列出 0.1.0 需要导出的
-/// operune:component 契约。Core 的兼容判断不依赖 root world 名称能否从
-/// 最终二进制恢复（§6.7，Component Model 不保证该信息的可恢复性），
-/// 只依赖二进制中真实可观察的 exports。
-///
-/// ## 0.1.0 之后 lifecycle / health 语义的演进预留（仅注释，不定义）
-/// 平台生命周期 / 健康检查属于 operune:component 的未来契约方向（§6.6），
-/// 0.1.0 有意不定义，原因：
-/// - §19.3 要求 health / readiness 必须在真实 grant / resource 环境
-///   （Runtime Candidate 阶段）执行，不能与零权限 descriptor 阶段混用，
-///   否则依赖能力的健康检查会形成身份 / 授权循环；
-/// - 0.3.0 路线图（§41）才引入 graceful lifecycle
-///   （ready / drain / stop / checkpoint）与 state migration；
-/// - 届时以新增 interface（例如 lifecycle、health）在同一 package 的
-///   兼容版本中演进，不改变本 descriptor 的既有语义；
-/// - 0.2.0 的 Component-to-Component provider graph（§40）是 export 能力
-///   声明，同样与 descriptor 身份语义分离，不影响本契约。
 package operune:component@0.1.0;
+
+// operune:component@0.1.0 — 参考 world（作者侧便利，非运行时事实源）
+//
+// 本 world 仅供 Component 作者参考，便于一次性列出 0.1.0 需要导出的
+// operune:component 契约。Core 的兼容判断不依赖 root world 名称能否从
+// 最终二进制恢复（§6.7，Component Model 不保证该信息的可恢复性），
+// 只依赖二进制中真实可观察的 exports。
+//
+// ## 0.1.0 之后 lifecycle / health 语义的演进预留（仅注释，不定义）
+// 平台生命周期 / 健康检查属于 operune:component 的未来契约方向（§6.6），
+// 0.1.0 有意不定义，原因：
+// - §19.3 要求 health / readiness 必须在真实 grant / resource 环境
+//   （Runtime Candidate 阶段）执行，不能与零权限 descriptor 阶段混用，
+//   否则依赖能力的健康检查会形成身份 / 授权循环；
+// - 0.3.0 路线图（§41）才引入 graceful lifecycle
+//   （ready / drain / stop / checkpoint）与 state migration；
+// - 届时以新增 interface（例如 lifecycle、health）在同一 package 的
+//   兼容版本中演进，不改变本 descriptor 的既有语义；
+// - 0.2.0 的 Component-to-Component provider graph（§40）是 export 能力
+//   声明，同样与 descriptor 身份语义分离，不影响本契约。
 
 /// 0.1.0 最小 Component：导出 descriptor 即可被 Core 识别身份并进入安装流程。
 world operune-component {

@@ -1,51 +1,54 @@
-/// operune:web@0.1.0 — 最小 Component Web bridge：static assets（§21.3）
-///
-/// Component 导出本 interface，向 Core 提供其内嵌静态资产的列举与读取。
-/// Core 在激活阶段读取资产，按组件内容摘要缓存并直接提供给浏览器；
-/// 静态资产请求不必每次重新执行 Wasm（§6.2）。
-///
-/// ## 缓存事实（§21.3）
-/// 资产缓存键是 `ContentDigest + asset path`，其中：
-/// - ContentDigest 是 Core 对收到的原始 Component 字节计算得到的不可变
-///   内容事实（§6.7），由 Core 持有，不出现在本契约的函数签名中；
-/// - asset path 即本契约的 `asset-path`。
-/// 同一 ComponentVersion 的资产集合随版本原子切换（§21.5）：升级后任何
-/// 新页面加载与 asset lookup 都解析到同一 active version，禁止产生
-/// "前端 v2 + 后端 v1" 拼接。
-///
-/// ## 与 WASI 的关系（P4，论证见 wit/README.md）
-/// 本 interface 不复制 wasi:filesystem / wasi:http：它读取的是 Component
-/// 内嵌数据（以 Core 内容摘要缓存为事实），不通过 preopen 目录，不暴露
-/// 宿主文件系统、网络或可变文件，无路径穿越面；是仅 Operune 平台拥有
-/// 的组件托管语义。
 package operune:web@0.1.0;
 
-/// 单个资产的元数据。
-record asset-metadata {
-    /// 资产在 Component 内的逻辑路径。
-    path: asset-path,
-    /// 资产字节大小。Core 用于体积预算与缓存决策。
-    size: u64,
-    /// 作者建议的 MIME 类型（例如 "text/html"）。Core 保留最终校验权：
-    /// 响应头、CSP 与 MIME 嗅探防护属于 Core-owned security headers（§21.3），
-    /// 作者的声明不可覆盖 Core 的安全判定。
-    content-type: option<string>,
-}
-
-/// assets 接口的预期失败。
-enum assets-error {
-    /// 请求的资产路径不存在。
-    not-found,
-    /// 路径非法（未规范化、越界、含 ".." 等），Core 视为 contract violation。
-    invalid-path,
-    /// 资产超出 Core 单资产体积上限。guest 应主动声明；Core 侧另有
-    /// 宿主硬上限（§7.4 host buffer 上限），超限按 trap / 失败处理。
-    too-large,
-    /// 清单或数据无法解析（数据损坏等）。
-    malformed,
-}
+// operune:web@0.1.0 — 最小 Component Web bridge：static assets（§21.3）
+//
+// Component 导出本 interface，向 Core 提供其内嵌静态资产的列举与读取。
+// Core 在激活阶段读取资产，按组件内容摘要缓存并直接提供给浏览器；
+// 静态资产请求不必每次重新执行 Wasm（§6.2）。
+//
+// ## 缓存事实（§21.3）
+// 资产缓存键是 `ContentDigest + asset path`，其中：
+// - ContentDigest 是 Core 对收到的原始 Component 字节计算得到的不可变
+//   内容事实（§6.7），由 Core 持有，不出现在本契约的函数签名中；
+// - asset path 即本契约的 `asset-path`。
+// 同一 ComponentVersion 的资产集合随版本原子切换（§21.5）：升级后任何
+// 新页面加载与 asset lookup 都解析到同一 active version，禁止产生
+// "前端 v2 + 后端 v1" 拼接。
+//
+// ## 与 WASI 的关系（P4，论证见 wit/README.md）
+// 本 interface 不复制 wasi:filesystem / wasi:http：它读取的是 Component
+// 内嵌数据（以 Core 内容摘要缓存为事实），不通过 preopen 目录，不暴露
+// 宿主文件系统、网络或可变文件，无路径穿越面；是仅 Operune 平台拥有
+// 的组件托管语义。
 
 interface assets {
+    use descriptor.{asset-path};
+
+    /// 单个资产的元数据。
+    record asset-metadata {
+        /// 资产在 Component 内的逻辑路径。
+        path: asset-path,
+        /// 资产字节大小。Core 用于体积预算与缓存决策。
+        size: u64,
+        /// 作者建议的 MIME 类型（例如 "text/html"）。Core 保留最终校验权：
+        /// 响应头、CSP 与 MIME 嗅探防护属于 Core-owned security headers（§21.3），
+        /// 作者的声明不可覆盖 Core 的安全判定。
+        content-type: option<string>,
+    }
+
+    /// assets 接口的预期失败。
+    enum assets-error {
+        /// 请求的资产路径不存在。
+        not-found,
+        /// 路径非法（未规范化、越界、含 ".." 等），Core 视为 contract violation。
+        invalid-path,
+        /// 资产超出 Core 单资产体积上限。guest 应主动声明；Core 侧另有
+        /// 宿主硬上限（§7.4 host buffer 上限），超限按 trap / 失败处理。
+        too-large,
+        /// 清单或数据无法解析（数据损坏等）。
+        malformed,
+    }
+
     /// 列举 Component 内嵌的全部静态资产。
     ///
     /// 契约：side-effect-free、bounded、可重复（同一 ContentDigest + 同一

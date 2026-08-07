@@ -1,9 +1,10 @@
-/// operune:web@0.1.0 — 参考 world（作者侧便利，非运行时事实源）
-///
-/// 携带 Web UI 的 Component 在 0.1.0 需要导出的 operune 契约总览。
-/// Core 的兼容判断只依赖二进制中真实可观察的 exports（§6.7），
-/// 不依赖 root world 名称。
 package operune:web@0.1.0;
+
+// operune:web@0.1.0 — 参考 world（作者侧便利，非运行时事实源）
+//
+// 携带 Web UI 的 Component 在 0.1.0 需要导出的 operune 契约总览。
+// Core 的兼容判断只依赖二进制中真实可观察的 exports（§6.7），
+// 不依赖 root world 名称。
 
 /// 带 Web UI 的 Component：必须同时导出 operune:component/descriptor
 /// （安装 / 身份契约）与 operune:web 的三个契约。

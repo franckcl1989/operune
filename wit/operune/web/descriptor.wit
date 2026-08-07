@@ -26,51 +26,51 @@
 /// 因此本契约及 operune:web/actions 中不存在任何会话凭据、cookie、CSRF 字段。
 package operune:web@0.1.0;
 
-/// Component 内嵌资产的逻辑路径（record wrapper，§13.5；非宿主文件路径）。
-///
-/// 不变量：值必须是规范化相对路径，以 "/" 开头，不含 ".." 段、空段或
-/// 反斜杠；不得解析到挂载命名空间之外。Core 对每个路径执行规范化与
-/// 越界校验（防 path traversal，§32 security test 覆盖）。
-record asset-path {
-    value: string,
-}
-
-/// 可组合的 Web 能力声明（flags 表达可组合特征，§6.3）。
-///
-/// Core 的兼容判断仍以二进制可观察 contract surface 为准（§6.7）；
-/// 本声明用于 UI 展示与交叉校验：作者声明与二进制可观察 exports
-/// 不一致时视为 contract violation。
-flags web-features {
-    /// Component 携带可通过 operune:web/assets 读取的内嵌静态资产。
-    static-assets,
-    /// Component 提供 bounded backend action（operune:web/actions）。
-    backend-actions,
-}
-
-/// web descriptor：Component 声明自己携带 Web UI。
-record web-descriptor {
-    /// Web UI 的入口资产路径（例如 "/index.html"）。
-    /// Core 将其解析到分配好的挂载命名空间；缺失或越界视为非法。
-    entry: asset-path,
-    /// 本 Component 提供的 Web 能力集合。
-    features: web-features,
-    /// 挂载命名空间下的展示名（可选，作者声明）。
-    display-name: option<string>,
-}
-
-/// web descriptor 阶段的预期失败（WIT result 表达预期失败，§6.3）。
-///
-/// trap、超时、超预算由 Core 在宿主侧观察，不进入返回值空间。
-enum web-descriptor-error {
-    /// 返回的 metadata 无法解析或违反契约不变量（入口路径非法等）。
-    malformed,
-    /// 未来演进：平台不再支持该 web descriptor contract 版本。
-    unsupported-contract-version,
-    /// guest 内部不可恢复错误。
-    internal,
-}
-
 interface descriptor {
+    /// Component 内嵌资产的逻辑路径（record wrapper，§13.5；非宿主文件路径）。
+    ///
+    /// 不变量：值必须是规范化相对路径，以 "/" 开头，不含 ".." 段、空段或
+    /// 反斜杠；不得解析到挂载命名空间之外。Core 对每个路径执行规范化与
+    /// 越界校验（防 path traversal，§32 security test 覆盖）。
+    record asset-path {
+        value: string,
+    }
+
+    /// 可组合的 Web 能力声明（flags 表达可组合特征，§6.3）。
+    ///
+    /// Core 的兼容判断仍以二进制可观察 contract surface 为准（§6.7）；
+    /// 本声明用于 UI 展示与交叉校验：作者声明与二进制可观察 exports
+    /// 不一致时视为 contract violation。
+    flags web-features {
+        /// Component 携带可通过 operune:web/assets 读取的内嵌静态资产。
+        static-assets,
+        /// Component 提供 bounded backend action（operune:web/actions）。
+        backend-actions,
+    }
+
+    /// web descriptor：Component 声明自己携带 Web UI。
+    record web-descriptor {
+        /// Web UI 的入口资产路径（例如 "/index.html"）。
+        /// Core 将其解析到分配好的挂载命名空间；缺失或越界视为非法。
+        entry: asset-path,
+        /// 本 Component 提供的 Web 能力集合。
+        features: web-features,
+        /// 挂载命名空间下的展示名（可选，作者声明）。
+        display-name: option<string>,
+    }
+
+    /// web descriptor 阶段的预期失败（WIT result 表达预期失败，§6.3）。
+    ///
+    /// trap、超时、超预算由 Core 在宿主侧观察，不进入返回值空间。
+    enum web-descriptor-error {
+        /// 返回的 metadata 无法解析或违反契约不变量（入口路径非法等）。
+        malformed,
+        /// 未来演进：平台不再支持该 web descriptor contract 版本。
+        unsupported-contract-version,
+        /// guest 内部不可恢复错误。
+        internal,
+    }
+
     /// 读取 web descriptor。
     ///
     /// 与 operune:component/descriptor 相同的契约约束（§19.3 的精神，
