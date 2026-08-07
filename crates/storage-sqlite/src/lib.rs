@@ -27,10 +27,13 @@
 //!   （§13.3），事务边界与安装/升级 crash consistency 协议（§18.5）；
 //! - [`recovery`]：打开时确定性对账（§18.5 crash recovery 决策表）；
 //! - [`executor`]：Storage Executor（§18.2）：专用线程 + 有界队列 +
-//!   typed request/response + 提交前取消语义 + shutdown 等待；
+//!   typed request/response + 提交前取消语义 + shutdown 等待；0.3.0
+//!   state 事务（§41.2，migration v4）：跨命令边界、取消/crash → 回滚；
 //! - [`ports`]：application port traits 的实现（§24.2：ComponentRegistry /
 //!   GrantStore / Audit / Config / ProviderGraph），同步桥接到 executor 并做
-//!   用例级类型与存储侧记录之间的转换（§13.3）。
+//!   用例级类型与存储侧记录之间的转换（§13.3）；0.3.0 的
+//!   StateStore / SecretStore / ComponentConfigStore port trait 由 application
+//!   里程碑定义后接线（§41.2）。
 //!
 //! # 权威性边界（§18.1）
 //!
@@ -60,9 +63,11 @@ pub use migration::{
 };
 pub use model::{
     ActiveBinding, ArtifactRecord, ArtifactState, AuditActor, AuditCategory, AuditEvent,
-    AuditOutcome, AuditRecord, CapabilityScope, ConfigEntry, GrantRecord, InstallationRecord,
-    InstallationVersionRecord, RollbackResult, SessionId, SessionRecord, StagedArtifact, Timestamp,
-    UpgradePhase, UpgradeTransactionId, UpgradeTransactionRecord, UserId, UserRecord, VersionState,
+    AuditOutcome, AuditRecord, CapabilityScope, ComponentConfigRecord, ConfigEntry, ConfigFormat,
+    GrantRecord, InstallationRecord, InstallationVersionRecord, RollbackResult, SecretMetadata,
+    SecretName, SecretRecord, SessionId, SessionRecord, StagedArtifact, StateKey,
+    StateSchemaVersion, StateTransactionHandle, StateValueRecord, Timestamp, UpgradePhase,
+    UpgradeTransactionId, UpgradeTransactionRecord, UserId, UserRecord, VersionState,
 };
 pub use ports::StoragePorts;
 pub use recovery::RecoveryAction;

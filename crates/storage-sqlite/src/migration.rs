@@ -38,7 +38,7 @@ use rusqlite::Connection;
 
 use crate::error::StorageError;
 use crate::model::Timestamp;
-use crate::schema::{DDL_V1, DDL_V3, verify_core_tables};
+use crate::schema::{DDL_V1, DDL_V3, DDL_V4, verify_core_tables};
 
 /// 单个版本化 migration。`apply` 在 runner 开启的事务内执行；
 /// 版本号由 runner 在同一事务内推进。
@@ -73,6 +73,7 @@ pub const PRODUCTION_MIGRATIONS: &[Migration] = &[
     Migration::new(1, "core-schema-v1", apply_v1),
     Migration::new(2, "candidate-lifecycle-v2", apply_v2),
     Migration::new(3, "graph-records-v3", apply_v3),
+    Migration::new(4, "stateful-tables-v4", apply_v4),
 ];
 
 /// 本构建支持的当前 schema 版本（= 最后一个 production migration 版本）。
@@ -264,6 +265,17 @@ fn apply_v3(tx: &rusqlite::Transaction<'_>) -> Result<(), StorageError> {
         .map_err(|e| StorageError::sqlite("apply graph records v3", e))
 }
 
+/// Migration v4：0.3.0 Stateful Runtime 的 state/config/secret 三张表
+///（§41.2 Config / State / Secret 三分离；DDL 与设计见 schema.rs 的
+/// [`DDL_V4`] 文档）。0.x 无历史数据：v3 → v4 时三表为空即可，无需回填。
+/// DDL 与版本推进在**同一事务**内（§18.4：失败整体回滚，schema 停留在 v3；
+/// §41.3：不得产生"代码版本已切换但状态 schema 不确定"的中间状态——
+/// migration 未提交则新表不存在，已提交则三表完整）。
+fn apply_v4(tx: &rusqlite::Transaction<'_>) -> Result<(), StorageError> {
+    tx.execute_batch(DDL_V4)
+        .map_err(|e| StorageError::sqlite("apply stateful tables v4", e))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -282,7 +294,7 @@ mod tests {
             ok(read_schema_version(&conn), "version"),
             current_schema_version()
         );
-        assert_eq!(current_schema_version(), 3);
+        assert_eq!(current_schema_version(), 4);
     }
 
     #[test]
@@ -311,7 +323,7 @@ mod tests {
         }
         let error = err(open_authoritative_db(&path), "reopen newer db");
         assert!(
-            matches!(error, StorageError::SchemaTooNew { db: 99, current: 3 }),
+            matches!(error, StorageError::SchemaTooNew { db: 99, current: 4 }),
             "expected SchemaTooNew, got {error:?}"
         );
     }
@@ -500,9 +512,10 @@ mod tests {
             "seed v2 data",
         );
 
-        // 前进路径：v2 → v3。
+        // 前进路径：v2 → v3（upto = Some(3)：本测试只验证 v2→v3 一跳；
+        // v3→v4 的前进路径由 forward_migration_v3_to_v4 覆盖）。
         ok(
-            apply_migrations_to(&mut conn, PRODUCTION_MIGRATIONS, None),
+            apply_migrations_to(&mut conn, PRODUCTION_MIGRATIONS, Some(3)),
             "migrate to v3",
         );
         assert_eq!(ok(read_schema_version(&conn), "version"), 3);
@@ -547,5 +560,168 @@ mod tests {
             );
             assert_eq!(count, 0, "{table} must start empty");
         }
+    }
+
+    #[test]
+    fn fresh_db_has_empty_stateful_tables() {
+        // §41.2：v4 之后的全新数据库——state/config/secret 三表存在且为空
+        //（服务层恢复输入 = 空集；§41.3 无"schema 不确定"状态：版本由
+        // 首次写入建立，见 repository/executor 文档）。
+        let dir = tempdir();
+        let conn = ok(open_authoritative_db(&db_path(dir.path())), "open");
+        for table in ["component_state", "component_config", "component_secret"] {
+            let count: i64 = ok(
+                conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                }),
+                "count stateful rows",
+            );
+            assert_eq!(count, 0, "{table} must start empty");
+        }
+    }
+
+    #[test]
+    fn forward_migration_v3_to_v4_creates_stateful_tables_preserving_data() {
+        // §18.4 release contract 的 old-version → new-version migration test：
+        // v3 → v4 前进路径。0.x 无 stateful 历史数据：v4 只建表、不回填
+        //（三表必须为空）；既有 v1-v3 数据必须保留。
+        let dir = tempdir();
+        let mut conn = ok(
+            Connection::open(db_path(dir.path())),
+            "open raw connection (test setup)",
+        );
+        ok(configure_connection(&conn), "configure");
+
+        // old-version 数据库：停在 v3，并写入一个安装实例 + graph 记录。
+        ok(
+            apply_migrations_to(&mut conn, PRODUCTION_MIGRATIONS, Some(3)),
+            "init at v3",
+        );
+        assert_eq!(ok(read_schema_version(&conn), "version"), 3);
+        ok(
+            conn.execute_batch(
+                "INSERT INTO components (component_id) VALUES ('acme:demo');
+                 INSERT INTO installations
+                     (installation_id, component_id, enabled, lifecycle_state,
+                      created_at, updated_at)
+                 VALUES ('00000000-0000-0000-0000-000000000001', 'acme:demo', 0,
+                         'installed', 1, 1);
+                 INSERT INTO graph_provider_records (installation_id, provided, updated_at)
+                     VALUES ('00000000-0000-0000-0000-000000000001', '[\"acme:demo/iface@1.0.0\"]', 1);",
+            ),
+            "seed v3 data",
+        );
+
+        // 前进路径：v3 → v4。
+        ok(
+            apply_migrations_to(&mut conn, PRODUCTION_MIGRATIONS, None),
+            "migrate to v4",
+        );
+        assert_eq!(ok(read_schema_version(&conn), "version"), 4);
+        // 三表存在且为空（0.x 无历史数据，无需回填）。
+        for table in ["component_state", "component_config", "component_secret"] {
+            let count: i64 = ok(
+                conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                }),
+                "count stateful rows",
+            );
+            assert_eq!(count, 0, "{table} must be empty after v3 -> v4");
+        }
+        // 既有数据保留。
+        let kept: Option<String> = ok(
+            conn.query_row(
+                "SELECT installation_id FROM installations
+                 WHERE installation_id = '00000000-0000-0000-0000-000000000001'",
+                [],
+                |row| row.get(0),
+            )
+            .optional(),
+            "read kept installation",
+        );
+        assert_eq!(
+            kept.as_deref(),
+            Some("00000000-0000-0000-0000-000000000001")
+        );
+        let graph: i64 = ok(
+            conn.query_row("SELECT COUNT(*) FROM graph_provider_records", [], |row| {
+                row.get(0)
+            }),
+            "count graph rows",
+        );
+        assert_eq!(graph, 1, "v3 graph records must survive v3 -> v4");
+    }
+
+    #[test]
+    fn stateful_tables_enforce_check_constraints() {
+        // §41.2 结构性约束的 DB 硬后备（写入前主动校验在 repository 侧，
+        // §13.3；此处验证 SQL CHECK 本身拒绝非法行——key 空、值超上限、
+        // 版本非正、格式越界、密文空/超上限、FK 指向不存在安装）。
+        let dir = tempdir();
+        let conn = ok(open_authoritative_db(&db_path(dir.path())), "open");
+        let big = vec![0u8; 2 * 1024 * 1024];
+        let big_secret = vec![0u8; 300 * 1024];
+
+        let reject = |sql: &str, params: &[&dyn rusqlite::types::ToSql]| {
+            let error = err(conn.execute(sql, params), "constraint violation must fail");
+            assert!(
+                matches!(error, rusqlite::Error::SqliteFailure(..)),
+                "expected SQLite failure, got {error:?}"
+            );
+        };
+        // component_state：key 空 / 值超 1 MiB / schema_version 负 /
+        // 外键指向不存在的安装。
+        reject(
+            "INSERT INTO component_state (installation_id, state_key, schema_version, value, updated_at)
+             VALUES ('00000000-0000-0000-0000-000000000001', '', 1, X'', 1)",
+            &[],
+        );
+        reject(
+            "INSERT INTO component_state (installation_id, state_key, schema_version, value, updated_at)
+             VALUES ('00000000-0000-0000-0000-000000000001', 'k', 1, ?1, 1)",
+            &[&big],
+        );
+        reject(
+            "INSERT INTO component_state (installation_id, state_key, schema_version, value, updated_at)
+             VALUES ('00000000-0000-0000-0000-000000000001', 'k', -1, X'', 1)",
+            &[],
+        );
+        reject(
+            "INSERT INTO component_state (installation_id, state_key, schema_version, value, updated_at)
+             VALUES ('ffffffff-ffff-ffff-ffff-ffffffffffff', 'k', 1, X'', 1)",
+            &[],
+        );
+        // component_config：format 越界 / revision 0 / 值超 1 MiB。
+        reject(
+            "INSERT INTO component_config (installation_id, format, schema_version, revision, value, updated_at)
+             VALUES ('00000000-0000-0000-0000-000000000001', 'yaml', 1, 1, X'', 1)",
+            &[],
+        );
+        reject(
+            "INSERT INTO component_config (installation_id, format, schema_version, revision, value, updated_at)
+             VALUES ('00000000-0000-0000-0000-000000000001', 'json', 1, 0, X'', 1)",
+            &[],
+        );
+        reject(
+            "INSERT INTO component_config (installation_id, format, schema_version, revision, value, updated_at)
+             VALUES ('00000000-0000-0000-0000-000000000001', 'json', 1, 1, ?1, 1)",
+            &[&big],
+        );
+        // component_secret：密文空 / 密文超 256 KiB / secret_version 0。
+        reject(
+            "INSERT INTO component_secret (installation_id, secret_name, secret_version, ciphertext, metadata, updated_at)
+             VALUES ('00000000-0000-0000-0000-000000000001', 'n', 1, X'', '', 1)",
+            &[],
+        );
+        reject(
+            "INSERT INTO component_secret (installation_id, secret_name, secret_version, ciphertext, metadata, updated_at)
+             VALUES ('00000000-0000-0000-0000-000000000001', 'n', 1, ?1, '', 1)",
+            &[&big_secret],
+        );
+        reject(
+            "INSERT INTO component_secret (installation_id, secret_name, secret_version, ciphertext, metadata, updated_at)
+             VALUES ('00000000-0000-0000-0000-000000000001', 'n', 0, X'01', '', 1)",
+            &[],
+        );
     }
 }

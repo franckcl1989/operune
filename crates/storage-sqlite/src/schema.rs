@@ -214,6 +214,93 @@ CREATE TABLE graph_consumer_records (
 );
 ";
 
+/// Migration v4：0.3.0 Stateful Runtime 三分离表（§41.2 Config / State /
+/// Secret；§41.3 验收：升级、进程 crash、取消、磁盘失败均不得产生"代码
+/// 版本已切换但状态 schema 不确定"的不可恢复状态）。
+///
+/// 表设计与序列化选择（§13.3 边界解析一次；WIT 契约 wit/operune/{state,
+/// config, secret}）：
+///
+/// - **三表分离，不统一成无类型 KV**（§41.2：Config、State、Secret 语义
+///   不同——config 是管理员输入、state 是 Component 产生的权威业务状态、
+///   secret 是受专门访问控制与防泄漏规则保护的敏感值）；
+/// - **`component_state`**：state = 安装实例 × key 的行（PK 组合）；每行
+///   携带写入时的 schema 版本（§41.2 versioned state）；value 是平台
+///   不透明的序列化业务字节（平台不解析、不解释，WIT）；每安装实例的
+///   store 整体 schema 版本以保留 key `'!schema-version'` 的单行
+///   （schema_version 列）持久承载——§41.3：版本必须持久确定，migration
+///   提交在**同一事务**内推进（`'!'` 不在 WIT state-key 字符集
+///   `[A-Za-z0-9._-/]` 内 ⇒ 与任何 guest key 不可能冲突，model.rs
+///   [`STATE_SCHEMA_MARKER_KEY`]）；
+/// - **`component_config`**：每安装实例一行（PK = installation_id）；
+///   `format` 为声明格式闭集（json/toml/raw，WIT）；`revision` 每次被
+///   接受的写入 +1（CHECK `>= 1`；单调性由应用层在**单语句 upsert** 内
+///   保证：`revision = component_config.revision + 1`——SQLite CHECK 无法
+///   表达跨行比较，而 executor 单连接串行（§18.2）⇒ 语句原子、无交错，
+///   设计注释见 repository.rs `put_component_config`）；config 是输入、
+///   无平台级 migration（§41.2，与 state 的本质区别），schema_version 列
+///   记录配置契约的 schema 版本（WIT 与 revision 相区别）；
+/// - **`component_secret`**：密文 BLOB **不透明**（§16.6 / ADR-0001，
+///   已裁决：加密在 SecretStore 服务侧，storage 不解密、不解释内容，
+///   明文绝不落库——本表没有也不会有可容纳明文的列；KEK 绝不进本库）；
+///   `secret_version` 每次轮换 +1（与 config revision 同模式）；
+///   `metadata` 只承载非敏感元数据（绝不含值/密钥材料，§16.6）；
+/// - 体积上界用 SQL 字面量（CHECK 硬后备），与 model.rs 常量一致
+///   （`STATE_VALUE_MAX_BYTES` / `CONFIG_VALUE_MAX_BYTES` /
+///   `SECRET_CIPHERTEXT_MAX_BYTES` / `SECRET_METADATA_MAX_LEN`；
+///   Rust 侧常量是写入前拒绝的主动校验，§13.3）；
+/// - 三表都外键到 `installations(installation_id)`：state/config/secret
+///   命名空间私有于安装实例（§19.4），与 `grants` 同约束。
+pub(crate) const DDL_V4: &str = "
+-- §41.2 state：Component 产生的权威持久业务状态（WIT operune:state）。
+-- 行 = 安装实例 × key；PK 组合强制 (installation, key) 唯一（至多一行）。
+-- schema_version = 写入时绑定的 schema 版本；保留 key '!schema-version'
+-- 单行承载 store 整体版本（§41.3 持久确定）。
+-- value = 平台不透明的序列化业务字节（平台不解析不解释）；单值硬上限
+-- 1 MiB（model.rs STATE_VALUE_MAX_BYTES；CHECK 是硬后备）。
+CREATE TABLE component_state (
+    installation_id TEXT NOT NULL REFERENCES installations(installation_id),
+    state_key       TEXT NOT NULL CHECK (length(state_key) BETWEEN 1 AND 255),
+    schema_version  INTEGER NOT NULL CHECK (schema_version >= 0),
+    value           BLOB NOT NULL CHECK (length(value) <= 1048576),
+    updated_at      INTEGER NOT NULL,
+    PRIMARY KEY (installation_id, state_key)
+);
+
+-- §41.2 config：管理员/系统提供的输入（validation + 版本语义；guest 只读）。
+-- 每安装实例一行（PK = installation_id）：单实例配置快照是单行事实。
+-- format = 声明格式闭集（WIT：json/toml/raw）；revision 每次写入 +1
+-- （单调性见 schema 模块文档与 repository.rs 设计注释；CHECK 防非正起始值）。
+-- schema_version = 配置契约的 schema 版本（WIT 与 revision 相区别）。
+-- value 硬上限 1 MiB（model.rs CONFIG_VALUE_MAX_BYTES）。
+CREATE TABLE component_config (
+    installation_id TEXT PRIMARY KEY REFERENCES installations(installation_id),
+    format          TEXT NOT NULL CHECK (format IN ('json', 'toml', 'raw')),
+    schema_version  INTEGER NOT NULL CHECK (schema_version >= 0),
+    revision        INTEGER NOT NULL CHECK (revision >= 1),
+    value           BLOB NOT NULL CHECK (length(value) <= 1048576),
+    updated_at      INTEGER NOT NULL
+);
+
+-- §41.2 secret：受专门访问控制与防泄漏规则保护的敏感值（WIT
+-- operune:secret）。**storage 只存不透明密文 BLOB，不解密、不解释、
+-- 不回显内容**（§16.6 / ADR-0001：加密在 SecretStore 服务侧，明文绝不
+-- 落库——本表没有也不会有可容纳明文的值列；KEK 绝不进本库）。
+-- secret_version 每次轮换 +1（CHECK >= 1，防非正起始值）；metadata 只
+-- 承载非敏感元数据（≤ 4096，绝不含值/密钥材料，§16.6）；密文硬上限
+-- 256 KiB（model.rs SECRET_CIPHERTEXT_MAX_BYTES，envelope =
+-- 算法标识+版本+nonce+密文+tag，ADR-0001）。
+CREATE TABLE component_secret (
+    installation_id TEXT NOT NULL REFERENCES installations(installation_id),
+    secret_name     TEXT NOT NULL CHECK (length(secret_name) BETWEEN 1 AND 255),
+    secret_version  INTEGER NOT NULL CHECK (secret_version >= 1),
+    ciphertext      BLOB NOT NULL CHECK (length(ciphertext) BETWEEN 1 AND 262144),
+    metadata        TEXT NOT NULL CHECK (length(metadata) <= 4096),
+    updated_at      INTEGER NOT NULL,
+    PRIMARY KEY (installation_id, secret_name)
+);
+";
+
 /// 打开后校验 Core 必备表存在（fail closed，§18.4：不得以半升级 schema 继续）。
 /// 在 migration 成功之后调用；缺失即持久化状态损坏。
 pub(crate) fn verify_core_tables(conn: &rusqlite::Connection) -> Result<(), crate::StorageError> {
@@ -234,6 +321,9 @@ pub(crate) fn verify_core_tables(conn: &rusqlite::Connection) -> Result<(), crat
         "runtime_config",
         "graph_provider_records",
         "graph_consumer_records",
+        "component_state",
+        "component_config",
+        "component_secret",
     ] {
         let found: Option<String> = conn
             .query_row(

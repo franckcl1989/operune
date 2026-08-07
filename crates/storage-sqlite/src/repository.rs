@@ -48,6 +48,30 @@
 //! 检查点在**每个事务提交之前**：请求在事务提交前被取消 ⇒ 该事务不提交
 //! （回滚），命令返回 [`StorageError::Cancelled`]。已提交事务不受取消影响
 //! （提交点之前的检查已通过）——绝不产生半事务状态。
+//!
+//! # State / Config / Secret（§41.2，migration v4）
+//!
+//! 0.3.0 Stateful Runtime 三分离表的 SQL 边界（schema 见 schema.rs
+//! [`DDL_V4`](crate::schema::DDL_V4) 文档）：
+//!
+//! - **state 事务跨命令边界**：SQLite 事务在连接上，executor 单连接串行
+//!   （§18.2）⇒ 同一时刻至多一个进行中 state 事务，事务命令被串行化。
+//!   begin 用 `BEGIN IMMEDIATE`、提交/回滚用 `COMMIT`/`ROLLBACK`（进行中
+//!   状态由 executor worker 持有，executor.rs 文档）；事务内读写直接执行
+//!   于连接上（本模块 `tx_*` 方法，**不套 `run_tx`**——外层事务就是原子性
+//!   边界，套 `BEGIN` 会与既有事务冲突）。取消/超时 → 事务整体回滚；
+//!   crash 时未提交事务由 SQLite 自然回滚（§18.5：WAL 只重放已提交帧）。
+//! - **state schema 版本**（§41.2/§41.3）：每安装实例一个整体版本，以
+//!   保留 key `'!schema-version'` 的单行（schema_version 列）持久承载；
+//!   版本校验在 begin/standalone-put 时进行（[`StorageError::SchemaVersionMismatch`]），
+//!   版本推进与数据写入在**同一事务**内原子提交——绝无"代码版本已切换但
+//!   状态 schema 不确定"的中间观（§41.3 验收）。
+//! - **config revision 单调**（§41.2）：SQLite CHECK 只能引用本行，无法
+//!   表达跨版本比较；单调性由应用层在**单语句 upsert** 内保证
+//!   （`revision = component_config.revision + 1`，同一语句内原子完成；
+//!   executor 单连接串行 ⇒ 无交错），CHECK `>= 1` 防非正起始值。
+//! - **secret 密文边界**（§16.6 / ADR-0001，已裁决）：本模块只做密文 BLOB
+//!   的存取，**不解密、不解释、不回显内容**；明文与 KEK 绝不进本库。
 
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -64,13 +88,16 @@ use crate::artifact::{ArtifactSpace, ArtifactStore, BudgetUsage, GcPolicy, GcRep
 use crate::error::{BudgetSpace, StorageError};
 use crate::model::{
     ActiveBinding, ArtifactRecord, ArtifactState, AuditActor, AuditEvent, AuditRecord,
-    CapabilityScope, ConfigEntry, GrantRecord, InstallationRecord, InstallationVersionRecord,
-    RollbackResult, SessionId, SessionRecord, StagedArtifact, Timestamp, UpgradeTransactionId,
-    UpgradeTransactionRecord, UserId, UserRecord, VersionState,
+    CONFIG_VALUE_MAX_BYTES, CapabilityScope, ComponentConfigRecord, ConfigEntry, ConfigFormat,
+    GrantRecord, InstallationRecord, InstallationVersionRecord, RollbackResult,
+    SECRET_CIPHERTEXT_MAX_BYTES, SECRET_METADATA_MAX_LEN, STATE_SCHEMA_MARKER_KEY,
+    STATE_VALUE_MAX_BYTES, SecretMetadata, SecretName, SecretRecord, SessionId, SessionRecord,
+    StagedArtifact, StateKey, StateSchemaVersion, StateValueRecord, Timestamp,
+    UpgradeTransactionId, UpgradeTransactionRecord, UserId, UserRecord, VersionState,
 };
 
 /// 取消检查：提交点之前的取消 → `Cancelled`（§18.2 取消语义）。
-fn check_cancel(cancel: &AtomicBool) -> Result<(), StorageError> {
+pub(crate) fn check_cancel(cancel: &AtomicBool) -> Result<(), StorageError> {
     if cancel.load(Ordering::Relaxed) {
         Err(StorageError::Cancelled)
     } else {
@@ -2070,6 +2097,568 @@ impl<'a> Repository<'a> {
             });
         }
         Ok(entries)
+    }
+
+    // ------------------------------------------------------------------
+    // Component state（§41.2，migration v4；事务语义见模块文档）
+    // ------------------------------------------------------------------
+
+    /// 读取单键 state（快照点读；`None` = 键不存在，WIT not-found 语义）。
+    /// 事务内读取（快照）用 [`Self::tx_get_state`]。
+    pub(crate) fn get_state(
+        &self,
+        installation_id: InstallationId,
+        key: &StateKey,
+    ) -> Result<Option<StateValueRecord>, StorageError> {
+        self.read_state_row(installation_id, key)
+    }
+
+    fn read_state_row(
+        &self,
+        installation_id: InstallationId,
+        key: &StateKey,
+    ) -> Result<Option<StateValueRecord>, StorageError> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT state_key, schema_version, value, updated_at FROM component_state
+                 WHERE installation_id = ?1 AND state_key = ?2",
+                params![installation_id.to_string(), key.as_str()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|e| StorageError::sqlite("read state row", e))?;
+        match row {
+            Some((key_str, schema_version, value, updated_at)) => {
+                let key = match StateKey::new(key_str) {
+                    Ok(key) => key,
+                    Err(_) => {
+                        return Err(StorageError::CorruptState(
+                            "invalid state key in database".into(),
+                        ));
+                    }
+                };
+                Ok(Some(StateValueRecord {
+                    installation_id,
+                    key,
+                    schema_version: Self::schema_version_from_i64(schema_version)?,
+                    value,
+                    updated_at: Self::timestamp_from_i64(updated_at)?,
+                }))
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn schema_version_from_i64(value: i64) -> Result<StateSchemaVersion, StorageError> {
+        u32::try_from(value)
+            .map(StateSchemaVersion::new)
+            .map_err(|_| {
+                StorageError::CorruptState(format!("state schema version {value} out of range"))
+            })
+    }
+
+    /// 原子单键 upsert（§41.2 atomic update；CAS 的基础原语——executor
+    /// 单连接串行 ⇒ 服务侧 get→compare→put 天然无交错，无需存储层
+    /// 条件写原语）。
+    ///
+    /// 版本语义（§41.3）：`schema_version` 必须等于 store 当前持久化版本，
+    /// 否则 [`StorageError::SchemaVersionMismatch`]；空 store（无 marker）
+    /// 首次写入在**同一事务**内建立版本。值体积在写入前拒绝
+    /// （§13.3，CHECK 为硬后备）。
+    pub(crate) fn put_state(
+        &mut self,
+        installation_id: InstallationId,
+        key: &StateKey,
+        schema_version: StateSchemaVersion,
+        value: &[u8],
+        cancel: &AtomicBool,
+    ) -> Result<(), StorageError> {
+        check_cancel(cancel)?;
+        if value.len() > STATE_VALUE_MAX_BYTES {
+            return Err(StorageError::InvalidArgument(format!(
+                "state value of {} bytes exceeds the hard limit of {STATE_VALUE_MAX_BYTES} bytes",
+                value.len()
+            )));
+        }
+        if self.read_installation(installation_id)?.is_none() {
+            return Err(StorageError::NotFound(format!(
+                "installation {installation_id}"
+            )));
+        }
+        if let Some(current) = self.get_state_schema_version(installation_id)?
+            && current != schema_version
+        {
+            return Err(StorageError::SchemaVersionMismatch {
+                installation: installation_id,
+                expected: current,
+                requested: schema_version,
+            });
+        }
+        let now = self.sql_now()?;
+        self.run_tx("begin state put transaction", |tx| {
+            Self::upsert_state_row(tx, installation_id, key, schema_version, value, now)?;
+            Self::upsert_schema_marker(tx, installation_id, schema_version, now)
+        })
+    }
+
+    /// 删除单键（键不存在 → [`StorageError::NotFound`]，WIT not-found）。
+    /// schema marker（保留 key）不可被本路径删除（保留 key 不在 WIT
+    /// state-key 字符集内，无法构造为 [`StateKey`]，§41.2）。
+    pub(crate) fn delete_state(
+        &mut self,
+        installation_id: InstallationId,
+        key: &StateKey,
+        cancel: &AtomicBool,
+    ) -> Result<(), StorageError> {
+        check_cancel(cancel)?;
+        if self.read_installation(installation_id)?.is_none() {
+            return Err(StorageError::NotFound(format!(
+                "installation {installation_id}"
+            )));
+        }
+        self.run_tx("begin state delete transaction", |tx| {
+            let changed = tx
+                .execute(
+                    "DELETE FROM component_state
+                     WHERE installation_id = ?1 AND state_key = ?2",
+                    params![installation_id.to_string(), key.as_str()],
+                )
+                .map_err(|e| StorageError::sqlite("delete state row", e))?;
+            if changed == 0 {
+                return Err(StorageError::NotFound(format!(
+                    "state key {key} for installation {installation_id}"
+                )));
+            }
+            Ok(())
+        })
+    }
+
+    /// 读取安装实例 state store 的整体 schema 版本（§41.2/§41.3；
+    /// `None` = 空 store，版本由首次写入建立）。
+    pub(crate) fn get_state_schema_version(
+        &self,
+        installation_id: InstallationId,
+    ) -> Result<Option<StateSchemaVersion>, StorageError> {
+        let value: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT schema_version FROM component_state
+                 WHERE installation_id = ?1 AND state_key = ?2",
+                params![installation_id.to_string(), STATE_SCHEMA_MARKER_KEY],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| StorageError::sqlite("read state schema version", e))?;
+        match value {
+            Some(value) => Ok(Some(Self::schema_version_from_i64(value)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// 进行中事务内的读取（快照语义，WIT：事务内读取看到一致性快照；同
+    /// 连接可见事务自身未提交写入）。**不套 `run_tx`**——外层事务就是
+    /// 原子性边界（模块文档）。
+    pub(crate) fn tx_get_state(
+        &self,
+        installation_id: InstallationId,
+        key: &StateKey,
+    ) -> Result<Option<StateValueRecord>, StorageError> {
+        self.read_state_row(installation_id, key)
+    }
+
+    /// 进行中事务内的写入（行 schema 版本 = 事务绑定版本；版本语义在
+    /// begin 时校验，executor 文档）。marker 的建立/推进推迟到 commit
+    /// 时（[`Self::tx_finalize`]），与事务提交同一点。
+    pub(crate) fn tx_put_state(
+        &mut self,
+        installation_id: InstallationId,
+        key: &StateKey,
+        schema_version: StateSchemaVersion,
+        value: &[u8],
+    ) -> Result<(), StorageError> {
+        if value.len() > STATE_VALUE_MAX_BYTES {
+            return Err(StorageError::InvalidArgument(format!(
+                "state value of {} bytes exceeds the hard limit of {STATE_VALUE_MAX_BYTES} bytes",
+                value.len()
+            )));
+        }
+        let now = self.sql_now()?;
+        Self::upsert_state_row(self.conn, installation_id, key, schema_version, value, now)
+    }
+
+    /// 进行中事务内的删除（键不存在 → [`StorageError::NotFound`]）。
+    pub(crate) fn tx_delete_state(
+        &mut self,
+        installation_id: InstallationId,
+        key: &StateKey,
+    ) -> Result<(), StorageError> {
+        let changed = self
+            .conn
+            .execute(
+                "DELETE FROM component_state
+                 WHERE installation_id = ?1 AND state_key = ?2",
+                params![installation_id.to_string(), key.as_str()],
+            )
+            .map_err(|e| StorageError::sqlite("delete state row in transaction", e))?;
+        if changed == 0 {
+            return Err(StorageError::NotFound(format!(
+                "state key {key} for installation {installation_id}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// 事务提交前最终化（executor 在 `COMMIT` 前调用，事务已 dirty）：
+    /// 写入/推进 store 的 schema marker（§41.3：schema 版本与数据在同一
+    /// 事务内原子提交——Normal 空 store 首次写入建立版本；Migration 提交
+    /// 把版本推进到目标版本，原子切换）。
+    pub(crate) fn tx_finalize(
+        &mut self,
+        installation_id: InstallationId,
+        schema_version: StateSchemaVersion,
+    ) -> Result<(), StorageError> {
+        let now = self.sql_now()?;
+        Self::upsert_schema_marker(self.conn, installation_id, schema_version, now)
+    }
+
+    /// state 行 upsert（值 + 版本标签；事务参数：`run_tx` 内或外部事务内）。
+    fn upsert_state_row(
+        conn: &rusqlite::Connection,
+        installation_id: InstallationId,
+        key: &StateKey,
+        schema_version: StateSchemaVersion,
+        value: &[u8],
+        updated_at: i64,
+    ) -> Result<(), StorageError> {
+        conn.execute(
+            "INSERT INTO component_state (installation_id, state_key, schema_version, value, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(installation_id, state_key) DO UPDATE SET
+                 schema_version = excluded.schema_version,
+                 value = excluded.value,
+                 updated_at = excluded.updated_at",
+            params![
+                installation_id.to_string(),
+                key.as_str(),
+                schema_version.sql_value(),
+                value,
+                updated_at
+            ],
+        )
+        .map_err(|e| StorageError::sqlite("upsert state row", e))?;
+        Ok(())
+    }
+
+    /// store 整体 schema 版本 marker 的 upsert（保留 key
+    /// `'!schema-version'`；版本推进与数据写入同事务，§41.3）。
+    fn upsert_schema_marker(
+        conn: &rusqlite::Connection,
+        installation_id: InstallationId,
+        schema_version: StateSchemaVersion,
+        updated_at: i64,
+    ) -> Result<(), StorageError> {
+        conn.execute(
+            "INSERT INTO component_state (installation_id, state_key, schema_version, value, updated_at)
+             VALUES (?1, ?2, ?3, X'', ?4)
+             ON CONFLICT(installation_id, state_key) DO UPDATE SET
+                 schema_version = excluded.schema_version,
+                 value = excluded.value,
+                 updated_at = excluded.updated_at",
+            params![
+                installation_id.to_string(),
+                STATE_SCHEMA_MARKER_KEY,
+                schema_version.sql_value(),
+                updated_at
+            ],
+        )
+        .map_err(|e| StorageError::sqlite("upsert state schema marker", e))?;
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // Component config（§41.2：管理员输入，validation + 版本语义）
+    // ------------------------------------------------------------------
+
+    /// 写入/更新安装实例的 component config 快照（每安装一行，§41.2）。
+    ///
+    /// **revision 单调性**（设计注释）：SQLite CHECK 只能引用本行、无法
+    /// 表达"新 revision > 旧 revision"的跨行比较，因此单调性由应用层在
+    /// 单语句 upsert 内保证——`revision = component_config.revision + 1`
+    /// （DO UPDATE 引用既有行）在同一 SQLite 语句内原子完成；executor
+    /// 单连接串行（§18.2）⇒ 读-判-写无交错。CHECK `revision >= 1` 阻止
+    /// 非正起始值（DB 硬后备）。初次写入 revision = 1。
+    ///
+    /// config 是输入、无平台级 migration（§41.2 与 state 的本质区别）；
+    /// `schema_version` 记录配置契约的 schema 版本（WIT 与 revision 区别）。
+    pub(crate) fn put_component_config(
+        &mut self,
+        installation_id: InstallationId,
+        format: ConfigFormat,
+        schema_version: StateSchemaVersion,
+        value: &[u8],
+        cancel: &AtomicBool,
+    ) -> Result<(), StorageError> {
+        check_cancel(cancel)?;
+        if value.len() > CONFIG_VALUE_MAX_BYTES {
+            return Err(StorageError::InvalidArgument(format!(
+                "component config value of {} bytes exceeds the hard limit of \
+                 {CONFIG_VALUE_MAX_BYTES} bytes",
+                value.len()
+            )));
+        }
+        if self.read_installation(installation_id)?.is_none() {
+            return Err(StorageError::NotFound(format!(
+                "installation {installation_id}"
+            )));
+        }
+        let now = self.sql_now()?;
+        self.run_tx("begin component config transaction", |tx| {
+            tx.execute(
+                "INSERT INTO component_config
+                     (installation_id, format, schema_version, revision, value, updated_at)
+                 VALUES (?1, ?2, ?3, 1, ?4, ?5)
+                 ON CONFLICT(installation_id) DO UPDATE SET
+                     format = excluded.format,
+                     schema_version = excluded.schema_version,
+                     revision = component_config.revision + 1,
+                     value = excluded.value,
+                     updated_at = excluded.updated_at",
+                params![
+                    installation_id.to_string(),
+                    format.to_string(),
+                    schema_version.sql_value(),
+                    value,
+                    now
+                ],
+            )
+            .map_err(|e| StorageError::sqlite("upsert component config", e))?;
+            Ok(())
+        })
+    }
+
+    /// 读取安装实例的 component config 快照（原子：revision 与 value 同
+    /// 行同读，WIT config-snapshot；`None` = 尚无已校验配置）。
+    pub(crate) fn get_component_config(
+        &self,
+        installation_id: InstallationId,
+    ) -> Result<Option<ComponentConfigRecord>, StorageError> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT format, schema_version, revision, value, updated_at
+                 FROM component_config WHERE installation_id = ?1",
+                [installation_id.to_string()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, Vec<u8>>(3)?,
+                        row.get::<_, i64>(4)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|e| StorageError::sqlite("read component config", e))?;
+        match row {
+            Some((format, schema_version, revision, value, updated_at)) => {
+                Ok(Some(ComponentConfigRecord {
+                    installation_id,
+                    format: format.parse()?,
+                    schema_version: Self::schema_version_from_i64(schema_version)?,
+                    revision: u64::try_from(revision).map_err(|_| {
+                        StorageError::CorruptState(format!(
+                            "component config revision {revision} out of range"
+                        ))
+                    })?,
+                    value,
+                    updated_at: Self::timestamp_from_i64(updated_at)?,
+                }))
+            }
+            None => Ok(None),
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Component secret（§41.2；密文边界见模块文档与 schema.rs DDL_V4）
+    // ------------------------------------------------------------------
+
+    /// 写入/轮换 secret 密文（insert or replace 版本递增：初次 secret_version
+    /// = 1，每次写入 +1——同一语句内原子，CHECK `>= 1` 硬后备）。
+    ///
+    /// **密文边界（§16.6 / ADR-0001）**：`ciphertext` 是 SecretStore 服务侧
+    /// 加密后的**不透明密文 BLOB**，本方法不加密、不解密、不解释内容，
+    /// 原样落库；明文绝不进本库；`metadata` 只承载非敏感元数据（结构性
+    /// 校验：长度上限 + 无控制字符；语义由服务侧定义，§13.3）。
+    pub(crate) fn put_secret(
+        &mut self,
+        installation_id: InstallationId,
+        name: &SecretName,
+        ciphertext: &[u8],
+        metadata: &str,
+        cancel: &AtomicBool,
+    ) -> Result<(), StorageError> {
+        check_cancel(cancel)?;
+        if ciphertext.is_empty() || ciphertext.len() > SECRET_CIPHERTEXT_MAX_BYTES {
+            return Err(StorageError::InvalidArgument(format!(
+                "secret ciphertext of {} bytes is outside the allowed range 1..={SECRET_CIPHERTEXT_MAX_BYTES} bytes",
+                ciphertext.len()
+            )));
+        }
+        if metadata.len() > SECRET_METADATA_MAX_LEN || metadata.chars().any(char::is_control) {
+            return Err(StorageError::InvalidArgument(format!(
+                "secret metadata must not exceed {SECRET_METADATA_MAX_LEN} bytes and must not \
+                 contain control characters"
+            )));
+        }
+        if self.read_installation(installation_id)?.is_none() {
+            return Err(StorageError::NotFound(format!(
+                "installation {installation_id}"
+            )));
+        }
+        let now = self.sql_now()?;
+        self.run_tx("begin secret put transaction", |tx| {
+            tx.execute(
+                "INSERT INTO component_secret
+                     (installation_id, secret_name, secret_version, ciphertext, metadata, updated_at)
+                 VALUES (?1, ?2, 1, ?3, ?4, ?5)
+                 ON CONFLICT(installation_id, secret_name) DO UPDATE SET
+                     secret_version = component_secret.secret_version + 1,
+                     ciphertext = excluded.ciphertext,
+                     metadata = excluded.metadata,
+                     updated_at = excluded.updated_at",
+                params![
+                    installation_id.to_string(),
+                    name.as_str(),
+                    ciphertext,
+                    metadata,
+                    now
+                ],
+            )
+            .map_err(|e| StorageError::sqlite("upsert secret ciphertext", e))?;
+            Ok(())
+        })
+    }
+
+    /// 读取 secret 密文（不透明字节原样返回；`None` = 名称不存在）。
+    pub(crate) fn get_secret(
+        &self,
+        installation_id: InstallationId,
+        name: &SecretName,
+    ) -> Result<Option<SecretRecord>, StorageError> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT secret_name, secret_version, ciphertext, metadata, updated_at
+                 FROM component_secret WHERE installation_id = ?1 AND secret_name = ?2",
+                params![installation_id.to_string(), name.as_str()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, i64>(4)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|e| StorageError::sqlite("read secret ciphertext", e))?;
+        match row {
+            Some((name_str, version, ciphertext, metadata, updated_at)) => {
+                let name = match SecretName::new(name_str) {
+                    Ok(name) => name,
+                    Err(_) => {
+                        return Err(StorageError::CorruptState(
+                            "invalid secret name in database".into(),
+                        ));
+                    }
+                };
+                Ok(Some(SecretRecord {
+                    name,
+                    version: u64::try_from(version).map_err(|_| {
+                        StorageError::CorruptState(format!("secret version {version} out of range"))
+                    })?,
+                    ciphertext,
+                    metadata,
+                    updated_at: Self::timestamp_from_i64(updated_at)?,
+                }))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// 列出安装实例的全部 secret 名称与版本（§41.2 list-granted-secrets
+    /// 的存储输入；**不含值**——不读取 ciphertext 列）。
+    pub(crate) fn list_secret_names(
+        &self,
+        installation_id: InstallationId,
+    ) -> Result<Vec<SecretMetadata>, StorageError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT secret_name, secret_version FROM component_secret
+                 WHERE installation_id = ?1 ORDER BY secret_name",
+            )
+            .map_err(|e| StorageError::sqlite("prepare list secret names", e))?;
+        let rows = stmt
+            .query_map([installation_id.to_string()], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .map_err(|e| StorageError::sqlite("query secret names", e))?;
+        let mut names = Vec::new();
+        for row in rows {
+            let (name_str, version) =
+                row.map_err(|e| StorageError::sqlite("read secret name row", e))?;
+            let name = match SecretName::new(name_str) {
+                Ok(name) => name,
+                Err(_) => {
+                    return Err(StorageError::CorruptState(
+                        "invalid secret name in database".into(),
+                    ));
+                }
+            };
+            names.push(SecretMetadata {
+                name,
+                version: u64::try_from(version).map_err(|_| {
+                    StorageError::CorruptState(format!("secret version {version} out of range"))
+                })?,
+            });
+        }
+        Ok(names)
+    }
+
+    /// 删除 secret（名称不存在 → [`StorageError::NotFound`]）。
+    pub(crate) fn delete_secret(
+        &mut self,
+        installation_id: InstallationId,
+        name: &SecretName,
+        cancel: &AtomicBool,
+    ) -> Result<(), StorageError> {
+        check_cancel(cancel)?;
+        self.run_tx("begin secret delete transaction", |tx| {
+            let changed = tx
+                .execute(
+                    "DELETE FROM component_secret
+                     WHERE installation_id = ?1 AND secret_name = ?2",
+                    params![installation_id.to_string(), name.as_str()],
+                )
+                .map_err(|e| StorageError::sqlite("delete secret", e))?;
+            if changed == 0 {
+                return Err(StorageError::NotFound(format!(
+                    "secret {name} for installation {installation_id}"
+                )));
+            }
+            Ok(())
+        })
     }
 
     // ------------------------------------------------------------------

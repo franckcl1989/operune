@@ -10,7 +10,9 @@ use std::fmt;
 
 use thiserror::Error;
 
-use operune_domain::{ComponentId, ComponentVersion, ContentDigest, DomainError};
+use operune_domain::{ComponentId, ComponentVersion, ContentDigest, DomainError, InstallationId};
+
+use crate::model::StateSchemaVersion;
 
 /// 存储空间类别（§18.7 磁盘预算：staging / quarantine / final content-addressed）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,6 +73,27 @@ pub enum StorageError {
     /// 生命周期/状态机冲突（§12.2：非法转换显式拒绝，不静默忽略）。
     #[error("lifecycle conflict: {0}")]
     LifecycleConflict(String),
+
+    /// §41.2/§41.3 state schema 版本冲突：请求的 schema 版本与 store 当前
+    /// 版本不符（WIT `unsupported-schema-version`；migration 前阻止混合
+    /// 版本写入的契约边界；空 store 不产生本错误——首次写入建立版本）。
+    #[error(
+        "state schema version mismatch: installation {installation} is at version {expected}, \
+         requested {requested}"
+    )]
+    SchemaVersionMismatch {
+        /// 安装实例。
+        installation: InstallationId,
+        /// store 当前持久化版本。
+        expected: StateSchemaVersion,
+        /// 请求的版本。
+        requested: StateSchemaVersion,
+    },
+
+    /// §41.2 state 事务冲突（WIT `conflict`：并发修改冲突，或对已终止事务
+    /// 继续操作；单连接 executor 的进行中事务窗口排他，§18.2）。
+    #[error("state transaction conflict: {0}")]
+    StateTransactionConflict(String),
 
     /// 有界请求队列已满（§15.2 / §18.2：请求 channel 必须有界）。
     #[error("storage request queue is full; retry later")]

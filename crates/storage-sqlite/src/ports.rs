@@ -45,6 +45,19 @@
 //!   `Serialize` 即规范形态），读取解析失败一律
 //!   [`StorageError::CorruptState`] fail closed（与 grant scope 的 JSON
 //!   规范化同模式）。
+//!
+//! # 0.3.0 state/config/secret 端口接线（§41.2）——待 application port 定义
+//!
+//! 本 crate 的 executor 层已提供 0.3.0 Stateful Runtime 的**存储能力**
+//!（migration v4 三表 + typed 命令，见 executor.rs 模块文档）：state 事务
+//!（begin/put/delete/commit/abort，跨命令边界、取消/crash → 回滚、schema
+//! 版本确定性）、component config（revision 单调）、secret 密文 BLOB
+//!（不透明，§16.6 / ADR-0001）。application 的 `StateStore` / `SecretStore`
+//! / `ComponentConfigStore` port trait 由**另一里程碑**定义（本任务不定义
+//! application 层 trait——那是 application 的职责）。trait 落定后按本模块
+//! 既有模式接线：`submit_blocking` 同步桥接 + §13.3 转换层（与
+//! `ProviderGraphPort` 同模式），并补齐 §41.2 要求的 state/config/secret
+//! audit（metadata-only，值绝不进审计，§16.6/§41.2）。
 
 use std::sync::Arc;
 use std::time::Duration;

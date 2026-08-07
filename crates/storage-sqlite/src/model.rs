@@ -716,6 +716,292 @@ pub struct ConfigEntry {
     pub updated_by: String,
 }
 
+// ---------------------------------------------------------------------------
+// 0.3.0 Stateful Runtime（§41.2）：state / config / secret 三分离的存储侧
+// typed 值类型（migration v4 表，§41）。
+//
+// 依赖注记：domain crate 的 stateful 新类型（`StateKey` / `SecretName` /
+// state schema version 等）由另一里程碑并行添加，**尚未提交**。本模块按
+// WIT 契约（wit/operune/state、wit/operune/secret）自行建模存储侧 typed
+// newtype（与 `UserId` / `SessionId` 同模式：domain 未建模的存储内部身份用
+// 本模块 newtype）；domain 类型就绪后按 §13.3 在 SQL 边界切换到 domain
+// 类型（本 crate 的公开签名跟随 domain，不构成锁定）。
+// ---------------------------------------------------------------------------
+
+/// state key 最大长度（WIT operune:state `state-key` 的宿主侧上限，§41.2）。
+pub(crate) const STATE_KEY_MAX_LEN: usize = 255;
+
+/// state 单值硬上限（1 MiB；WIT "体积受 Core 宿主侧单值上限与安装实例总
+/// 预算约束（§7.4）"——单值上限由本常量定义，SQL CHECK 是其硬后备）。
+pub(crate) const STATE_VALUE_MAX_BYTES: usize = 1024 * 1024;
+
+/// config 单值硬上限（1 MiB；WIT operune:config `config-value` "体积受 Core
+/// 宿主侧硬上限约束（§7.4 / §7.5）"）。
+pub(crate) const CONFIG_VALUE_MAX_BYTES: usize = 1024 * 1024;
+
+/// secret 名称最大长度（WIT operune:secret `secret-name` 的宿主侧上限，
+/// §41.2）。
+pub(crate) const SECRET_NAME_MAX_LEN: usize = 255;
+
+/// secret 密文 BLOB 硬上限（256 KiB；密文 envelope = 算法标识 + 版本 +
+/// nonce + 密文 + tag，见 ADR-0001——storage 不解释内容，只做结构性上界）。
+pub(crate) const SECRET_CIPHERTEXT_MAX_BYTES: usize = 256 * 1024;
+
+/// secret 非敏感 metadata 上限（§41.2：metadata 只承载非敏感元数据，绝不
+/// 含值或密钥材料，§16.6；存储侧只做结构性校验，语义由 SecretStore 服务
+/// 侧定义）。
+pub(crate) const SECRET_METADATA_MAX_LEN: usize = 4096;
+
+/// state store 整体 schema 版本的保留 marker key（§41.2 "每个安装实例的
+/// state store 有一个整体 `state-schema-version`"；§41.3：schema 版本必须
+/// 持久确定，migration 提交原子推进）。
+///
+/// 选择 `'!'` 开头：WIT `state-key` 不变量只允许 `[A-Za-z0-9._-/]`
+/// （§41.2），`'!'` 不在字符集内 ⇒ 任何 guest key 都不可能与本 marker
+/// 冲突（storage 侧 [`StateKey`] 校验同时保证该不变式，marker 不可伪造）。
+pub(crate) const STATE_SCHEMA_MARKER_KEY: &str = "!schema-version";
+
+/// 校验 WIT record wrapper 键（§13.5：非裸 string；validate-on-construct，
+/// §13.3）。只允许 ASCII 字母数字 + 显式白名单标点（无控制字符/空白）；
+/// 长度上界。
+fn validate_key(
+    value: &str,
+    kind: &str,
+    allowed_punct: &[u8],
+    max_len: usize,
+) -> Result<(), StorageError> {
+    if value.is_empty() {
+        return Err(StorageError::InvalidArgument(format!(
+            "{kind} must not be empty"
+        )));
+    }
+    if value.len() > max_len {
+        return Err(StorageError::InvalidArgument(format!(
+            "{kind} must not exceed {max_len} bytes"
+        )));
+    }
+    for byte in value.bytes() {
+        if !byte.is_ascii_alphanumeric() && !allowed_punct.contains(&byte) {
+            return Err(StorageError::InvalidArgument(format!(
+                "{kind} contains a character outside the allowed set \
+                 (ASCII alphanumeric + {})",
+                String::from_utf8_lossy(allowed_punct)
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// 状态键（`component_state.state_key`；WIT operune:state `state-key`，
+/// §41.2）。字符集 `[A-Za-z0-9._-/]`（非空、无控制字符/空白、≤ 255 字节）。
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct StateKey(String);
+
+impl StateKey {
+    /// 构造并校验（validate-on-construct，§13.3；违反 WIT 不变量 →
+    /// [`StorageError::InvalidArgument`]）。
+    pub fn new(value: impl Into<String>) -> Result<Self, StorageError> {
+        let value = value.into();
+        validate_key(&value, "state key", b"._-/", STATE_KEY_MAX_LEN)?;
+        Ok(Self(value))
+    }
+
+    /// 原始字符串视图。
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for StateKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// 安装实例 state store 的 schema 版本（WIT operune:state
+/// `state-schema-version`，§41.2 契约层版本表达；u32 无非法取值，
+/// 构造不可失败）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct StateSchemaVersion(u32);
+
+impl StateSchemaVersion {
+    /// 构造（u32 全取值合法，不可失败）。
+    pub const fn new(value: u32) -> Self {
+        Self(value)
+    }
+
+    /// 原始值。
+    pub const fn as_u32(self) -> u32 {
+        self.0
+    }
+
+    /// SQLite 参数表示（u32 → i64 恒可表示，§14.4 无回绕）。
+    pub(crate) fn sql_value(self) -> i64 {
+        i64::from(self.0)
+    }
+}
+
+impl fmt::Display for StateSchemaVersion {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// 进行中的 state 事务句柄（§41.2 事务资源；由 executor 在 begin 时签发，
+/// 跨命令边界引用同一进行中事务；单连接串行 ⇒ 同一时刻至多一个，§18.2）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct StateTransactionHandle(u64);
+
+impl StateTransactionHandle {
+    /// 从 executor 单调计数构造。
+    pub(crate) fn new(counter: u64) -> Self {
+        Self(counter)
+    }
+
+    /// 底层计数。
+    pub(crate) fn as_u64(self) -> u64 {
+        self.0
+    }
+}
+
+impl fmt::Display for StateTransactionHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "state-tx-{}", self.0)
+    }
+}
+
+/// `component_state` 表记录（§41.2：state 是 Component 产生的权威持久业务
+/// 状态；value 是平台不透明的序列化业务字节——**平台不解析、不解释 value
+/// 内容**，结构化形态由 Component 与自身 schema 之间的事实保证，WIT）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StateValueRecord {
+    /// 安装实例（state 命名空间私有于安装实例，§19.4）。
+    pub installation_id: InstallationId,
+    /// 状态键。
+    pub key: StateKey,
+    /// 本行的 schema 版本（写入时绑定，§41.2 版本化 state）。
+    pub schema_version: StateSchemaVersion,
+    /// 平台不透明的序列化业务字节。
+    pub value: Vec<u8>,
+    /// 最后更新时间。
+    pub updated_at: Timestamp,
+}
+
+/// Component config 的声明格式（WIT operune:config："契约层表达格式
+/// （json/toml/raw）"，§41.2；闭集，CHECK 与 domain 枚举字符串一致）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ConfigFormat {
+    /// JSON。
+    Json,
+    /// TOML。
+    Toml,
+    /// 原始字节（无格式声明）。
+    Raw,
+}
+
+impl fmt::Display for ConfigFormat {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            Self::Json => "json",
+            Self::Toml => "toml",
+            Self::Raw => "raw",
+        };
+        f.write_str(s)
+    }
+}
+
+impl std::str::FromStr for ConfigFormat {
+    type Err = StorageError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "json" => Ok(Self::Json),
+            "toml" => Ok(Self::Toml),
+            "raw" => Ok(Self::Raw),
+            other => Err(StorageError::CorruptState(format!(
+                "invalid component config format {other:?}"
+            ))),
+        }
+    }
+}
+
+/// `component_config` 表记录（§41.2：config 是管理员/系统提供的输入，具有
+/// validation 与版本语义；guest 只读，写侧不在 Component 契约内）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComponentConfigRecord {
+    /// 安装实例。
+    pub installation_id: InstallationId,
+    /// 声明格式（json/toml/raw）。
+    pub format: ConfigFormat,
+    /// 配置契约的 schema 版本（WIT：与 config-version/revision 相区别）。
+    pub schema_version: StateSchemaVersion,
+    /// 快照修订号（每次被接受的写入 +1，§41.2 变化检测）。
+    pub revision: u64,
+    /// 有界配置值（通过验证后才成为当前配置）。
+    pub value: Vec<u8>,
+    /// 最后更新时间。
+    pub updated_at: Timestamp,
+}
+
+/// secret 名称（`component_secret.secret_name`；WIT operune:secret
+/// `secret-name`，§41.2）。字符集 `[A-Za-z0-9._-]`（非空、无控制字符/空白、
+/// ≤ 255 字节）。
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct SecretName(String);
+
+impl SecretName {
+    /// 构造并校验（validate-on-construct，§13.3）。
+    pub fn new(value: impl Into<String>) -> Result<Self, StorageError> {
+        let value = value.into();
+        validate_key(&value, "secret name", b"._-", SECRET_NAME_MAX_LEN)?;
+        Ok(Self(value))
+    }
+
+    /// 原始字符串视图。
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for SecretName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// `component_secret` 表记录（§41.2：secret 是受专门访问控制与防泄漏规则
+/// 保护的敏感值）。
+///
+/// **密文边界（§16.6 / ADR-0001，已裁决）**：`ciphertext` 是**不透明密文
+///   BLOB**——加密在 SecretStore 服务侧完成（AEAD envelope：算法标识 +
+///   版本 + nonce + 密文 + tag），本存储层不解密、不解释、不回显内容；
+///   明文绝不落库（本表没有也不会有可容纳明文的列）；KEK 绝不进入本
+///   数据库（§16.6：KEK 不得与密文同库同保护级）。`metadata` 只承载
+///   非敏感元数据。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecretRecord {
+    /// secret 名称（grant scope 的键，§17.3）。
+    pub name: SecretName,
+    /// 轮换版本（每次轮换 +1，WIT `secret-version`）。
+    pub version: u64,
+    /// 不透明密文 BLOB（storage 不解密，原样存取）。
+    pub ciphertext: Vec<u8>,
+    /// 非敏感元数据（绝不含值/密钥材料，§16.6）。
+    pub metadata: String,
+    /// 最后更新时间。
+    pub updated_at: Timestamp,
+}
+
+/// secret 列表项元数据（WIT `list-granted-secrets` 的 `secret-metadata`：
+/// 名称 + 版本；**不含值**，§41.2 防泄漏）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecretMetadata {
+    /// secret 名称。
+    pub name: SecretName,
+    /// 轮换版本。
+    pub version: u64,
+}
+
 /// 显式回滚结果（§20.1 热升级/回滚）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RollbackResult {
