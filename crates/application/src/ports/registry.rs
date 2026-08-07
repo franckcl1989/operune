@@ -4,6 +4,8 @@ use operune_domain::{ComponentId, ComponentVersion, ContentDigest, InstallationI
 
 use crate::model::{CandidateRecord, DigestVersionBinding, InstallationRecord};
 
+use super::AuditEvent;
+
 /// 注册表持久化错误（封闭 typed error，§14.1）。
 #[derive(Debug, thiserror::Error)]
 pub enum RegistryError {
@@ -83,4 +85,23 @@ pub trait ComponentRegistryPort: Send + Sync {
 
     /// 全部安装实例记录（管理面列表，§21.1）。
     fn list_installations(&self) -> Result<Vec<InstallationRecord>, RegistryError>;
+}
+
+/// 卸载存储面 port（§39.2 remove / §42.4：卸载后组件从 UI 与 backend
+/// 完整消失；storage-sqlite 层实现）。
+///
+/// 语义：**单事务**删除安装实例的全部 Core 元数据（grants /
+/// active_version / upgrade_transactions / graph 记录 /
+/// component_state/config/secret / installation_versions / installations
+/// 行，§18.5 crash consistency）；**artifact 保留**（§18.7 rollback
+/// retention：digest 仍被 artifact / component_versions 引用，GC 引用
+/// 规则不变）；audit 事件由服务侧提供并在**同一事务**落盘（§18.7 fail
+/// closed——audit 无法落盘时删除整体回滚）。
+pub trait UninstallStorePort: Send + Sync {
+    /// 单事务卸载。安装不存在 → [`RegistryError::NotFound`]。
+    fn remove_installation(
+        &self,
+        installation: InstallationId,
+        audit: AuditEvent,
+    ) -> Result<(), RegistryError>;
 }

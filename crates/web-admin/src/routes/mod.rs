@@ -63,6 +63,10 @@ pub fn admin_router(state: Arc<AdminState>) -> Router {
                 .layer(DefaultBodyLimit::max(upload_limit)),
         )
         .route("/components/{id}/rollback", post(components::rollback_post))
+        .route(
+            "/components/{id}/remove",
+            get(components::remove_form).post(components::remove_post),
+        )
         .route("/grants", get(grants::grants_list))
         .route(
             "/grants/{id}",

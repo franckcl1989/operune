@@ -17,11 +17,12 @@ use std::sync::{Arc, Mutex};
 use operune_application::contract::GuestComponentDescriptor;
 use operune_application::ports::{
     AuditEvent as AppAuditEvent, AuditPort, ComponentRegistryPort, ConfigError, ConfigPort,
-    GrantError, GrantStorePort, RegistryError,
+    GrantError, GrantStorePort, RegistryError, UninstallStorePort,
 };
 use operune_application::{
     ActiveRuntimeRegistry, ContractSurface, InProcessActionPolicy, InstallOutcome, InstallService,
-    InstallationGrant, RuntimeConfig, UpgradeOutcome, UpgradeService, WasmRuntime, WebBridge,
+    InstallationGrant, RuntimeConfig, UninstallService, UpgradeOutcome, UpgradeService,
+    WasmRuntime, WebBridge,
 };
 use operune_domain::{
     CapabilityId, ComponentId, ComponentLifecycleState, ComponentVersion, ContentDigest,
@@ -126,6 +127,66 @@ impl FakeRegistry {
             Ok(guard) => guard.get(&id).cloned(),
             Err(_) => None,
         }
+    }
+
+    /// 移除安装记录（卸载存储副作用的落点，§39.2 remove）。
+    pub(crate) fn remove_installation(&self, id: InstallationId) {
+        if let Ok(mut guard) = self.installations.lock() {
+            guard.remove(&id);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FakeUninstallStore（§39.2 remove：记录调用 + 模拟真实存储的单事务删除）
+// ---------------------------------------------------------------------------
+
+/// 假卸载存储面：记录调用并可注入"安装记录随卸载消失"的副作用。
+pub(crate) struct FakeUninstallStore {
+    removed: std::sync::Mutex<Vec<InstallationId>>,
+    effect: std::sync::Mutex<Option<RemoveEffect>>,
+}
+
+/// 删除副作用（模拟真实存储"单事务删除"的完整性）。
+type RemoveEffect = Arc<dyn Fn(InstallationId) + Send + Sync>;
+
+impl FakeUninstallStore {
+    pub(crate) fn new() -> Self {
+        Self {
+            removed: std::sync::Mutex::new(Vec::new()),
+            effect: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// 接线删除副作用（harness 在构造期调用一次）。
+    pub(crate) fn with_effect(&self, effect: RemoveEffect) {
+        if let Ok(mut slot) = self.effect.lock() {
+            *slot = Some(effect);
+        }
+    }
+}
+
+impl UninstallStorePort for FakeUninstallStore {
+    fn remove_installation(
+        &self,
+        installation: InstallationId,
+        _audit: AppAuditEvent,
+    ) -> Result<(), RegistryError> {
+        {
+            let mut removed = self
+                .removed
+                .lock()
+                .map_err(|_| RegistryError::Storage(Box::new(std::io::Error::other("poisoned"))))?;
+            removed.push(installation);
+        }
+        let effect = match self.effect.lock() {
+            Ok(guard) => guard.clone(),
+            Err(_) => None,
+        };
+        if let Some(effect) = effect {
+            effect(installation);
+        }
+        Ok(())
     }
 }
 
@@ -450,6 +511,19 @@ impl TestHarness {
             Arc::clone(&active),
             Arc::clone(&assets),
         );
+        let uninstall_store = Arc::new(FakeUninstallStore::new());
+        uninstall_store.with_effect(Arc::new({
+            // 模拟真实存储"单事务删除"：安装记录随卸载消失（§42.4）。
+            let registry = Arc::clone(&registry);
+            move |installation| registry.remove_installation(installation)
+        }));
+        let uninstall = UninstallService::new(
+            Arc::clone(&registry) as Arc<dyn ComponentRegistryPort>,
+            Arc::clone(&uninstall_store) as Arc<dyn UninstallStorePort>,
+            Arc::clone(&app_audit) as Arc<dyn AuditPort>,
+            Arc::clone(&config) as Arc<dyn ConfigPort>,
+            Arc::clone(&active),
+        );
         let _web = WebBridge::new(
             Arc::clone(&active),
             Arc::clone(&assets),
@@ -459,6 +533,7 @@ impl TestHarness {
         let api = RealAdminApi::new(
             install,
             upgrade,
+            uninstall,
             Arc::clone(&active),
             Arc::clone(&registry) as Arc<dyn ComponentRegistryPort>,
             Arc::clone(&grants) as Arc<dyn GrantStorePort>,
@@ -528,6 +603,7 @@ pub(crate) enum RecordedCall {
     Rollback(InstallationId),
     Disable(InstallationId),
     Enable(InstallationId),
+    Remove(InstallationId),
     GrantsFor(InstallationId),
     ReplaceGrants {
         id: InstallationId,
@@ -566,6 +642,7 @@ struct FakeAdminConfig {
     safe_mode: bool,
     next_install: Option<Result<InstallOutcome, AdminError>>,
     next_upgrade: Option<Result<UpgradeOutcome, AdminError>>,
+    next_remove: Option<Result<(), AdminError>>,
 }
 
 impl FakeAdminApi {
@@ -588,6 +665,16 @@ impl FakeAdminApi {
 
     pub(crate) fn with_upgrade(&self, outcome: UpgradeOutcome) {
         self.with_config(|config| config.next_upgrade = Some(Ok(outcome)));
+    }
+
+    /// 脚本化下一次 remove 的结果（默认 Ok(())；失败用于错误页断言）。
+    pub(crate) fn with_remove(&self, result: Result<(), AdminError>) {
+        self.with_config(|config| config.next_remove = Some(result));
+    }
+
+    /// 预置组件视图（列表 / 详情 / 确认页渲染测试的种子）。
+    pub(crate) fn with_components(&self, components: Vec<crate::facade::ComponentView>) {
+        self.with_config(|config| config.components = components);
     }
 
     pub(crate) fn calls(&self) -> Vec<RecordedCall> {
@@ -705,6 +792,18 @@ impl crate::facade::AdminApi for FakeAdminApi {
     fn enable(&self, id: InstallationId) -> Result<(), AdminError> {
         self.record(RecordedCall::Enable(id));
         Ok(())
+    }
+
+    fn remove(&self, id: InstallationId) -> Result<(), AdminError> {
+        self.record(RecordedCall::Remove(id));
+        let mut config = self
+            .config
+            .lock()
+            .map_err(|_| AdminError::Unsupported("fake poisoned"))?;
+        match config.next_remove.take() {
+            Some(result) => result,
+            None => Ok(()),
+        }
     }
 
     fn grants_for(&self, id: InstallationId) -> Result<Vec<InstallationGrant>, AdminError> {

@@ -95,6 +95,7 @@ pub mod scheduler;
 pub mod secret;
 pub mod state;
 pub mod stateful_imports;
+pub mod uninstall;
 pub mod upgrade;
 pub mod web;
 pub mod web_app;
@@ -132,9 +133,9 @@ pub use ports::{
     GraphRecords, GraphStoreError, InProcessActionPolicy, InProcessWebPermissionPolicy,
     InProcessWebQuota, PermissionDenied, ProviderGraphPort, RegistryError, SecretCiphertextRecord,
     SecretGrantPort, SecretStoreError, SecretStorePort, StateStoreError, StateStorePort,
-    StatefulAuditEvent, StatefulAuditPort, WEB_PERMISSIONS_CAPABILITY, WebPermissionContext,
-    WebPermissionPolicyPort, WebQuotaContext, WebQuotaDenied, WebQuotaGuard, WebQuotaLimits,
-    WebQuotaPort,
+    StatefulAuditEvent, StatefulAuditPort, UninstallStorePort, WEB_PERMISSIONS_CAPABILITY,
+    WebPermissionContext, WebPermissionPolicyPort, WebQuotaContext, WebQuotaDenied, WebQuotaGuard,
+    WebQuotaLimits, WebQuotaPort,
 };
 pub use runtime::{
     ActiveRuntime, CompiledWasm, EventRuntimeDelivery, PreparedRuntime, RuntimePlan,
@@ -144,6 +145,7 @@ pub use scheduler::{SchedulerError, SchedulerLimits, SchedulerService};
 pub use secret::{SecretError, SecretService};
 pub use state::{CasOutcome, MigrationGate, StateError, StateService};
 pub use stateful_imports::StatefulHostServices;
+pub use uninstall::UninstallService;
 pub use upgrade::UpgradeService;
 pub use web::{AssetCache, AssetResponse, WebBridge};
 pub use web_app::{

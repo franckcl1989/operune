@@ -197,6 +197,20 @@ pub enum AuditEvent {
         /// 排除规则数。
         exclusions: usize,
     },
+    /// 卸载完成（§39.2 remove / §42.4：卸载后组件从 UI 与 backend 完整
+    /// 消失——路由/页面/资产/app context 全部 404）。事件与元数据删除
+    /// 同事务落盘（§18.7 fail closed）。artifact 保留（§18.7：digest 仍
+    /// 被 artifact/component_versions 引用，GC 规则不变）。
+    UninstallCompleted {
+        /// 安装实例。
+        installation: InstallationId,
+        /// 逻辑产品身份。
+        component_id: ComponentId,
+        /// 最后激活版本。
+        version: ComponentVersion,
+        /// 最后激活 digest（从未激活 = `None`）。
+        digest: Option<ContentDigest>,
+    },
 }
 
 /// 安装输入拒绝原因（§19.1 / §19.2）。

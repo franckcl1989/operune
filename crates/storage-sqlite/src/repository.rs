@@ -982,6 +982,60 @@ impl<'a> Repository<'a> {
         Ok(next)
     }
 
+    /// `remove_installation`：卸载安装实例（§39.2 remove / §42.4：卸载后
+    /// UI + backend 完整消失）。**单事务**删除该安装实例的全部 Core
+    /// 元数据：`grants` → `active_version` → `upgrade_transactions` →
+    /// graph 记录（`graph_provider_records` / `graph_consumer_records`）→
+    /// `component_state` / `component_config` / `component_secret` →
+    /// `installation_versions` → `installations` 行（子表先于父表删除；
+    /// `foreign_keys = ON` 按连接强制——顺序即删除可行性，§18.3）。
+    /// audit 与删除同事务（§18.7 fail closed：audit 无法落盘时整个删除
+    /// 回滚，绝不产生"元数据已删但审计缺失"的半状态）。
+    ///
+    /// artifact **保留**（§18.7 rollback retention）：卸载不删除
+    /// `artifacts` 记录，也不删除 `component_versions` 版本绑定——digest
+    /// 仍被 artifact/component_versions 引用，GC 引用规则不变（仍被引用的
+    /// digest 不可能被 GC 删除）；卸载后同一 digest 可全新安装（§19.4：
+    /// InstallationId 由 Core 重新生成）。
+    ///
+    /// 安装不存在 → [`StorageError::NotFound`]。
+    pub(crate) fn remove_installation(
+        &mut self,
+        installation_id: InstallationId,
+        audit: &AuditEvent,
+        cancel: &AtomicBool,
+    ) -> Result<(), StorageError> {
+        check_cancel(cancel)?;
+        if self.read_installation(installation_id)?.is_none() {
+            return Err(StorageError::NotFound(format!(
+                "installation {installation_id}"
+            )));
+        }
+        let now = self.sql_now()?;
+        let id = installation_id.to_string();
+        self.run_tx("begin uninstall transaction", |tx| {
+            // §39.2 / §42.4：删除顺序 = 子表先于父表（active_version 外键
+            // 到 installation_versions；其余各表外键到 installations）。
+            // 语句均为静态 SQL（表名非输入，无注入面，§19.1）。
+            for statement in [
+                "DELETE FROM grants WHERE installation_id = ?1",
+                "DELETE FROM active_version WHERE installation_id = ?1",
+                "DELETE FROM upgrade_transactions WHERE installation_id = ?1",
+                "DELETE FROM graph_provider_records WHERE installation_id = ?1",
+                "DELETE FROM graph_consumer_records WHERE installation_id = ?1",
+                "DELETE FROM component_state WHERE installation_id = ?1",
+                "DELETE FROM component_config WHERE installation_id = ?1",
+                "DELETE FROM component_secret WHERE installation_id = ?1",
+                "DELETE FROM installation_versions WHERE installation_id = ?1",
+                "DELETE FROM installations WHERE installation_id = ?1",
+            ] {
+                tx.execute(statement, [&id])
+                    .map_err(|e| StorageError::sqlite("delete uninstall rows", e))?;
+            }
+            Self::insert_audit(tx, audit, now)
+        })
+    }
+
     /// `set_installation_enabled`：enable/disable 事实（§39.2）。启用一个
     /// `Failed`（终态，§12.2）的安装被拒绝。
     pub(crate) fn set_installation_enabled(
@@ -3988,6 +4042,287 @@ mod tests {
             let repo = Repository::new(&mut conn, &store);
             assert!(repo.get_artifact(digest)?.is_none());
         }
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // 卸载（§39.2 remove / §42.4）——单事务删除与 artifact 保留（§18.7）
+    // ------------------------------------------------------------------
+
+    /// 在安装实例上铺满全部关联元数据（grants / graph 记录 / state /
+    /// config / secret），供卸载测试验证"卸载后相关表无残留"。
+    fn seed_all_metadata(conn: &mut Connection, store: &ArtifactStore, inst: InstallationId) {
+        // graph records（§40.2）：直接插入规范化 JSON（本测试只验证删除面，
+        // 序列化层由既有 replace_graph_records 测试覆盖）。
+        ok(
+            conn.execute(
+                "INSERT INTO graph_provider_records (installation_id, provided, updated_at)
+                 VALUES (?1, '[\"acme:svc/api@1.0.0\"]', ?2)",
+                params![inst.to_string(), 0],
+            ),
+            "insert graph provider record",
+        );
+        ok(
+            conn.execute(
+                "INSERT INTO graph_consumer_records (installation_id, required, updated_at)
+                 VALUES (?1, '[\"acme:svc/api@1.0.0\"]', ?2)",
+                params![inst.to_string(), 0],
+            ),
+            "insert graph consumer record",
+        );
+        let c = cancel();
+        let mut repo = Repository::new(conn, store);
+        let capability = ok(CapabilityId::new("wasi:cli/environment"), "capability");
+        let scope = ok(CapabilityScope::new("{}".to_owned()), "capability scope");
+        ok(
+            repo.grant_capability(inst, capability, scope, &audit("grant"), &c),
+            "grant",
+        );
+        // state（§41.2）：首次写入建立 schema 版本。
+        let key = ok(StateKey::new("k"), "state key");
+        ok(
+            repo.put_state(inst, &key, StateSchemaVersion::new(1), b"value", &c),
+            "put state",
+        );
+        // config（§41.2）。
+        ok(
+            repo.put_component_config(
+                inst,
+                ConfigFormat::Json,
+                StateSchemaVersion::new(1),
+                b"{}",
+                &c,
+            ),
+            "put config",
+        );
+        // secret 密文（§41.2 / §16.6：不透明 BLOB，本测试只用占位字节）。
+        let name = ok(SecretName::new("api-key"), "secret name");
+        ok(
+            repo.put_secret(inst, &name, b"ciphertext-placeholder", "metadata", &c),
+            "put secret",
+        );
+    }
+
+    #[test]
+    fn remove_installation_deletes_all_metadata_and_keeps_artifact() -> Result<(), StorageError> {
+        // §39.2 remove / §42.4：卸载后相关表无残留；§18.7：artifact 保留
+        // （digest 仍被 component_versions 引用，GC 规则不变）。
+        let dir = tempdir();
+        let (mut conn, store) = open_harness(dir.path());
+        let c = cancel();
+        let (cid, v1, digest) = stage_candidate(&mut conn, &store, "remove-me", "1.0.0", b"bytes");
+        let inst = activate(&mut conn, &store, cid.clone(), v1, digest);
+        // 铺满关联元数据。
+        seed_all_metadata(&mut conn, &store, inst);
+
+        // 卸载前：全部关联表有数据（自检种子生效）。
+        {
+            let repo = Repository::new(&mut conn, &store);
+            assert!(!ok(repo.list_grants(inst), "grants").is_empty());
+            assert!(repo.get_active_binding(inst)?.is_some());
+            assert!(!ok(repo.list_installation_versions(inst), "versions").is_empty());
+            assert!(!ok(repo.list_upgrade_transactions(inst), "tx markers").is_empty());
+            let graph = ok(repo.load_graph_records(), "graph records");
+            assert!(!graph.providers.is_empty() || !graph.consumers.is_empty());
+            assert!(
+                repo.get_state(inst, &ok(StateKey::new("k"), "key"))?
+                    .is_some()
+            );
+            assert!(repo.get_component_config(inst)?.is_some());
+            assert!(
+                repo.get_secret(inst, &ok(SecretName::new("api-key"), "name"))?
+                    .is_some()
+            );
+            // artifact 与版本绑定存在（卸载保留目标，§18.7）。
+            assert!(repo.get_artifact(digest)?.is_some());
+            assert!(repo.resolve_version(&cid, v1)?.is_some());
+        }
+
+        // 卸载（单事务）。
+        {
+            let mut repo = Repository::new(&mut conn, &store);
+            ok(
+                repo.remove_installation(inst, &audit("uninstall"), &c),
+                "remove installation",
+            );
+        }
+
+        // 卸载后：相关表全部无残留。
+        {
+            let repo = Repository::new(&mut conn, &store);
+            assert!(
+                repo.get_installation(inst)?.is_none(),
+                "installations row gone"
+            );
+            assert!(
+                ok(repo.list_grants(inst), "grants").is_empty(),
+                "grants gone"
+            );
+            assert!(
+                repo.get_active_binding(inst)?.is_none(),
+                "active_version gone"
+            );
+            assert!(
+                ok(repo.list_installation_versions(inst), "versions").is_empty(),
+                "installation_versions gone"
+            );
+            assert!(
+                ok(repo.list_upgrade_transactions(inst), "tx markers").is_empty(),
+                "upgrade_transactions gone"
+            );
+            let graph = ok(repo.load_graph_records(), "graph records");
+            assert!(
+                graph.providers.is_empty() && graph.consumers.is_empty(),
+                "graph records gone"
+            );
+            assert!(
+                repo.get_state(inst, &ok(StateKey::new("k"), "key"))?
+                    .is_none(),
+                "component_state gone"
+            );
+            assert!(
+                repo.get_component_config(inst)?.is_none(),
+                "component_config gone"
+            );
+            assert!(
+                repo.get_secret(inst, &ok(SecretName::new("api-key"), "name"))?
+                    .is_none(),
+                "component_secret gone"
+            );
+            // §18.7：artifact 保留——记录、字节、版本绑定都在。
+            assert!(
+                repo.get_artifact(digest)?.is_some(),
+                "artifact record retained"
+            );
+            assert!(
+                repo.read_artifact_bytes(digest)?.is_some(),
+                "artifact bytes retained"
+            );
+            assert!(
+                repo.resolve_version(&cid, v1)?.is_some(),
+                "component_versions binding retained"
+            );
+        }
+        // 审计：卸载事件已记录（§18.7 同事务）。
+        {
+            let repo = Repository::new(&mut conn, &store);
+            let recent = ok(repo.list_audit_recent(1000), "audit recent");
+            assert!(
+                recent.iter().any(|event| event.action == "uninstall"),
+                "uninstall audit event must be recorded"
+            );
+        }
+
+        // 重复卸载：NotFound（幂等语义 = 显式错误，不静默）。
+        {
+            let mut repo = Repository::new(&mut conn, &store);
+            let error = err(
+                repo.remove_installation(inst, &audit("uninstall again"), &c),
+                "repeat uninstall",
+            );
+            assert!(
+                matches!(error, StorageError::NotFound(_)),
+                "repeat uninstall must be NotFound, got {error:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn remove_installation_mid_transaction_failure_rolls_back_everything()
+    -> Result<(), StorageError> {
+        // §18.5 crash consistency / §18.7 fail closed：卸载事务中途失败
+        // （audit 落盘失败）⇒ 整个删除回滚，绝不产生"半删除"状态。
+        let dir = tempdir();
+        let (mut conn, store) = open_harness(dir.path());
+        let c = cancel();
+        let (cid, v1, digest) =
+            stage_candidate(&mut conn, &store, "rollback-me", "1.0.0", b"bytes");
+        let inst = activate(&mut conn, &store, cid, v1, digest);
+        seed_all_metadata(&mut conn, &store, inst);
+
+        // 破坏 audit 落盘：删除 audit_events 表 → 事务内 insert_audit 失败
+        // （fail closed，§18.7）。
+        ok(
+            conn.execute_batch("DROP TABLE audit_events;"),
+            "drop audit table",
+        );
+
+        let error = err(
+            {
+                let mut repo = Repository::new(&mut conn, &store);
+                repo.remove_installation(inst, &audit("uninstall"), &c)
+            },
+            "uninstall with broken audit",
+        );
+        assert!(matches!(error, StorageError::Sqlite { .. }));
+
+        // 回滚后：安装与全部关联数据仍在（无半删除）。
+        {
+            let repo = Repository::new(&mut conn, &store);
+            assert!(repo.get_installation(inst)?.is_some(), "installation kept");
+            assert!(
+                !ok(repo.list_grants(inst), "grants").is_empty(),
+                "grants kept"
+            );
+            assert!(
+                repo.get_active_binding(inst)?.is_some(),
+                "active_version kept"
+            );
+            assert!(
+                !ok(repo.list_installation_versions(inst), "versions").is_empty(),
+                "installation_versions kept"
+            );
+            assert!(
+                !ok(repo.list_upgrade_transactions(inst), "tx markers").is_empty(),
+                "upgrade_transactions kept"
+            );
+            assert!(
+                repo.get_state(inst, &ok(StateKey::new("k"), "key"))?
+                    .is_some(),
+                "component_state kept"
+            );
+            assert!(
+                repo.get_component_config(inst)?.is_some(),
+                "component_config kept"
+            );
+            assert!(
+                repo.get_secret(inst, &ok(SecretName::new("api-key"), "name"))?
+                    .is_some(),
+                "component_secret kept"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn uninstalled_digest_can_be_reinstalled_as_fresh_installation() -> Result<(), StorageError> {
+        // §19.4：卸载不删除 artifact / 版本绑定（§18.7）——同一 digest 可
+        // 全新安装，Core 生成**新的** InstallationId（不跨卸载复用身份）。
+        let dir = tempdir();
+        let (mut conn, store) = open_harness(dir.path());
+        let c = cancel();
+        let (cid, v1, digest) =
+            stage_candidate(&mut conn, &store, "reinstall-me", "1.0.0", b"same bytes");
+        let first = activate(&mut conn, &store, cid.clone(), v1, digest);
+        {
+            let mut repo = Repository::new(&mut conn, &store);
+            ok(
+                repo.remove_installation(first, &audit("uninstall"), &c),
+                "remove installation",
+            );
+        }
+        // 同一 digest + 同一版本绑定，全新安装 → 新 InstallationId。
+        let second = activate(&mut conn, &store, cid, v1, digest);
+        assert_ne!(
+            first, second,
+            "reinstall must mint a fresh InstallationId (§19.4)"
+        );
+        let repo = Repository::new(&mut conn, &store);
+        assert!(
+            repo.get_artifact(digest)?.is_some(),
+            "artifact retained across uninstall (§18.7)"
+        );
         Ok(())
     }
 }

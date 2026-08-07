@@ -86,7 +86,7 @@ use operune_application::ports::{
     ConfigError, ConfigPort, ConfigStoreError, GrantError, GrantStorePort, GraphRecords,
     GraphStoreError, ProviderGraphPort, RegistryError, SecretCiphertextRecord, SecretGrantPort,
     SecretStoreError, SecretStorePort, StateStoreError, StateStorePort, StatefulAuditEvent,
-    StatefulAuditPort,
+    StatefulAuditPort, UninstallStorePort,
 };
 use operune_domain::{
     ByteSize, ComponentId, ComponentLifecycleState, ComponentVersion, ConfigFormat, ConfigRevision,
@@ -794,6 +794,45 @@ impl ComponentRegistryPort for StoragePorts {
             }
         }
         Ok(composed)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// UninstallStorePort（§39.2 remove / §42.4：卸载后 UI + backend 完整消失）
+// ---------------------------------------------------------------------------
+
+impl UninstallStorePort for StoragePorts {
+    fn remove_installation(
+        &self,
+        installation: InstallationId,
+        audit: AuditEvent,
+    ) -> Result<(), RegistryError> {
+        // §18.7 fail closed：audit 事件映射失败即中止（不提交删除）。
+        let storage_audit = match to_storage_audit(&audit) {
+            Ok(event) => event,
+            Err(error) => {
+                let message = match error {
+                    AuditError::Storage(source) => {
+                        format!("audit event mapping failed: {source}")
+                    }
+                };
+                return Err(Self::registry_error(StorageError::InvalidArgument(message)));
+            }
+        };
+        match self.submit(Command::RemoveInstallation {
+            installation_id: installation,
+            audit: storage_audit,
+        }) {
+            Ok(Response::Removed) => Ok(()),
+            Ok(_) => Err(RegistryError::Storage(Box::new(unexpected(
+                "RemoveInstallation",
+            )))),
+            // §39.2 remove 契约：安装不存在 → [`RegistryError::NotFound`]
+            //（与 grant_error 的 NotFound 映射同模式——其余错误装箱为
+            // 可诊断 source）。
+            Err(StorageError::NotFound(_)) => Err(RegistryError::NotFound("installation")),
+            Err(error) => Err(Self::registry_error(error)),
+        }
     }
 }
 
@@ -1686,6 +1725,23 @@ fn to_storage_audit(event: &AuditEvent) -> Result<crate::model::AuditEvent, Audi
             None,
             AuditOutcome::Success,
             Some(format!("{bindings} bindings, {exclusions} exclusions")),
+        ),
+        // §39.2 remove / §42.4：卸载完成（事件与元数据删除同事务，
+        // §18.7 fail closed）。component-lifecycle 类别 + uninstall 前缀。
+        AuditEvent::UninstallCompleted {
+            installation,
+            component_id,
+            version,
+            digest,
+        } => (
+            AuditCategory::ComponentLifecycle,
+            "uninstall-completed",
+            Some(installation.to_string()),
+            AuditOutcome::Success,
+            Some(match digest {
+                Some(digest) => format!("{component_id} {version} {digest}"),
+                None => format!("{component_id} {version} (never activated)"),
+            }),
         ),
     };
     crate::model::AuditEvent::new(
@@ -3595,6 +3651,180 @@ mod tests {
             }),
             "config-failed row must have failure outcome"
         );
+        shutdown_ports(ports).await;
+    }
+
+    // ------------------------------------------------------------------
+    // 卸载（§39.2 remove / §42.4）——真实 executor 端到端
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn uninstall_store_removes_everything_on_real_executor() {
+        // §39.2 remove / §42.4 端到端（真实 executor）：安装实例的全部
+        // Core 元数据（grants / active / 版本绑定 / graph 记录 /
+        // state/config/secret / installation 行）在单事务中删除；artifact
+        // 保留（§18.7）；audit 与删除同事务落盘（§18.7 fail closed）；
+        // 重复卸载 → NotFound；同一 digest 全新安装 → 新的 InstallationId
+        //（§19.4）。
+        let dir = tempdir();
+        let ports = open_ports(dir.path()).await;
+        let component = component_id("uninstall-demo");
+        let version = version("1.0.0");
+        let bytes = b"uninstall component bytes".to_vec();
+        let (digest, installation) = install_v1(&ports, &component, version, bytes).await;
+
+        // 铺满关联元数据。
+        // grants（§17.5）。
+        let grant = InstallationGrant {
+            capability: ok(CapabilityId::new("wasi:cli/environment"), "capability"),
+            scope: GrantScope::Unscoped,
+        };
+        ok(
+            GrantStorePort::replace_grants(&ports, installation, &[grant]),
+            "replace grants",
+        );
+        // graph records（§40.2：provider + consumer 同一安装）。
+        ok(
+            ports.replace_records(
+                installation,
+                Some(&provider_record(
+                    installation,
+                    &[iface("acme:svc", "checkout", 1, 0, 0)],
+                )),
+                Some(&consumer_record(
+                    installation,
+                    &[requirement("acme:svc", "checkout", "^1.0.0")],
+                )),
+            ),
+            "replace graph records",
+        );
+        // state / config / secret（§41.2）。
+        let schema_v1 = StateSchemaVersion::from_u32(1);
+        ok(
+            StateStorePort::put(
+                &ports,
+                installation,
+                &state_key("k"),
+                schema_v1,
+                &state_value(b"v"),
+            ),
+            "put state",
+        );
+        ok(
+            ComponentConfigStorePort::put(
+                &ports,
+                installation,
+                ConfigFormat::Json,
+                ConfigSchemaVersion::from_u32(1),
+                &ok(ConfigValue::new(b"{}".to_vec()), "config value"),
+            ),
+            "put config",
+        );
+        ok(
+            SecretStorePort::put(
+                &ports,
+                installation,
+                &ok(SecretName::new("db-password"), "secret name"),
+                vec![1, 2, 3],
+                "metadata",
+            ),
+            "put secret",
+        );
+
+        // 预检：关联数据全部存在。
+        assert!(!ok(GrantStorePort::grants_for(&ports, installation), "grants").is_empty());
+        let graph = ok(ports.load_records(), "graph records");
+        assert!(!graph.providers.is_empty() || !graph.consumers.is_empty());
+        assert!(ok(ports.get(installation, &state_key("k")), "state").is_some());
+        assert!(
+            ok(
+                ComponentConfigStorePort::snapshot(&ports, installation),
+                "config"
+            )
+            .is_some()
+        );
+        assert!(!ok(SecretStorePort::list(&ports, installation), "secret list").is_empty());
+
+        // 卸载（服务侧 audit 事件同事务落盘，§18.7 fail closed）。
+        let app_audit = operune_application::ports::AuditEvent::UninstallCompleted {
+            installation,
+            component_id: component.clone(),
+            version,
+            digest: Some(digest),
+        };
+        ok(
+            UninstallStorePort::remove_installation(&ports, installation, app_audit.clone()),
+            "remove installation",
+        );
+
+        // 卸载后：全部相关表无残留（§42.4）。
+        assert!(ok(ports.installation(installation), "installation").is_none());
+        assert!(ok(ports.list_installations(), "list").is_empty());
+        assert!(
+            ok(GrantStorePort::grants_for(&ports, installation), "grants").is_empty(),
+            "grants gone"
+        );
+        let graph = ok(ports.load_records(), "graph records");
+        assert!(
+            graph.providers.is_empty() && graph.consumers.is_empty(),
+            "graph records gone"
+        );
+        assert!(
+            ok(ports.get(installation, &state_key("k")), "state").is_none(),
+            "state gone"
+        );
+        assert!(
+            ok(
+                ComponentConfigStorePort::snapshot(&ports, installation),
+                "config"
+            )
+            .is_none(),
+            "config gone"
+        );
+        assert!(
+            ok(SecretStorePort::list(&ports, installation), "secret list").is_empty(),
+            "secret gone"
+        );
+        // artifact 保留（§18.7）：candidate 记录 + 字节 + 版本绑定都在。
+        assert!(ok(ports.candidate(digest), "candidate").is_some());
+        assert!(ok(ports.artifact_bytes(digest), "artifact bytes").is_some());
+        assert!(
+            ok(
+                ports.resolve_version(&component, version),
+                "version binding"
+            )
+            .is_some()
+        );
+        // audit 同事务落盘（§18.7）。
+        let events = ok(ports.executor.list_audit_recent(1000).await, "audit recent");
+        assert!(
+            events
+                .iter()
+                .any(|event| event.action == "uninstall-completed"),
+            "uninstall-completed audit row must be durable"
+        );
+
+        // 重复卸载 → RegistryError::NotFound（显式错误，不静默）。
+        let error = err(
+            UninstallStorePort::remove_installation(&ports, installation, app_audit),
+            "repeat remove",
+        );
+        assert!(
+            matches!(error, RegistryError::NotFound(_)),
+            "repeat uninstall must be NotFound, got {error:?}"
+        );
+
+        // 同一 digest 全新安装 → 新的 InstallationId（§19.4：身份不跨
+        // 卸载复用；§18.7：artifact 仍可用）。
+        let (_, second) = install_v1(
+            &ports,
+            &component,
+            version,
+            b"uninstall component bytes".to_vec(),
+        )
+        .await;
+        assert_ne!(installation, second);
+
         shutdown_ports(ports).await;
     }
 }

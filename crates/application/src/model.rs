@@ -707,6 +707,13 @@ pub(crate) enum PipelineTarget {
         /// 当前安装记录（必须 Active）。
         current: InstallationRecord,
     },
+    /// 重新激活（§39.2 enable / §12.2：`Disabled → ActivationRequested →
+    /// Activating → Active`）。携带当前记录（必须 Disabled）；字节由用例
+    /// 层从 artifact store 读取（§18.7——卸载不删除 artifact）。
+    Enable {
+        /// 当前安装记录（必须 Disabled，§12.2 概念图终点）。
+        current: InstallationRecord,
+    },
 }
 
 #[cfg(test)]

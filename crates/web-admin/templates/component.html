@@ -49,4 +49,7 @@
   <input type="hidden" name="_csrf" value="{{ ctx.csrf }}">
   <button type="submit">Rollback</button>
 </form>
+<p>
+  <a href="/components/{{ record.installation_id }}/remove" class="danger">Remove component</a>
+</p>
 {% endblock %}

@@ -269,10 +269,47 @@ fn disable_transitions_active_to_disabled() {
         harness.api.disable(installation),
         Err(AdminError::Domain(_))
     ));
-    // enable：0.1 明确不支持（application 用例 API 缺口）。
+    // enable（§39.2）已实现：本 harness 的 fake registry 没有持久化
+    // artifact 字节（§18.7 retention 面），enable 以 ArtifactUnavailable
+    // 拒绝（不再是 Unsupported）。
     assert!(matches!(
         harness.api.enable(installation),
-        Err(AdminError::Unsupported(_))
+        Err(AdminError::Application(
+            ApplicationError::ArtifactUnavailable(_)
+        ))
+    ));
+}
+
+#[test]
+fn remove_deletes_installation_from_registry() {
+    // §39.2 remove / §42.4：卸载后安装从注册表消失（fake 存储副作用
+    // 模拟真实单事务删除）。
+    let harness = harness();
+    let installation = harness.insert_active_record();
+    ok_or_fail(harness.api.remove(installation), "remove");
+    assert!(
+        harness.registry.installation(installation).is_none(),
+        "installation must be gone after remove"
+    );
+    // 未知安装 → typed 拒绝（InstallationNotFound）。
+    assert!(matches!(
+        harness.api.remove(InstallationId::new()),
+        Err(AdminError::Application(
+            ApplicationError::InstallationNotFound(_)
+        ))
+    ));
+}
+
+#[test]
+fn enable_rejects_active_installation() {
+    // §12.2：仅 Disabled 可重新激活——Active 安装 enable → typed 拒绝。
+    let harness = harness();
+    let installation = harness.insert_active_record();
+    assert!(matches!(
+        harness.api.enable(installation),
+        Err(AdminError::Application(
+            ApplicationError::EnableInvalidState { .. }
+        ))
     ));
 }
 

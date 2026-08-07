@@ -43,7 +43,11 @@ pub fn admin_error_response(error: &AdminError) -> Response {
             | operune_application::ApplicationError::NotActiveForWeb(_)
             | operune_application::ApplicationError::InstallationNotFound(_)
             | operune_application::ApplicationError::NoRollbackTarget(_)
-            | operune_application::ApplicationError::RollbackUnavailable(_) => {
+            | operune_application::ApplicationError::RollbackUnavailable(_)
+            | operune_application::ApplicationError::ProviderHasConsumers { .. }
+            | operune_application::ApplicationError::EnableInvalidState { .. }
+            | operune_application::ApplicationError::EnableRequiresApproval { .. }
+            | operune_application::ApplicationError::ArtifactUnavailable(_) => {
                 (StatusCode::CONFLICT, app.to_string())
             }
             _ => (StatusCode::INTERNAL_SERVER_ERROR, app.to_string()),

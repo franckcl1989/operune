@@ -23,7 +23,8 @@ use crate::facade::AdminError;
 use crate::routes::login::page_ctx;
 use crate::state::AdminState;
 use crate::templates::{
-    ComponentDetailTemplate, ComponentsTemplate, InstallTemplate, UpgradeTemplate, component_row,
+    ComponentDetailTemplate, ComponentsTemplate, InstallTemplate, RemoveTemplate, UpgradeTemplate,
+    component_row,
 };
 use operune_application::InstallationGrant;
 
@@ -276,7 +277,7 @@ pub async fn disable_post(
     }
 }
 
-/// POST /components/{id}/enable（0.1.0 明确不支持，见 facade 文档）。
+/// POST /components/{id}/enable（§39.2 enable：Disabled → 重新验证 → 激活）。
 pub async fn enable_post(
     State(state): State<Arc<AdminState>>,
     _auth: Authenticated,
@@ -284,6 +285,40 @@ pub async fn enable_post(
 ) -> Response {
     match state.facade.enable(id) {
         Ok(()) => Redirect::to(&format!("/components/{id}")).into_response(),
+        Err(error) => admin_error_response(&error),
+    }
+}
+
+/// GET /components/{id}/remove（§39.2 remove 确认页：破坏性操作显式确认；
+/// 卸载后组件从 UI 与 backend 完整消失，§42.4）。
+pub async fn remove_form(
+    State(state): State<Arc<AdminState>>,
+    auth: Authenticated,
+    Path(id): Path<InstallationId>,
+) -> Response {
+    match state.facade.component(id) {
+        Ok(view) => render_template(
+            RemoveTemplate {
+                ctx: page_ctx(&auth),
+                record: view.record,
+                error: None,
+            },
+            StatusCode::OK,
+        ),
+        Err(error) => admin_error_response(&error),
+    }
+}
+
+/// POST /components/{id}/remove（§39.2 remove：卸载编排经
+/// [`AdminApi::remove`]；失败（含 provider 仍有 active consumer 依赖，
+/// §40 裁决）→ 错误页展示原因，卸载不发生任何状态变更）。
+pub async fn remove_post(
+    State(state): State<Arc<AdminState>>,
+    _auth: Authenticated,
+    Path(id): Path<InstallationId>,
+) -> Response {
+    match state.facade.remove(id) {
+        Ok(()) => Redirect::to("/components").into_response(),
         Err(error) => admin_error_response(&error),
     }
 }

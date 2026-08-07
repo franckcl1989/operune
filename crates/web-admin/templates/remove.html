@@ -1,0 +1,26 @@
+{% extends "base.html" %}
+{% block title %}Remove component {{ record.installation_id }}{% endblock %}
+{% block content %}
+<h1>Remove component <code>{{ record.installation_id }}</code></h1>
+
+{% if let Some(error) = error %}
+<p class="warn">{{ error }}</p>
+{% endif %}
+
+<p>This permanently removes the installation
+  <code>{{ record.installation_id }}</code> ({{ record.component_id }}
+  {{ record.version }}) from the Core registry: its grants, provider graph
+  records, component state/config/secret and installation record are
+  deleted in one transaction.</p>
+
+<p>Its pages, routes and assets stop being served immediately. The
+  component artifact itself is <strong>retained</strong> (RFC 18.7 rollback
+  retention) — the same digest can be installed again later as a fresh
+  installation.</p>
+
+<form method="post" action="/components/{{ record.installation_id }}/remove">
+  <input type="hidden" name="_csrf" value="{{ ctx.csrf }}">
+  <button type="submit" class="danger">Remove component</button>
+  <a href="/components/{{ record.installation_id }}">Cancel</a>
+</form>
+{% endblock %}

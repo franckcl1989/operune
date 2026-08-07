@@ -6,8 +6,9 @@
 use std::error::Error as StdError;
 
 use operune_domain::{
-    ByteSize, CapabilityId, ComponentId, ComponentVersion, ContentDigest, DomainError,
-    InstallationId, ProviderGraphError, StateSchemaVersion, UpgradeCompatibilityReport,
+    ByteSize, CapabilityId, ComponentId, ComponentLifecycleState, ComponentVersion, ContentDigest,
+    DomainError, InstallationId, ProviderGraphError, StateSchemaVersion,
+    UpgradeCompatibilityReport,
 };
 
 /// 可诊断错误源：第三方错误装箱（§14.1 适配层转换后保留 source；§16.6
@@ -238,6 +239,65 @@ pub enum ApplicationError {
         #[source]
         source: crate::web_app::AppDescriptorFailure,
     },
+
+    /// 卸载被拒绝：安装实例是 provider 且仍有 active consumer 依赖
+    /// （§40 依赖图完整性裁决，§39.2 remove）。
+    ///
+    /// 裁决记录（选项 (a) vs (b)）：provider 卸载导致依赖图不完整——
+    /// 选项 (a) 拒绝卸载（有依赖时）vs (b) 允许并标记受影响 consumer 为
+    /// failed/未激活（须重解析）。选 (a)：
+    ///
+    /// - 确定性：拒绝发生在任何状态变更之前，无部分图、无隐式重解析；
+    /// - 安全性：§19.5 禁止把缺失依赖的 Component 当作健康 active 服务，
+    ///   §40.4 要求同一 set 确定解析——(b) 会把 graph 留在"已提交但不可
+    ///   解析"的中间态；(a) 保持 graph 快照永远可解析；
+    /// - 操作语义与既有停用/升级门控一致（[`crate::composition::CompositionService`
+    ///   的 deactivate / provider 升级兼容分析同样拒绝仍被依赖的 provider）。
+    ///
+    /// consumer 卸载直接允许（consumer 移除不破坏任何其它解析）。
+    #[error(
+        "installation {installation} is a provider with {consumers:?} active consumer(s); refusing to uninstall (§40 graph integrity)"
+    )]
+    ProviderHasConsumers {
+        /// 被卸载的安装实例。
+        installation: InstallationId,
+        /// 直接依赖它的 consumer 安装实例。
+        consumers: Vec<InstallationId>,
+    },
+
+    /// enable 前置状态非法（§39.2 enable / §12.2：仅 `Disabled` 终态可
+    /// 重新激活）。
+    #[error(
+        "installation {installation} is in state {state}; only Disabled can be re-enabled (§39.2)"
+    )]
+    EnableInvalidState {
+        /// 安装实例。
+        installation: InstallationId,
+        /// 当前生命周期状态。
+        state: ComponentLifecycleState,
+    },
+
+    /// enable 需要显式重新批准（§17.5：既有 grant 被替换/撤销后不得静默
+    /// 放行——重新激活前必须补齐缺失能力）。
+    #[error(
+        "enable requires explicit grant approval for installation {installation}: missing {missing:?} (§17.5)"
+    )]
+    EnableRequiresApproval {
+        /// 安装实例。
+        installation: InstallationId,
+        /// 未被覆盖的能力。
+        missing: Vec<CapabilityId>,
+    },
+
+    /// 卸载时后台任务停机失败（§20.4：scheduler/event 未确定停机时卸载
+    /// 不得继续——已入队任务可能仍在投递/触发）。
+    #[error("background task stop failed during uninstall (aborted, §20.4): {0}")]
+    BackgroundStop(#[source] crate::error::ErrorSource),
+
+    /// artifact 字节不可用（§18.7 retention 被破坏：卸载不删除 artifact，
+    /// 缺失即外部损坏/GC 误删）。enable 重新激活需要重新验证字节。
+    #[error("artifact {0} is unavailable (retention violated, §18.7)")]
+    ArtifactUnavailable(ContentDigest),
 
     /// 内部不变量破坏（视为系统故障，fail-stop 语义，§14.3）。
     #[error("application internal invariant violated: {0}")]

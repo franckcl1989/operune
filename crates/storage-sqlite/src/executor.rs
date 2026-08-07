@@ -242,6 +242,18 @@ pub(crate) enum Command {
         /// audit 事件。
         audit: AuditEvent,
     },
+    /// 卸载安装实例（§39.2 remove / §42.4：卸载后 UI + backend 完整消失）。
+    /// **单事务**删除该安装实例的全部 Core 元数据（grants / active_version /
+    /// upgrade_transactions / graph 记录 / component_state/config/secret /
+    /// installation_versions / installations 行）；**artifact 保留**
+    /// （§18.7 rollback retention：digest 仍被 artifact/component_versions
+    /// 引用，GC 规则不变）。audit 与删除同事务（§18.7 fail closed）。
+    RemoveInstallation {
+        /// 安装实例。
+        installation_id: InstallationId,
+        /// audit 事件（同事务，§18.7）。
+        audit: AuditEvent,
+    },
     /// 能力授权（§17.5）。
     GrantCapability {
         /// 安装实例。
@@ -638,6 +650,8 @@ pub(crate) enum Response {
     RollbackPerformed(RollbackResult),
     /// enable/disable 已设置。
     Enabled,
+    /// 卸载已执行（§39.2 remove；单事务）。
+    Removed,
     /// 已授权。
     Granted,
     /// 已撤销。
@@ -1055,6 +1069,26 @@ impl StorageExecutor {
         match response {
             Response::RollbackPerformed(result) => Ok(result),
             _ => Err(unexpected_response("RollbackVersion")),
+        }
+    }
+
+    /// 卸载安装实例（§39.2 remove / §42.4）。不存在 →
+    /// [`StorageError::NotFound`]；单事务删除（§18.5 crash consistency），
+    /// artifact 保留（§18.7）。
+    pub async fn remove_installation(
+        &self,
+        installation_id: InstallationId,
+        audit: AuditEvent,
+    ) -> Result<(), StorageError> {
+        let response = self
+            .submit(Command::RemoveInstallation {
+                installation_id,
+                audit,
+            })
+            .await?;
+        match response {
+            Response::Removed => Ok(()),
+            _ => Err(unexpected_response("RemoveInstallation")),
         }
     }
 
@@ -2122,6 +2156,12 @@ fn worker_main(
                 } => Repository::new(&mut conn, &store)
                     .set_installation_enabled(installation_id, enabled, &audit, &request.cancel)
                     .map(|()| Response::Enabled),
+                Command::RemoveInstallation {
+                    installation_id,
+                    audit,
+                } => Repository::new(&mut conn, &store)
+                    .remove_installation(installation_id, &audit, &request.cancel)
+                    .map(|()| Response::Removed),
                 Command::GrantCapability {
                     installation_id,
                     capability_id,

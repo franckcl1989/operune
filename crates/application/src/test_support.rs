@@ -37,10 +37,11 @@ use crate::ports::{
     GraphRecords, GraphStoreError, InProcessActionPolicy, ProviderGraphPort, RegistryError,
     SchedulerDeliveryError, SchedulerDeliveryPort, SecretCiphertextRecord, SecretGrantPort,
     SecretStoreError, SecretStorePort, StateStoreError, StateStorePort, StatefulAuditEvent,
-    StatefulAuditPort,
+    StatefulAuditPort, UninstallStorePort,
 };
 use crate::runtime::{ActiveRuntime, CompiledWasm, PreparedRuntime, RuntimePlan, WasmRuntime};
 use crate::state::MigrationGate;
+use crate::uninstall::UninstallService;
 use crate::upgrade::UpgradeService;
 use crate::web::{AssetCache, WebBridge};
 use crate::web_app::WebAppService;
@@ -163,6 +164,25 @@ impl FakeRegistry {
         };
         installations.get(&id).cloned()
     }
+
+    /// 移除安装记录（卸载用例的 fake 存储副作用的落点，§39.2 remove）。
+    pub(crate) fn remove_installation(&self, id: InstallationId) {
+        let mut installations = match self.installations.lock() {
+            Ok(guard) => guard,
+            Err(_) => return,
+        };
+        installations.remove(&id);
+    }
+
+    /// 让某 digest 的 artifact 字节缺失（§18.7 retention 被破坏的测试注入；
+    /// 记录仍存在，字节不可读）。
+    pub(crate) fn remove_artifact_bytes(&self, digest: ContentDigest) {
+        let mut artifacts = match self.artifacts.lock() {
+            Ok(guard) => guard,
+            Err(_) => return,
+        };
+        artifacts.remove(&digest);
+    }
 }
 
 impl ComponentRegistryPort for FakeRegistry {
@@ -283,6 +303,87 @@ impl ComponentRegistryPort for FakeRegistry {
             RegistryError::Storage(Box::new(std::io::Error::other("lock poisoned")))
         })?;
         Ok(installations.values().cloned().collect())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FakeUninstallStore（内存实现，§39.2 remove 的形状对齐：记录卸载调用 +
+// 可注入失败）
+// ---------------------------------------------------------------------------
+
+/// 删除副作用（模拟真实存储"单事务删除"的完整性）。
+type RemoveEffect = Arc<dyn Fn(InstallationId) + Send + Sync>;
+
+/// 假卸载存储面：记录每次卸载调用（含服务侧 audit 事件）、可注入失败，
+/// 并可注入"真实存储单事务删除"的副作用（harness 接线：移除 FakeRegistry
+/// 的安装记录，模拟 §39.2 remove 的持久化语义）。
+pub(crate) struct FakeUninstallStore {
+    removed: Mutex<Vec<(InstallationId, AuditEvent)>>,
+    fail_next: std::sync::atomic::AtomicBool,
+    effect: Mutex<Option<RemoveEffect>>,
+}
+
+impl FakeUninstallStore {
+    pub(crate) fn new() -> Self {
+        Self {
+            removed: Mutex::new(Vec::new()),
+            fail_next: std::sync::atomic::AtomicBool::new(false),
+            effect: Mutex::new(None),
+        }
+    }
+
+    /// 全部卸载调用：(安装实例, 服务侧 audit 事件)（断言用）。
+    pub(crate) fn removed(&self) -> Vec<(InstallationId, AuditEvent)> {
+        match self.removed.lock() {
+            Ok(guard) => guard.clone(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// 注入一次存储失败（卸载中止语义测试）。
+    pub(crate) fn with_storage_failure(&self) {
+        self.fail_next
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// 接线删除副作用（harness 在构造期调用一次）。
+    pub(crate) fn with_effect(&self, effect: RemoveEffect) {
+        let mut slot = match self.effect.lock() {
+            Ok(guard) => guard,
+            Err(_) => return,
+        };
+        *slot = Some(effect);
+    }
+}
+
+impl UninstallStorePort for FakeUninstallStore {
+    fn remove_installation(
+        &self,
+        installation: InstallationId,
+        audit: AuditEvent,
+    ) -> Result<(), RegistryError> {
+        if self
+            .fail_next
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            return Err(RegistryError::Storage(Box::new(std::io::Error::other(
+                "injected uninstall store failure",
+            ))));
+        }
+        let mut removed = self.removed.lock().map_err(|_| {
+            RegistryError::Storage(Box::new(std::io::Error::other("lock poisoned")))
+        })?;
+        removed.push((installation, audit));
+        drop(removed);
+        let effect = self
+            .effect
+            .lock()
+            .map_err(|_| RegistryError::Storage(Box::new(std::io::Error::other("lock poisoned"))))?
+            .clone();
+        if let Some(effect) = effect {
+            effect(installation);
+        }
+        Ok(())
     }
 }
 
@@ -1119,6 +1220,9 @@ pub(crate) struct Harness {
     pub(crate) assets: Arc<AssetCache>,
     pub(crate) install: InstallService,
     pub(crate) upgrade: UpgradeService,
+    /// §39.2 remove 卸载用例（composition 接线随 `with_composition`）。
+    pub(crate) uninstall_store: Arc<FakeUninstallStore>,
+    pub(crate) uninstall: UninstallService,
     pub(crate) web: WebBridge,
     /// 0.2.0 provider graph records 存储（fake）。
     pub(crate) graph_store: Arc<FakeGraphStore>,
@@ -1208,8 +1312,24 @@ impl Harness {
             Arc::clone(&config_port) as Arc<dyn ConfigPort>,
             Arc::clone(&audit) as Arc<dyn AuditPort>,
         ));
+        // 卸载用例（§39.2 remove）：fake 卸载存储面 + 可选 composition
+        // 接线（卸载前的 provider 依赖检查 / graph 记录清理，§40）。
+        let uninstall_store = Arc::new(FakeUninstallStore::new());
+        uninstall_store.with_effect(Arc::new({
+            // 模拟真实存储"单事务删除"的完整性：安装记录随卸载消失
+            // （§42.4：卸载后列表完整消失）。
+            let registry = Arc::clone(&registry);
+            move |installation| registry.remove_installation(installation)
+        }));
+        let uninstall = UninstallService::new(
+            Arc::clone(&registry) as Arc<dyn ComponentRegistryPort>,
+            Arc::clone(&uninstall_store) as Arc<dyn UninstallStorePort>,
+            Arc::clone(&audit) as Arc<dyn AuditPort>,
+            Arc::clone(&config_port) as Arc<dyn ConfigPort>,
+            Arc::clone(&active),
+        );
         // 0.2.0 composition 接线（§40）：同一 composition 服务注入
-        // install / upgrade 两条用例路径。
+        // install / upgrade / uninstall 三条用例路径。
         let composition = if wired {
             let composition = Arc::new(CompositionService::new(
                 Arc::clone(&graph_store) as Arc<dyn ProviderGraphPort>,
@@ -1222,6 +1342,10 @@ impl Harness {
                 Err(_) => test_failure("composition wiring failed"),
             }
             match upgrade.set_composition(Arc::clone(&composition)) {
+                Ok(()) => {}
+                Err(_) => test_failure("composition wiring failed"),
+            }
+            match uninstall.set_composition(Arc::clone(&composition)) {
                 Ok(()) => {}
                 Err(_) => test_failure("composition wiring failed"),
             }
@@ -1274,6 +1398,8 @@ impl Harness {
             assets,
             install,
             upgrade,
+            uninstall_store,
+            uninstall,
             web,
             graph_store,
             active_graph,

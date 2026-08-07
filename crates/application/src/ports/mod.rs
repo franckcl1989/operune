@@ -90,7 +90,7 @@ pub use grants::{GrantError, GrantStorePort};
 pub use graph::{GraphRecords, GraphStoreError, ProviderGraphPort};
 pub use lifecycle::{CheckpointError, CheckpointPort, InProcessCheckpoint};
 pub use policy::{ActionContext, ActionPolicyPort, InProcessActionPolicy};
-pub use registry::{ComponentRegistryPort, RegistryError};
+pub use registry::{ComponentRegistryPort, RegistryError, UninstallStorePort};
 pub use scheduler::{
     InProcessSchedulerGrant, SchedulerDeliveryError, SchedulerDeliveryPort, SchedulerGrantPort,
 };

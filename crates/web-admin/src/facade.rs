@@ -29,7 +29,7 @@ use operune_application::ports::{
 use operune_application::{
     ActiveRuntimeRegistry, ApplicationError, GrantApproval, GrantScope, InstallOutcome,
     InstallRequest, InstallService, InstallationGrant, RollbackRequest, RuntimeConfig,
-    UpgradeOutcome, UpgradeRequest, UpgradeService,
+    UninstallService, UpgradeOutcome, UpgradeRequest, UpgradeService,
 };
 use operune_domain::{
     ByteSize, ComponentLifecycleEvent, ComponentLifecycleState, DomainError, InstallationId,
@@ -91,10 +91,14 @@ pub trait AdminApi: Send + Sync {
     /// 管理性停用（Active → Draining → Disabled；有界 drain，§20.4）。
     fn disable(&self, id: InstallationId) -> Result<(), AdminError>;
 
-    /// 重新启用（Disabled → 重新激活）。0.1.0 需要激活管线支持
-    /// （application 用例 API 缺口，见 crate 文档），返回
-    /// [`AdminError::Unsupported`]。
+    /// 重新启用（§39.2 enable：Disabled → readiness 重验证 → 原子激活；
+    /// 经 [`InstallService::enable`] 复用完整激活管线）。
     fn enable(&self, id: InstallationId) -> Result<(), AdminError>;
+
+    /// 卸载（§39.2 remove / §42.4：卸载后组件从 UI 与 backend 完整消失）。
+    /// provider 仍有 active consumer 依赖时拒绝
+    /// （[`ApplicationError::ProviderHasConsumers`]）。
+    fn remove(&self, id: InstallationId) -> Result<(), AdminError>;
 
     /// 安装实例的 grants（§17.5）。
     fn grants_for(&self, id: InstallationId) -> Result<Vec<InstallationGrant>, AdminError>;
@@ -595,6 +599,7 @@ impl SafeModeState {
 pub struct RealAdminApi {
     install: InstallService,
     upgrade: UpgradeService,
+    uninstall: UninstallService,
     active: Arc<ActiveRuntimeRegistry>,
     registry: Arc<dyn ComponentRegistryPort>,
     grants: Arc<dyn GrantStorePort>,
@@ -615,6 +620,7 @@ impl RealAdminApi {
     pub fn new(
         install: InstallService,
         upgrade: UpgradeService,
+        uninstall: UninstallService,
         active: Arc<ActiveRuntimeRegistry>,
         registry: Arc<dyn ComponentRegistryPort>,
         grants: Arc<dyn GrantStorePort>,
@@ -630,6 +636,7 @@ impl RealAdminApi {
         Self {
             install,
             upgrade,
+            uninstall,
             active,
             registry,
             grants,
@@ -836,10 +843,26 @@ impl AdminApi for RealAdminApi {
         Ok(())
     }
 
-    fn enable(&self, _id: InstallationId) -> Result<(), AdminError> {
-        Err(AdminError::Unsupported(
-            "enable (re-activation) needs the activation pipeline; application use-case API gap in 0.1.0",
-        ))
+    fn enable(&self, id: InstallationId) -> Result<(), AdminError> {
+        // §39.2 enable：readiness 重验证 → 原子激活（复用完整激活管线，
+        // §19.3）。前置状态非法 / grants 被撤销 / artifact 缺失都以
+        // typed ApplicationError 拒绝（错误映射见 error.rs）。
+        self.install.enable(id).map_err(AdminError::Application)
+    }
+
+    fn remove(&self, id: InstallationId) -> Result<(), AdminError> {
+        // §39.2 remove / §42.4：卸载编排（drain → 停后台任务 → 清 graph
+        // records → 单事务删除全部 Core 元数据；artifact 保留，§18.7）。
+        // provider 仍有 active consumer 依赖 → ProviderHasConsumers 拒绝。
+        // 卸载成功后才写管理面审计（与 disable 同模式；application 侧
+        // 的组件生命周期审计已由 UninstallService 写入，§18.7）。
+        self.uninstall
+            .uninstall(id)
+            .map_err(AdminError::Application)?;
+        self.write_admin_audit(
+            "component.remove",
+            format!("installation {id} removed (admin)"),
+        )
     }
 
     fn grants_for(&self, id: InstallationId) -> Result<Vec<InstallationGrant>, AdminError> {

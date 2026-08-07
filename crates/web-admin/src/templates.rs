@@ -125,6 +125,16 @@ pub struct UpgradeTemplate {
     pub error: Option<String>,
 }
 
+/// 卸载确认页（§39.2 remove / §42.4：破坏性操作必须显式确认；卸载后
+/// 组件从 UI 与 backend 完整消失，artifact 保留，§18.7）。
+#[derive(Template)]
+#[template(path = "remove.html")]
+pub struct RemoveTemplate {
+    pub ctx: PageContext,
+    pub record: InstallationRecord,
+    pub error: Option<String>,
+}
+
 /// Grants 页（§21.1 grants）。
 #[derive(Template)]
 #[template(path = "grants.html")]

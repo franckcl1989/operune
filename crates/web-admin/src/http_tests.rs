@@ -22,12 +22,13 @@ use tower::ServiceExt;
 
 use crate::auth::session_cookie_name;
 use crate::facade::{
-    AdminUser, AdminUserStore, AuditLogView, InMemoryAdminUserStore, InMemoryAuditLog,
+    AdminError, AdminUser, AdminUserStore, AuditLogView, InMemoryAdminUserStore, InMemoryAuditLog,
     default_password_hasher,
 };
 use crate::routes::admin_router;
 use crate::state::AdminState;
 use crate::test_support::{FakeAdminApi, ok_or_fail, some_or_fail};
+use operune_application::ApplicationError;
 
 /// 测试固定 host（与 Origin 一致，§16.5 Origin 校验）。
 const HOST: &str = "127.0.0.1:8443";
@@ -835,6 +836,167 @@ async fn upgrade_requires_approval_renders_missing_capabilities() {
     let body = body_text(response).await;
     // §17.5：RequiresApproval 提示列出缺失能力。
     assert!(body.contains("operune:web/actions"));
+}
+
+// ---------------------------------------------------------------------------
+// remove（§39.2 remove / §42.4：确认页 + POST + 失败错误页）
+// ---------------------------------------------------------------------------
+
+/// 构造一个组件视图种子（确认页 / 详情页渲染测试）。
+fn component_view(installation: operune_domain::InstallationId) -> crate::facade::ComponentView {
+    crate::facade::ComponentView {
+        record: operune_application::InstallationRecord {
+            installation_id: installation,
+            component_id: ok_or_fail(operune_domain::ComponentId::new("demo"), "component id"),
+            version: operune_domain::ComponentVersion::from_parts(1, 0, 0),
+            active_digest: Some(operune_domain::ContentDigest::from_bytes(b"demo bytes")),
+            last_known_good_digest: None,
+            state: operune_domain::ComponentLifecycleState::Active,
+        },
+        active: None,
+        grants: Vec::new(),
+    }
+}
+
+#[tokio::test]
+async fn remove_confirm_page_renders_for_existing_component() {
+    let app = prod_app();
+    let session = login(&app, "alice").await;
+    let installation = operune_domain::InstallationId::new();
+    app.facade
+        .with_components(vec![component_view(installation)]);
+    let response = send(
+        &app.router,
+        Method::GET,
+        &format!("/components/{installation}/remove"),
+        &[("cookie", &format!("__Host-operune-session={session}"))],
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        body.contains("Remove component"),
+        "confirm page must render"
+    );
+    assert!(body.contains(installation.to_string().as_str()));
+    // 确认页必须要求 CSRF 表单（§16.5：破坏性操作经统一中间件）。
+    assert!(body.contains("_csrf"));
+}
+
+#[tokio::test]
+async fn remove_confirm_page_unknown_component_returns_404() {
+    let app = prod_app();
+    let session = login(&app, "alice").await;
+    let response = send(
+        &app.router,
+        Method::GET,
+        &format!(
+            "/components/{}/remove",
+            operune_domain::InstallationId::new()
+        ),
+        &[("cookie", &format!("__Host-operune-session={session}"))],
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn remove_with_csrf_reaches_facade_and_redirects_to_list() {
+    let app = prod_app();
+    let session = login(&app, "alice").await;
+    let csrf = csrf_for(&app, &session);
+    let installation = operune_domain::InstallationId::new();
+    let response = send(
+        &app.router,
+        Method::POST,
+        &format!("/components/{installation}/remove"),
+        &[
+            ("cookie", &format!("__Host-operune-session={session}")),
+            ("origin", ORIGIN),
+            ("content-type", "application/x-www-form-urlencoded"),
+        ],
+        format!("_csrf={csrf}").into_bytes(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert!(
+        response
+            .headers()
+            .get(header::LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|location| location == "/components"),
+        "uninstall 成功后回到组件列表（§42.4：列表不再含该组件）"
+    );
+    assert!(app.facade.calls().iter().any(|call| matches!(
+        call,
+        crate::test_support::RecordedCall::Remove(id) if *id == installation
+    )));
+}
+
+#[tokio::test]
+async fn remove_without_csrf_rejected_before_facade() {
+    let app = prod_app();
+    let session = login(&app, "alice").await;
+    let installation = operune_domain::InstallationId::new();
+    let response = send(
+        &app.router,
+        Method::POST,
+        &format!("/components/{installation}/remove"),
+        &[
+            ("cookie", &format!("__Host-operune-session={session}")),
+            ("origin", ORIGIN),
+        ],
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert!(
+        app.facade.calls().is_empty(),
+        "无 CSRF 的卸载不得进入用例层"
+    );
+}
+
+#[tokio::test]
+async fn remove_failure_with_consumers_renders_error_page() {
+    // §40 裁决：provider 仍有 active consumer 依赖 → 拒绝卸载并展示
+    // 错误（409 CONFLICT，消息含影响面）。
+    let app = prod_app();
+    let session = login(&app, "alice").await;
+    let csrf = csrf_for(&app, &session);
+    let installation = operune_domain::InstallationId::new();
+    let consumer = operune_domain::InstallationId::new();
+    app.facade.with_remove(Err(AdminError::Application(
+        ApplicationError::ProviderHasConsumers {
+            installation,
+            consumers: vec![consumer],
+        },
+    )));
+    let response = send(
+        &app.router,
+        Method::POST,
+        &format!("/components/{installation}/remove"),
+        &[
+            ("cookie", &format!("__Host-operune-session={session}")),
+            ("origin", ORIGIN),
+            ("content-type", "application/x-www-form-urlencoded"),
+        ],
+        format!("_csrf={csrf}").into_bytes(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body = body_text(response).await;
+    assert!(
+        body.contains("active consumer"),
+        "错误页必须展示依赖影响面：{body}"
+    );
+    assert!(
+        app.facade
+            .calls()
+            .iter()
+            .any(|call| matches!(call, crate::test_support::RecordedCall::Remove(_)))
+    );
 }
 
 #[tokio::test]

@@ -178,6 +178,62 @@ impl InstallService {
     pub(crate) fn pipeline(&self) -> &Pipeline {
         &self.pipeline
     }
+
+    /// 重新激活（§39.2 enable / §12.2：`Disabled → ActivationRequested →
+    /// Activating → Active`）。
+    ///
+    /// 从 artifact store 读取当前版本的字节（§18.7 rollback retention：
+    /// 卸载/停用都不删除 artifact），复用完整激活管线——编译、descriptor
+    /// 确定性、imports/grant 解析、实例化与 **readiness 重验证**（§19.3）
+    /// ——后原子激活。**不做**"跳过验证直接恢复"。
+    ///
+    /// 前置：安装实例存在且处于 `Disabled`（§12.2 概念图终点），否则
+    /// [`ApplicationError::EnableInvalidState`]；当前版本字节不可用
+    /// （§18.7 retention 被破坏）→ [`ApplicationError::ArtifactUnavailable`]；
+    /// 既有 grant 不覆盖该版本 imports（§17.5：grants 被替换/撤销后不得
+    /// 静默放行）→ [`ApplicationError::EnableRequiresApproval`]。
+    pub fn enable(&self, installation: InstallationId) -> Result<(), ApplicationError> {
+        let record = self
+            .pipeline
+            .registry
+            .installation(installation)
+            .map_err(ApplicationError::Registry)?
+            .ok_or(ApplicationError::InstallationNotFound(installation))?;
+        if record.state != ComponentLifecycleState::Disabled {
+            return Err(ApplicationError::EnableInvalidState {
+                installation,
+                state: record.state,
+            });
+        }
+        let digest = record.active_digest.ok_or(ApplicationError::Internal(
+            "disabled installation lacks an active digest",
+        ))?;
+        // §18.7：重新验证需要字节事实可用（卸载不删除 artifact；缺失即
+        // retention 被破坏 / GC 误删）。
+        let bytes = self
+            .pipeline
+            .registry
+            .artifact_bytes(digest)
+            .map_err(ApplicationError::Registry)?
+            .ok_or(ApplicationError::ArtifactUnavailable(digest))?;
+        let result = self.pipeline.run(
+            InstallRequest {
+                bytes,
+                grants: GrantApproval::ReuseExisting,
+            },
+            PipelineTarget::Enable { current: record },
+        )?;
+        match result {
+            PipelineResult::Activated { .. } => Ok(()),
+            PipelineResult::RequiresApproval {
+                installation,
+                missing,
+            } => Err(ApplicationError::EnableRequiresApproval {
+                installation: installation.installation_id,
+                missing,
+            }),
+        }
+    }
 }
 
 /// guest `migrate` 调用注入面（WIT `migration` interface 的 Core 侧调用点，
@@ -296,9 +352,9 @@ impl Pipeline {
         // 升级 / 回滚沿用既有安装实例（§20：同一安装的版本演进）。
         let current_record = match &target {
             PipelineTarget::Install => None,
-            PipelineTarget::Upgrade { current } | PipelineTarget::Rollback { current } => {
-                Some(current.clone())
-            }
+            PipelineTarget::Upgrade { current }
+            | PipelineTarget::Rollback { current }
+            | PipelineTarget::Enable { current } => Some(current.clone()),
         };
         if matches!(target, PipelineTarget::Install)
             && matches!(request.grants, GrantApproval::ReuseExisting)
@@ -429,9 +485,11 @@ impl Pipeline {
         }
         let (component_id, version) = self.validate_identity(digest, &first)?;
 
-        // §20：升级 / 回滚目标必须是同一逻辑产品（ComponentId 不变）。
-        if let PipelineTarget::Upgrade { current } | PipelineTarget::Rollback { current, .. } =
-            &target
+        // §20 / §39.2：升级 / 回滚 / 重新激活目标必须是同一逻辑产品
+        //（ComponentId 不变）。
+        if let PipelineTarget::Upgrade { current }
+        | PipelineTarget::Rollback { current, .. }
+        | PipelineTarget::Enable { current } = &target
             && current.component_id != component_id
         {
             return Err(self.fail_candidate(
@@ -739,6 +797,18 @@ impl Pipeline {
                 &config,
                 &surface,
             ),
+            PipelineTarget::Enable { current } => self.activate_enable(
+                digest,
+                current,
+                installation_id,
+                component_id.clone(),
+                version,
+                active,
+                manifest,
+                cached,
+                web_app_declaration,
+                &surface,
+            ),
         }
     }
 
@@ -756,11 +826,12 @@ impl Pipeline {
                 PipelineTarget::Install => Err(ApplicationError::GrantApprovalRequired(
                     "a fresh install requires explicit grants",
                 )),
-                PipelineTarget::Upgrade { current } | PipelineTarget::Rollback { current, .. } => {
-                    self.grants
-                        .grants_for(current.installation_id)
-                        .map_err(ApplicationError::Grants)
-                }
+                PipelineTarget::Upgrade { current }
+                | PipelineTarget::Rollback { current, .. }
+                | PipelineTarget::Enable { current } => self
+                    .grants
+                    .grants_for(current.installation_id)
+                    .map_err(ApplicationError::Grants),
             },
         }
     }
@@ -1315,6 +1386,82 @@ impl Pipeline {
         // §20.1 / §20.4：交换后 drain 旧版本（有界 deadline）。
         self.drain_previous(installation_id, old_digest, previous, config)?;
 
+        Ok(PipelineResult::Activated {
+            installation: record,
+            digest,
+        })
+    }
+
+    /// 重新激活（§39.2 enable / §12.2：`Disabled → Activating → Active`）。
+    ///
+    /// 与 [`Pipeline::activate_install`] 同构，但**保留既有
+    /// `last_known_good_digest`**（§18.7 rollback retention：停用/重新启用
+    /// 不得丢失回滚保留目标），且**没有可 drain 的旧运行句柄**（停用时
+    /// 已 drain 并释放 Store 与 Host 资源，§20.4）。readiness 已由管线在
+    /// 激活前重新验证（§19.3：enable = 重新激活路径的完整验证，不允许
+    /// "跳过验证直接恢复"）。
+    #[allow(clippy::too_many_arguments)]
+    fn activate_enable(
+        &self,
+        digest: ContentDigest,
+        current: InstallationRecord,
+        installation_id: InstallationId,
+        component_id: ComponentId,
+        version: ComponentVersion,
+        active: Arc<dyn ActiveRuntime>,
+        manifest: Option<WebManifestData>,
+        cached: u64,
+        web_app_declaration: Option<AppDeclaration>,
+        surface: &ContractSurface,
+    ) -> Result<PipelineResult, ApplicationError> {
+        // 0.2.0：graph records 重新提交（重新激活 = 提供面/需求面重新进入
+        // 组合）+ 快照原子切换（§40.2）。在任何 durable "激活成功" 写入
+        // 之前执行。
+        self.commit_graph(digest, installation_id, surface)?;
+        // §18.7：durable audit 先行（fail closed）。
+        self.audit_ok(AuditEvent::ActivationSucceeded {
+            installation: installation_id,
+            component_id: component_id.clone(),
+            version,
+            digest,
+        })?;
+        let asset_count = manifest
+            .as_ref()
+            .map(|manifest| u64::try_from(manifest.assets.len()).unwrap_or(u64::MAX))
+            .unwrap_or(0);
+        self.audit_ok(AuditEvent::WebManifestLoaded {
+            installation: installation_id,
+            assets: asset_count,
+            cached,
+        })?;
+        let record = InstallationRecord {
+            installation_id,
+            component_id,
+            version,
+            active_digest: Some(digest),
+            // §18.7：保留停用前的回滚保留目标。
+            last_known_good_digest: current.last_known_good_digest,
+            state: ComponentLifecycleState::Active,
+        };
+        self.registry
+            .update_installation(&record)
+            .map_err(ApplicationError::Registry)?;
+        self.transition_candidate(digest, ComponentLifecycleEvent::ReadinessSucceeded)?;
+        self.active.swap(
+            installation_id,
+            Arc::new(ActiveEntry {
+                installation: ActiveInstallation {
+                    installation_id,
+                    component_id: record.component_id.clone(),
+                    version: record.version,
+                    digest,
+                },
+                runtime: active,
+                manifest,
+                web_app: web_app_declaration
+                    .map(|declaration| Arc::new(WebAppContext::new(declaration))),
+            }),
+        )?;
         Ok(PipelineResult::Activated {
             installation: record,
             digest,
