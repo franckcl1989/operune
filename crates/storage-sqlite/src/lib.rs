@@ -30,10 +30,10 @@
 //!   typed request/response + 提交前取消语义 + shutdown 等待；0.3.0
 //!   state 事务（§41.2，migration v4）：跨命令边界、取消/crash → 回滚；
 //! - [`ports`]：application port traits 的实现（§24.2：ComponentRegistry /
-//!   GrantStore / Audit / Config / ProviderGraph），同步桥接到 executor 并做
-//!   用例级类型与存储侧记录之间的转换（§13.3）；0.3.0 的
-//!   StateStore / SecretStore / ComponentConfigStore port trait 由 application
-//!   里程碑定义后接线（§41.2）。
+//!   GrantStore / Audit / Config / ProviderGraph / StateStore /
+//!   ComponentConfigStore / SecretStore / SecretGrant / StatefulAudit），
+//!   同步桥接到 executor 并做用例级类型与存储侧记录之间的转换（§13.3）；
+//!   0.3.0 state/config/secret 接线见 ports.rs 模块文档（§41.2）。
 //!
 //! # 权威性边界（§18.1）
 //!

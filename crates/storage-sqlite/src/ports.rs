@@ -46,20 +46,35 @@
 //!   [`StorageError::CorruptState`] fail closed（与 grant scope 的 JSON
 //!   规范化同模式）。
 //!
-//! # 0.3.0 state/config/secret 端口接线（§41.2）——待 application port 定义
+//! # 0.3.0 state/config/secret 端口接线（§41.2）
 //!
-//! 本 crate 的 executor 层已提供 0.3.0 Stateful Runtime 的**存储能力**
+//! 本 crate 的 executor 层提供 0.3.0 Stateful Runtime 的**存储能力**
 //!（migration v4 三表 + typed 命令，见 executor.rs 模块文档）：state 事务
 //!（begin/put/delete/commit/abort，跨命令边界、取消/crash → 回滚、schema
 //! 版本确定性）、component config（revision 单调）、secret 密文 BLOB
-//!（不透明，§16.6 / ADR-0001）。application 的 `StateStore` / `SecretStore`
-//! / `ComponentConfigStore` port trait 由**另一里程碑**定义（本任务不定义
-//! application 层 trait——那是 application 的职责）。trait 落定后按本模块
-//! 既有模式接线：`submit_blocking` 同步桥接 + §13.3 转换层（与
-//! `ProviderGraphPort` 同模式），并补齐 §41.2 要求的 state/config/secret
-//! audit（metadata-only，值绝不进审计，§16.6/§41.2）。
+//!（不透明，§16.6 / ADR-0001）。本模块实现 application 的五个 0.3 port
+//! trait（[`StateStorePort`] / [`ComponentConfigStorePort`] / [`SecretStorePort`]
+//! / [`SecretGrantPort`] / [`StatefulAuditPort`]），与既有 port 同模式：
+//! `submit_blocking` 同步桥接 + §13.3 转换层（边界解析一次，不放宽校验）。
+//!
+//! 接线要点（与 application/tests/stateful_e2e.rs 验证的模式一致）：
+//! - **事务句柄映射**：domain [`StateTransactionId`] ↔ 存储侧
+//!   [`StateTransactionHandle`]（构造器 `pub(crate)`，本层在 begin 时建立
+//!   `id → handle` 映射；executor 单连接串行 ⇒ 映射一致，无并发交错）；
+//! - **类型转换**：storage 自有 newtype（[`crate::model::StateKey`] /
+//!   [`crate::model::SecretName`]）与 domain 类型字符集一致，转换失败 =
+//!   契约违反 fail closed；`ConfigSchemaVersion` 与存储侧
+//!   [`crate::model::StateSchemaVersion`] 同为 u32 形态，一一对应；
+//! - **返回值读回**：config put 后读回 revision、secret put 后读回版本
+//!   （单语句 upsert 的单调性由存储保证，串行 executor 下 put 后读一致；
+//!   读回缺失 = 不变量违反 fail closed）；
+//! - **secret grant**：从 grants 表按 `operune:secret/secret` 能力面筛选，
+//!   名称范围经 scope 承载（JSON 规范化名称集，§13.3 同模式）；
+//! - **audit**：0.3 事件映射为 component-lifecycle 审计行，metadata-only
+//!   （值绝不进入审计，§16.6/§41.2）。
 
-use std::sync::Arc;
+use std::collections::{BTreeSet, HashMap};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use operune_application::model::{
@@ -67,12 +82,17 @@ use operune_application::model::{
     RuntimeConfig,
 };
 use operune_application::ports::{
-    AuditError, AuditEvent, AuditPort, ComponentRegistryPort, ConfigError, ConfigPort, GrantError,
-    GrantStorePort, GraphRecords, GraphStoreError, ProviderGraphPort, RegistryError,
+    AuditError, AuditEvent, AuditPort, ComponentConfigStorePort, ComponentRegistryPort,
+    ConfigError, ConfigPort, ConfigStoreError, GrantError, GrantStorePort, GraphRecords,
+    GraphStoreError, ProviderGraphPort, RegistryError, SecretCiphertextRecord, SecretGrantPort,
+    SecretStoreError, SecretStorePort, StateStoreError, StateStorePort, StatefulAuditEvent,
+    StatefulAuditPort,
 };
 use operune_domain::{
-    ByteSize, ComponentId, ComponentLifecycleState, ComponentVersion, ConsumerRecord,
-    ContentDigest, InstallationId, ProviderRecord,
+    ByteSize, ComponentId, ComponentLifecycleState, ComponentVersion, ConfigFormat, ConfigRevision,
+    ConfigSchemaVersion, ConfigSnapshot, ConfigValue, ConsumerRecord, ContentDigest,
+    InstallationId, ProviderRecord, SecretMetadata, SecretName, SecretVersion, StateKey,
+    StateSchemaVersion, StateTransactionId, StateValue,
 };
 use operune_runtime_wasm::{
     BackgroundTaskLimit, CallDeadline, HostBufferLimit, HttpBodyLimit, InstanceCountLimit,
@@ -83,15 +103,18 @@ use operune_runtime_wasm::{
 use crate::error::StorageError;
 use crate::executor::{Command, Response, StorageExecutor};
 use crate::model::{
-    ActiveBinding, AuditActor, AuditCategory, AuditOutcome, CapabilityScope,
-    InstallationVersionRecord, VersionState,
+    ActiveBinding, AuditActor, AuditCategory, AuditOutcome, CapabilityScope, ComponentConfigRecord,
+    ConfigFormat as StorageConfigFormat, InstallationVersionRecord,
+    SecretName as StorageSecretName, SecretRecord, StateKey as StorageStateKey,
+    StateSchemaVersion as StorageStateSchemaVersion, StateTransactionHandle, StateValueRecord,
+    VersionState,
 };
 
 /// RuntimeConfig 快照在 `runtime_config` 表中的 key（§18.0：单键 + 显式
 /// JSON 文档；BootstrapConfig 不进本表）。
 const RUNTIME_CONFIG_KEY: &str = "runtime-config";
 
-/// application port 适配层（四个 port trait 的单一实现类型）。
+/// application port 适配层（全部 port trait 的单一实现类型）。
 ///
 /// 构造：`StorageExecutor` 必须已打开（fail closed 语义见其 `open`）；
 /// `artifact_hard_limit` 是制品字节写入的存储侧硬上限（§19.1；通常取
@@ -99,6 +122,15 @@ const RUNTIME_CONFIG_KEY: &str = "runtime-config";
 pub struct StoragePorts {
     executor: Arc<StorageExecutor>,
     artifact_hard_limit: ByteSize,
+    /// §41.2 事务句柄映射：domain [`StateTransactionId`] → 存储侧
+    /// [`StateTransactionHandle`]。存储句柄构造器 `pub(crate)`（executor 内
+    /// 管理），接线层在 begin 时建立映射、commit/abort 时移除；executor
+    /// 单连接串行（§18.2）⇒ 同一时刻至多一个进行中事务，映射一致、无
+    /// 并发交错（模式见 application/tests/stateful_e2e.rs）。
+    tx_map: Mutex<HashMap<StateTransactionId, StateTransactionHandle>>,
+    /// domain 事务身份的单调分配器（Core 侧事务标识，§41.2；与 executor
+    /// 内部句柄计数独立）。
+    next_tx: Mutex<u64>,
 }
 
 impl StoragePorts {
@@ -107,12 +139,62 @@ impl StoragePorts {
         Self {
             executor,
             artifact_hard_limit,
+            tx_map: Mutex::new(HashMap::new()),
+            next_tx: Mutex::new(0),
         }
     }
 
     /// 同步提交（见模块文档的同步桥接说明）。
     fn submit(&self, cmd: Command) -> Result<Response, StorageError> {
         self.executor.submit_blocking(cmd)
+    }
+
+    // ------------------------------------------------------------------
+    // §41.2 事务句柄映射（StateTransactionId → StateTransactionHandle；
+    // 见模块文档与 stateful_e2e.rs 验证模式）
+    // ------------------------------------------------------------------
+
+    /// begin 时建立映射并分配 domain 事务身份（Core 侧事务标识，§41.2）。
+    fn remember_tx(&self, handle: StateTransactionHandle) -> StateTransactionId {
+        let mut counter = self
+            .next_tx
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *counter = counter.saturating_add(1);
+        let id = StateTransactionId::from_u64(*counter);
+        self.tx_map
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(id, handle);
+        id
+    }
+
+    /// 取出并移除事务句柄（commit 用；对已终止事务 → TransactionConflict，
+    /// WIT conflict）。
+    fn take_tx(&self, tx: StateTransactionId) -> Result<StateTransactionHandle, StateStoreError> {
+        self.tx_map
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&tx)
+            .ok_or_else(|| {
+                StateStoreError::TransactionConflict(
+                    "operation on a state transaction that is not in progress".into(),
+                )
+            })
+    }
+
+    /// 引用事务句柄（事务内操作用；对已终止事务 → TransactionConflict）。
+    fn handle_of(&self, tx: StateTransactionId) -> Result<StateTransactionHandle, StateStoreError> {
+        self.tx_map
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&tx)
+            .copied()
+            .ok_or_else(|| {
+                StateStoreError::TransactionConflict(
+                    "operation on a state transaction that is not in progress".into(),
+                )
+            })
     }
 
     // ------------------------------------------------------------------
@@ -151,6 +233,49 @@ impl StoragePorts {
 
     fn config_error(error: StorageError) -> ConfigError {
         ConfigError::Storage(Box::new(error))
+    }
+
+    /// state 存储错误映射（§14.1：typed 变体精确匹配，其余装箱为可诊断
+    /// source；与 application/tests/stateful_e2e.rs 的映射一致）。
+    fn state_error(error: StorageError) -> StateStoreError {
+        match error {
+            StorageError::NotFound(message) => StateStoreError::NotFound(message),
+            StorageError::SchemaVersionMismatch {
+                installation,
+                expected,
+                requested,
+            } => StateStoreError::SchemaVersionMismatch {
+                installation,
+                // 存储侧空 store 不产生本错误（首次写入建立版本，§41.3）——
+                // 因此此处恒有当前版本，`None` 分支由存储层保证不可达。
+                current: Some(StateSchemaVersion::from_u32(expected.as_u32())),
+                requested: StateSchemaVersion::from_u32(requested.as_u32()),
+            },
+            StorageError::StateTransactionConflict(message) => {
+                StateStoreError::TransactionConflict(message)
+            }
+            StorageError::InvalidArgument(message) => StateStoreError::InvalidArgument(message),
+            StorageError::CorruptState(message) => StateStoreError::Corrupt(message),
+            other => StateStoreError::Storage(Box::new(other)),
+        }
+    }
+
+    fn secret_error(error: StorageError) -> SecretStoreError {
+        match error {
+            StorageError::NotFound(message) => SecretStoreError::NotFound(message),
+            StorageError::InvalidArgument(message) => SecretStoreError::InvalidArgument(message),
+            StorageError::CorruptState(message) => SecretStoreError::Corrupt(message),
+            other => SecretStoreError::Storage(Box::new(other)),
+        }
+    }
+
+    fn component_config_error(error: StorageError) -> ConfigStoreError {
+        match error {
+            StorageError::NotFound(message) => ConfigStoreError::NotFound(message),
+            StorageError::InvalidArgument(message) => ConfigStoreError::InvalidArgument(message),
+            StorageError::CorruptState(message) => ConfigStoreError::Corrupt(message),
+            other => ConfigStoreError::Storage(Box::new(other)),
+        }
     }
 
     // ------------------------------------------------------------------
@@ -823,6 +948,429 @@ impl ConfigPort for StoragePorts {
 }
 
 // ---------------------------------------------------------------------------
+// StateStorePort（§41.2：state 是 Component 产生的权威持久业务状态；
+// CAS 的 get→compare→put 编排在 application 的 StateService，本 port 只
+// 承载存储面。executor 单连接串行 ⇒ 服务侧读-判-写无交错）
+// ---------------------------------------------------------------------------
+
+impl StateStorePort for StoragePorts {
+    fn get(
+        &self,
+        installation: InstallationId,
+        key: &StateKey,
+    ) -> Result<Option<StateValue>, StateStoreError> {
+        let storage_key = to_storage_state_key(key)?;
+        match self.submit(Command::GetState {
+            installation_id: installation,
+            key: storage_key,
+            tx: None,
+        }) {
+            Ok(Response::StateValue(record)) => record.map(to_domain_state_value).transpose(),
+            Ok(_) => Err(Self::state_error(unexpected("GetState"))),
+            Err(error) => Err(Self::state_error(error)),
+        }
+    }
+
+    fn put(
+        &self,
+        installation: InstallationId,
+        key: &StateKey,
+        schema_version: StateSchemaVersion,
+        value: &StateValue,
+    ) -> Result<(), StateStoreError> {
+        let storage_key = to_storage_state_key(key)?;
+        match self.submit(Command::PutState {
+            installation_id: installation,
+            key: storage_key,
+            schema_version: Some(to_storage_schema_version(schema_version)),
+            value: value.as_slice().to_vec(),
+            tx: None,
+        }) {
+            Ok(Response::StatePut) => Ok(()),
+            Ok(_) => Err(Self::state_error(unexpected("PutState"))),
+            Err(error) => Err(Self::state_error(error)),
+        }
+    }
+
+    fn delete(&self, installation: InstallationId, key: &StateKey) -> Result<(), StateStoreError> {
+        let storage_key = to_storage_state_key(key)?;
+        match self.submit(Command::DeleteState {
+            installation_id: installation,
+            key: storage_key,
+            tx: None,
+        }) {
+            Ok(Response::StateDeleted) => Ok(()),
+            Ok(_) => Err(Self::state_error(unexpected("DeleteState"))),
+            Err(error) => Err(Self::state_error(error)),
+        }
+    }
+
+    fn schema_version(
+        &self,
+        installation: InstallationId,
+    ) -> Result<Option<StateSchemaVersion>, StateStoreError> {
+        match self.submit(Command::GetStateSchemaVersion {
+            installation_id: installation,
+        }) {
+            Ok(Response::StateSchemaVersion(version)) => {
+                Ok(version.map(|version| StateSchemaVersion::from_u32(version.as_u32())))
+            }
+            Ok(_) => Err(Self::state_error(unexpected("GetStateSchemaVersion"))),
+            Err(error) => Err(Self::state_error(error)),
+        }
+    }
+
+    fn begin_transaction(
+        &self,
+        installation: InstallationId,
+        schema_version: StateSchemaVersion,
+    ) -> Result<StateTransactionId, StateStoreError> {
+        let handle = match self.submit(Command::BeginStateTransaction {
+            installation_id: installation,
+            schema_version: to_storage_schema_version(schema_version),
+            mode: crate::executor::StateTxMode::Normal,
+        }) {
+            Ok(Response::StateTransactionBegan(handle)) => handle,
+            Ok(_) => return Err(Self::state_error(unexpected("BeginStateTransaction"))),
+            Err(error) => return Err(Self::state_error(error)),
+        };
+        Ok(self.remember_tx(handle))
+    }
+
+    fn begin_migration_transaction(
+        &self,
+        installation: InstallationId,
+        to_version: StateSchemaVersion,
+    ) -> Result<StateTransactionId, StateStoreError> {
+        let handle = match self.submit(Command::BeginStateTransaction {
+            installation_id: installation,
+            schema_version: to_storage_schema_version(to_version),
+            mode: crate::executor::StateTxMode::Migration,
+        }) {
+            Ok(Response::StateTransactionBegan(handle)) => handle,
+            Ok(_) => return Err(Self::state_error(unexpected("BeginStateTransaction"))),
+            Err(error) => return Err(Self::state_error(error)),
+        };
+        Ok(self.remember_tx(handle))
+    }
+
+    fn tx_get(
+        &self,
+        tx: StateTransactionId,
+        installation: InstallationId,
+        key: &StateKey,
+    ) -> Result<Option<StateValue>, StateStoreError> {
+        let handle = self.handle_of(tx)?;
+        let storage_key = to_storage_state_key(key)?;
+        match self.submit(Command::GetState {
+            installation_id: installation,
+            key: storage_key,
+            tx: Some(handle),
+        }) {
+            Ok(Response::StateValue(record)) => record.map(to_domain_state_value).transpose(),
+            Ok(_) => Err(Self::state_error(unexpected("GetState"))),
+            Err(error) => Err(Self::state_error(error)),
+        }
+    }
+
+    fn tx_put(
+        &self,
+        tx: StateTransactionId,
+        installation: InstallationId,
+        key: &StateKey,
+        value: &StateValue,
+    ) -> Result<(), StateStoreError> {
+        let handle = self.handle_of(tx)?;
+        let storage_key = to_storage_state_key(key)?;
+        match self.submit(Command::PutState {
+            installation_id: installation,
+            key: storage_key,
+            schema_version: None,
+            value: value.as_slice().to_vec(),
+            tx: Some(handle),
+        }) {
+            Ok(Response::StatePut) => Ok(()),
+            Ok(_) => Err(Self::state_error(unexpected("PutState"))),
+            Err(error) => Err(Self::state_error(error)),
+        }
+    }
+
+    fn tx_delete(
+        &self,
+        tx: StateTransactionId,
+        installation: InstallationId,
+        key: &StateKey,
+    ) -> Result<(), StateStoreError> {
+        let handle = self.handle_of(tx)?;
+        let storage_key = to_storage_state_key(key)?;
+        match self.submit(Command::DeleteState {
+            installation_id: installation,
+            key: storage_key,
+            tx: Some(handle),
+        }) {
+            Ok(Response::StateDeleted) => Ok(()),
+            Ok(_) => Err(Self::state_error(unexpected("DeleteState"))),
+            Err(error) => Err(Self::state_error(error)),
+        }
+    }
+
+    fn commit(&self, tx: StateTransactionId) -> Result<(), StateStoreError> {
+        let handle = self.take_tx(tx)?;
+        match self.submit(Command::CommitStateTransaction { handle }) {
+            Ok(Response::StateCommitted) => Ok(()),
+            Ok(_) => Err(Self::state_error(unexpected("CommitStateTransaction"))),
+            Err(error) => Err(Self::state_error(error)),
+        }
+    }
+
+    fn abort(&self, tx: StateTransactionId) -> Result<(), StateStoreError> {
+        // WIT：abort 对已终止事务是 no-op——句柄可能已不存在，按 no-op
+        // 语义直接调用存储（存储侧对未知句柄 no-op 成功，§41.2）。
+        if let Ok(handle) = self.handle_of(tx) {
+            match self.submit(Command::AbortStateTransaction { handle }) {
+                Ok(Response::StateAborted) => {}
+                Ok(_) => return Err(Self::state_error(unexpected("AbortStateTransaction"))),
+                Err(error) => return Err(Self::state_error(error)),
+            }
+            self.take_tx(tx)?;
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ComponentConfigStorePort（§41.2：config 是管理员/系统提供的输入；写入时
+// revision 单调 +1 由存储保证；无平台级 migration——与 state 的本质区别）
+// ---------------------------------------------------------------------------
+
+impl ComponentConfigStorePort for StoragePorts {
+    fn snapshot(
+        &self,
+        installation: InstallationId,
+    ) -> Result<Option<ConfigSnapshot>, ConfigStoreError> {
+        match self.submit(Command::GetComponentConfig {
+            installation_id: installation,
+        }) {
+            Ok(Response::ComponentConfig(record)) => {
+                record.map(to_domain_config_snapshot).transpose()
+            }
+            Ok(_) => Err(Self::component_config_error(unexpected(
+                "GetComponentConfig",
+            ))),
+            Err(error) => Err(Self::component_config_error(error)),
+        }
+    }
+
+    fn put(
+        &self,
+        installation: InstallationId,
+        format: ConfigFormat,
+        schema_version: ConfigSchemaVersion,
+        value: &ConfigValue,
+    ) -> Result<ConfigRevision, ConfigStoreError> {
+        // §13.3 边界转换：domain ConfigSchemaVersion（u32）↔ 存储侧
+        // StateSchemaVersion（u32）一一对应，不可失败。
+        match self.submit(Command::PutComponentConfig {
+            installation_id: installation,
+            format: to_storage_config_format(format),
+            schema_version: StorageStateSchemaVersion::new(schema_version.as_u32()),
+            value: value.as_slice().to_vec(),
+        }) {
+            Ok(Response::ComponentConfigSet) => {}
+            Ok(_) => {
+                return Err(Self::component_config_error(unexpected(
+                    "PutComponentConfig",
+                )));
+            }
+            Err(error) => return Err(Self::component_config_error(error)),
+        }
+        // §41.2 返回值读回：revision 由存储单语句 upsert 保证单调（§41.2），
+        // executor 单连接串行 ⇒ put 后读一致，无交错。
+        match self.submit(Command::GetComponentConfig {
+            installation_id: installation,
+        }) {
+            Ok(Response::ComponentConfig(Some(record))) => {
+                Ok(ConfigRevision::from_u64(record.revision))
+            }
+            Ok(Response::ComponentConfig(None)) => {
+                Err(Self::component_config_error(StorageError::CorruptState(
+                    "config disappeared after write (invariant violation)".into(),
+                )))
+            }
+            Ok(_) => Err(Self::component_config_error(unexpected(
+                "GetComponentConfig",
+            ))),
+            Err(error) => Err(Self::component_config_error(error)),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SecretStorePort（§41.2 / §16.6：本 port 只承载**不透明密文 BLOB**与
+// 非敏感元数据，**明文绝不出现在本层**——加解密永远在 security 层
+// SecretService；storage 不解密、不解释、不回显内容）
+// ---------------------------------------------------------------------------
+
+impl SecretStorePort for StoragePorts {
+    fn put(
+        &self,
+        installation: InstallationId,
+        name: &SecretName,
+        ciphertext: Vec<u8>,
+        metadata: &str,
+    ) -> Result<SecretVersion, SecretStoreError> {
+        let storage_name = to_storage_secret_name(name)?;
+        match self.submit(Command::PutSecret {
+            installation_id: installation,
+            name: storage_name.clone(),
+            ciphertext,
+            metadata: metadata.to_owned(),
+        }) {
+            Ok(Response::SecretPut) => {}
+            Ok(_) => return Err(Self::secret_error(unexpected("PutSecret"))),
+            Err(error) => return Err(Self::secret_error(error)),
+        }
+        // §41.2 返回值读回：新版本（insert or replace 版本递增，存储保证）；
+        // 串行 executor 下 put 后读一致，无交错。
+        match self.submit(Command::GetSecretCiphertext {
+            installation_id: installation,
+            name: storage_name,
+        }) {
+            Ok(Response::Secret(Some(record))) => Ok(SecretVersion::from_u64(record.version)),
+            Ok(Response::Secret(None)) => Err(Self::secret_error(StorageError::CorruptState(
+                "secret disappeared after write (invariant violation)".into(),
+            ))),
+            Ok(_) => Err(Self::secret_error(unexpected("GetSecretCiphertext"))),
+            Err(error) => Err(Self::secret_error(error)),
+        }
+    }
+
+    fn ciphertext(
+        &self,
+        installation: InstallationId,
+        name: &SecretName,
+    ) -> Result<Option<SecretCiphertextRecord>, SecretStoreError> {
+        let storage_name = to_storage_secret_name(name)?;
+        match self.submit(Command::GetSecretCiphertext {
+            installation_id: installation,
+            name: storage_name,
+        }) {
+            Ok(Response::Secret(record)) => record.map(to_domain_secret_record).transpose(),
+            Ok(_) => Err(Self::secret_error(unexpected("GetSecretCiphertext"))),
+            Err(error) => Err(Self::secret_error(error)),
+        }
+    }
+
+    fn list(&self, installation: InstallationId) -> Result<Vec<SecretMetadata>, SecretStoreError> {
+        match self.submit(Command::ListSecretNames {
+            installation_id: installation,
+        }) {
+            Ok(Response::SecretList(records)) => {
+                let mut metadata: Vec<SecretMetadata> = Vec::with_capacity(records.len());
+                for record in records {
+                    let name = SecretName::new(record.name.as_str()).map_err(|_| {
+                        Self::secret_error(StorageError::CorruptState(
+                            "invalid secret name in store".into(),
+                        ))
+                    })?;
+                    metadata.push(SecretMetadata::new(
+                        name,
+                        SecretVersion::from_u64(record.version),
+                    ));
+                }
+                Ok(metadata)
+            }
+            Ok(_) => Err(Self::secret_error(unexpected("ListSecretNames"))),
+            Err(error) => Err(Self::secret_error(error)),
+        }
+    }
+
+    fn delete(
+        &self,
+        installation: InstallationId,
+        name: &SecretName,
+    ) -> Result<(), SecretStoreError> {
+        let storage_name = to_storage_secret_name(name)?;
+        match self.submit(Command::DeleteSecret {
+            installation_id: installation,
+            name: storage_name,
+        }) {
+            Ok(Response::SecretDeleted) => Ok(()),
+            Ok(_) => Err(Self::secret_error(unexpected("DeleteSecret"))),
+            Err(error) => Err(Self::secret_error(error)),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SecretGrantPort（§17.3 "secret names" 是 scope 维度之一；§17.5 第三层
+// Grant：durable owner 是 InstallationId。本层从 grants 表按
+// `operune:secret/secret` 能力面筛选名称范围——能力面之外不构成名称
+// grant（deny-by-default，§17.2）；名称范围经 scope 承载，解析失败 =
+// 存储损坏 fail closed（与 scope_from_storage 同模式，§13.3））
+// ---------------------------------------------------------------------------
+
+/// secret 能力面的能力 id（§19.5 `ImportClass::capability_id` 规范化形态：
+/// import `operune:secret/secret@0.1.0` → 能力 id `operune:secret/secret`）。
+const SECRET_CAPABILITY_ID: &str = "operune:secret/secret";
+
+impl SecretGrantPort for StoragePorts {
+    fn granted_names(&self, installation: InstallationId) -> Result<Vec<SecretName>, GrantError> {
+        let records = match self.submit(Command::ListGrants {
+            installation_id: installation,
+        }) {
+            Ok(Response::Grants(records)) => records,
+            Ok(_) => return Err(GrantError::Storage(Box::new(unexpected("ListGrants")))),
+            Err(error) => return Err(Self::grant_error(error, installation)),
+        };
+        // BTreeSet：去重 + 确定性顺序（SecretService 只做成员判定，§17.5
+        // 第四层 invocation-time enforcement）。
+        let mut names: BTreeSet<SecretName> = BTreeSet::new();
+        for record in records {
+            if record.capability_id.to_string() != SECRET_CAPABILITY_ID {
+                continue;
+            }
+            // 名称范围 = scope 中的 JSON 规范化名称集（§13.3 与 grant scope /
+            // graph 记录同模式；存储侧只做字符串结构性校验，语义解析在本层）。
+            let raw: Vec<String> =
+                serde_json::from_str(record.scope.as_str()).map_err(|error| {
+                    GrantError::Storage(Box::new(StorageError::CorruptState(format!(
+                        "invalid secret grant scope in database: {error}"
+                    ))))
+                })?;
+            for raw_name in raw {
+                let name = SecretName::new(raw_name).map_err(|_| {
+                    GrantError::Storage(Box::new(StorageError::CorruptState(
+                        "invalid secret name in database grant scope".into(),
+                    )))
+                })?;
+                names.insert(name);
+            }
+        }
+        Ok(names.into_iter().collect())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// StatefulAuditPort（§41.2 state/config/secret audit MUST；映射为
+// component-lifecycle 审计行，与 to_storage_audit 同模式；metadata-only，
+// 值绝不进入审计，§16.6/§41.2）
+// ---------------------------------------------------------------------------
+
+impl StatefulAuditPort for StoragePorts {
+    fn append(&self, event: StatefulAuditEvent) -> Result<(), AuditError> {
+        let storage_event = to_storage_stateful_audit(&event)?;
+        match self.submit(Command::AppendAudit {
+            audit: storage_event,
+        }) {
+            Ok(Response::AuditAppended(_)) => Ok(()),
+            Ok(_) => Err(AuditError::Storage(Box::new(unexpected("AppendAudit")))),
+            Err(error) => Err(Self::audit_error(error)),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 转换层（§13.3 边界解析一次；不放宽校验）
 // ---------------------------------------------------------------------------
 
@@ -840,6 +1388,80 @@ fn scope_to_storage(scope: &GrantScope) -> Result<CapabilityScope, StorageError>
 fn scope_from_storage(scope: &CapabilityScope) -> Result<GrantScope, StorageError> {
     serde_json::from_str(scope.as_str()).map_err(|error| {
         StorageError::CorruptState(format!("invalid grant scope in database: {error}"))
+    })
+}
+
+// ---------------------------------------------------------------------------
+// 0.3.0 Stateful Runtime（§41.2）：state/config/secret 边界转换
+// ---------------------------------------------------------------------------
+
+/// domain `StateKey` → storage `StateKey`（§13.3 边界解析一次；两侧字符集
+/// 一致（`[A-Za-z0-9._-/]`），失败 = 调用方契约违反 fail closed）。
+fn to_storage_state_key(key: &StateKey) -> Result<StorageStateKey, StateStoreError> {
+    StorageStateKey::new(key.as_str()).map_err(StoragePorts::state_error)
+}
+
+/// domain `StateSchemaVersion` → storage `StateSchemaVersion`（u32 一一对应，
+/// 不可失败）。
+fn to_storage_schema_version(version: StateSchemaVersion) -> StorageStateSchemaVersion {
+    StorageStateSchemaVersion::new(version.as_u32())
+}
+
+/// storage `StateValueRecord` → domain `StateValue`（§13.3 边界解析一次；
+/// 超限 = 存储损坏 fail closed）。
+fn to_domain_state_value(record: StateValueRecord) -> Result<StateValue, StateStoreError> {
+    StateValue::new(record.value).map_err(|_| {
+        StoragePorts::state_error(StorageError::CorruptState(
+            "state value exceeds the domain bound in store".into(),
+        ))
+    })
+}
+
+/// domain `ConfigFormat` → storage `ConfigFormat`（闭集一一对应，不可失败）。
+fn to_storage_config_format(format: ConfigFormat) -> StorageConfigFormat {
+    match format {
+        ConfigFormat::Json => StorageConfigFormat::Json,
+        ConfigFormat::Toml => StorageConfigFormat::Toml,
+        ConfigFormat::Raw => StorageConfigFormat::Raw,
+    }
+}
+
+/// storage `ComponentConfigRecord` → domain `ConfigSnapshot`（§13.3 边界
+/// 解析一次；value 超限 = 存储损坏 fail closed）。
+fn to_domain_config_snapshot(
+    record: ComponentConfigRecord,
+) -> Result<ConfigSnapshot, ConfigStoreError> {
+    let value = ConfigValue::new(record.value).map_err(|_| {
+        StoragePorts::component_config_error(StorageError::CorruptState(
+            "config value exceeds the domain bound in store".into(),
+        ))
+    })?;
+    Ok(ConfigSnapshot::new(
+        ConfigRevision::from_u64(record.revision),
+        value,
+    ))
+}
+
+/// domain `SecretName` → storage `SecretName`（§13.3 边界解析一次；两侧
+/// 字符集一致（`[A-Za-z0-9._-]`），失败 = 调用方契约违反 fail closed）。
+fn to_storage_secret_name(name: &SecretName) -> Result<StorageSecretName, SecretStoreError> {
+    StorageSecretName::new(name.as_str()).map_err(StoragePorts::secret_error)
+}
+
+/// storage `SecretRecord` → domain `SecretCiphertextRecord`（§16.6：只承载
+/// 密文 BLOB 与元数据，**不含明文**；名称解析失败 = 存储损坏 fail closed）。
+fn to_domain_secret_record(
+    record: SecretRecord,
+) -> Result<SecretCiphertextRecord, SecretStoreError> {
+    let name = SecretName::new(record.name.as_str()).map_err(|_| {
+        StoragePorts::secret_error(StorageError::CorruptState(
+            "invalid secret name in store".into(),
+        ))
+    })?;
+    Ok(SecretCiphertextRecord {
+        name,
+        version: SecretVersion::from_u64(record.version),
+        ciphertext: record.ciphertext,
     })
 }
 
@@ -1077,6 +1699,221 @@ fn to_storage_audit(event: &AuditEvent) -> Result<crate::model::AuditEvent, Audi
     .map_err(|error| AuditError::Storage(Box::new(error)))
 }
 
+/// application [`StatefulAuditEvent`]（§41.2 state/config/secret 审计）→
+/// 存储侧 [`crate::model::AuditEvent`]。
+///
+/// 逐变体显式映射（与 [`to_storage_audit`] 同模式）：类别沿用
+/// component-lifecycle（audit.rs 文档：接线层映射为 component-lifecycle
+/// 审计行）；`action` / `target` / `detail` 只含可诊断元数据（名称、版本、
+/// 键、静态 reason 标签——**值绝不进入审计**，§16.6 / §41.2）。
+fn to_storage_stateful_audit(
+    event: &StatefulAuditEvent,
+) -> Result<crate::model::AuditEvent, AuditError> {
+    let (action, target, outcome, detail) = match event {
+        StatefulAuditEvent::StateRead { installation, key } => (
+            "state-read",
+            Some(installation.to_string()),
+            AuditOutcome::Success,
+            Some(key.to_string()),
+        ),
+        StatefulAuditEvent::StateCasApplied { installation, key } => (
+            "state-cas-applied",
+            Some(installation.to_string()),
+            AuditOutcome::Success,
+            Some(key.to_string()),
+        ),
+        StatefulAuditEvent::StateCasRejected { installation, key } => (
+            "state-cas-rejected",
+            Some(installation.to_string()),
+            AuditOutcome::Failure,
+            Some(key.to_string()),
+        ),
+        StatefulAuditEvent::StateTxBegan {
+            installation,
+            schema_version,
+        } => (
+            "state-tx-began",
+            Some(installation.to_string()),
+            AuditOutcome::Success,
+            Some(format!("schema-version {schema_version}")),
+        ),
+        StatefulAuditEvent::StateTxCommitted {
+            installation,
+            schema_version,
+        } => (
+            "state-tx-committed",
+            Some(installation.to_string()),
+            AuditOutcome::Success,
+            Some(format!("schema-version {schema_version}")),
+        ),
+        StatefulAuditEvent::StateTxAborted {
+            installation,
+            schema_version,
+        } => (
+            "state-tx-aborted",
+            Some(installation.to_string()),
+            AuditOutcome::Success,
+            Some(format!("schema-version {schema_version}")),
+        ),
+        StatefulAuditEvent::StateTxPut { installation, key } => (
+            "state-tx-put",
+            Some(installation.to_string()),
+            AuditOutcome::Success,
+            Some(key.to_string()),
+        ),
+        StatefulAuditEvent::StateTxDeleted { installation, key } => (
+            "state-tx-deleted",
+            Some(installation.to_string()),
+            AuditOutcome::Success,
+            Some(key.to_string()),
+        ),
+        StatefulAuditEvent::StateFailed {
+            installation,
+            operation,
+            reason,
+        } => (
+            "state-failed",
+            Some(installation.to_string()),
+            AuditOutcome::Failure,
+            Some(format!("operation {operation}: {reason}")),
+        ),
+        StatefulAuditEvent::MigrationStarted {
+            installation,
+            from,
+            to,
+        } => (
+            "state-migration-started",
+            Some(installation.to_string()),
+            AuditOutcome::Success,
+            Some(format!("from {from} to {to}")),
+        ),
+        StatefulAuditEvent::MigrationCommitted {
+            installation,
+            from,
+            to,
+        } => (
+            "state-migration-committed",
+            Some(installation.to_string()),
+            AuditOutcome::Success,
+            Some(format!("from {from} to {to}")),
+        ),
+        StatefulAuditEvent::MigrationRolledBack {
+            installation,
+            from,
+            to,
+            reason,
+        } => (
+            "state-migration-rolled-back",
+            Some(installation.to_string()),
+            AuditOutcome::Failure,
+            Some(format!("from {from} to {to}: {reason}")),
+        ),
+        StatefulAuditEvent::MigrationFailed {
+            installation,
+            from,
+            to,
+            reason,
+        } => (
+            "state-migration-failed",
+            Some(installation.to_string()),
+            AuditOutcome::Failure,
+            Some(format!("from {from} to {to}: {reason}")),
+        ),
+        StatefulAuditEvent::ConfigRead {
+            installation,
+            revision,
+        } => (
+            "config-read",
+            Some(installation.to_string()),
+            AuditOutcome::Success,
+            Some(format!("revision {revision}")),
+        ),
+        StatefulAuditEvent::ConfigWritten {
+            installation,
+            revision,
+            format,
+        } => (
+            "config-written",
+            Some(installation.to_string()),
+            AuditOutcome::Success,
+            Some(format!("revision {revision} format {format}")),
+        ),
+        StatefulAuditEvent::ConfigFailed {
+            installation,
+            operation,
+            reason,
+        } => (
+            "config-failed",
+            Some(installation.to_string()),
+            AuditOutcome::Failure,
+            Some(format!("operation {operation}: {reason}")),
+        ),
+        StatefulAuditEvent::SecretRead {
+            installation,
+            name,
+            version,
+        } => (
+            "secret-read",
+            Some(installation.to_string()),
+            AuditOutcome::Success,
+            Some(format!("{name} version {version}")),
+        ),
+        StatefulAuditEvent::SecretDenied { installation, name } => (
+            "secret-denied",
+            Some(installation.to_string()),
+            AuditOutcome::Failure,
+            Some(name.to_string()),
+        ),
+        StatefulAuditEvent::SecretRotated {
+            installation,
+            name,
+            version,
+        } => (
+            "secret-rotated",
+            Some(installation.to_string()),
+            AuditOutcome::Success,
+            Some(format!("{name} version {version}")),
+        ),
+        StatefulAuditEvent::SecretDeleted { installation, name } => (
+            "secret-deleted",
+            Some(installation.to_string()),
+            AuditOutcome::Success,
+            Some(name.to_string()),
+        ),
+        StatefulAuditEvent::SecretListed {
+            installation,
+            names,
+        } => (
+            "secret-listed",
+            Some(installation.to_string()),
+            AuditOutcome::Success,
+            Some(format!("{names} names")),
+        ),
+        StatefulAuditEvent::SecretFailed {
+            installation,
+            name,
+            reason,
+        } => (
+            "secret-failed",
+            Some(installation.to_string()),
+            AuditOutcome::Failure,
+            Some(match name {
+                Some(name) => format!("{name}: {reason}"),
+                None => reason.to_string(),
+            }),
+        ),
+    };
+    crate::model::AuditEvent::new(
+        AuditActor::System,
+        AuditCategory::ComponentLifecycle,
+        action,
+        target,
+        outcome,
+        detail,
+    )
+    .map_err(|error| AuditError::Storage(Box::new(error)))
+}
+
 // ---------------------------------------------------------------------------
 // RuntimeConfig 快照序列化 / 解析（§18.0 / §13.3）
 // ---------------------------------------------------------------------------
@@ -1257,7 +2094,7 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::*;
-    use crate::testutil::{audit, component_id, data_root, ok, some, tempdir};
+    use crate::testutil::{audit, component_id, data_root, err, ok, some, tempdir};
     use operune_domain::{
         CapabilityId, ComponentId, ComponentLifecycleEvent, ComponentVersion, InterfaceId,
         InterfaceName, InterfaceRequirement, PackageName,
@@ -1582,14 +2419,17 @@ mod tests {
         let ports = open_ports(dir.path()).await;
         let digest = ContentDigest::from_bytes(b"audited bytes");
         ok(
-            ports.append(AuditEvent::CandidatePersisted { digest }),
+            AuditPort::append(&ports, AuditEvent::CandidatePersisted { digest }),
             "append candidate-persisted",
         );
         ok(
-            ports.append(AuditEvent::InstallRejected {
-                digest,
-                reason: operune_application::ports::RejectReason::Oversized,
-            }),
+            AuditPort::append(
+                &ports,
+                AuditEvent::InstallRejected {
+                    digest,
+                    reason: operune_application::ports::RejectReason::Oversized,
+                },
+            ),
             "append install-rejected",
         );
         // 存储侧 audit 可回读（§18.7 durable）。
@@ -1621,7 +2461,7 @@ mod tests {
                 .await,
             "write config",
         );
-        let snapshot = ok(ports.snapshot(), "config snapshot");
+        let snapshot = ok(ConfigPort::snapshot(&ports), "config snapshot");
         assert_eq!(snapshot, config);
         shutdown_ports(ports).await;
     }
@@ -1630,7 +2470,7 @@ mod tests {
     async fn config_snapshot_fails_closed_when_missing() {
         let dir = tempdir();
         let ports = open_ports(dir.path()).await;
-        let result = ports.snapshot();
+        let result = ConfigPort::snapshot(&ports);
         assert!(
             matches!(result, Err(ConfigError::Storage(_))),
             "missing config must fail closed: {result:?}"
@@ -2162,6 +3002,599 @@ mod tests {
         }
         let stored = ok(ports.load_records(), "load");
         assert!(stored.providers.is_empty());
+        shutdown_ports(ports).await;
+    }
+
+    // ------------------------------------------------------------------
+    // 0.3.0 Stateful Runtime（§41.2）：state/config/secret 端口接线测试
+    //（真实 executor + tempdir；与 application/tests/stateful_e2e.rs 同模式）
+    // ------------------------------------------------------------------
+
+    fn state_key(name: &str) -> StateKey {
+        ok(StateKey::new(name), "state key")
+    }
+
+    fn state_value(bytes: &[u8]) -> StateValue {
+        ok(StateValue::new(bytes.to_vec()), "state value")
+    }
+
+    #[tokio::test]
+    async fn state_cas_roundtrip_establishes_schema_version() {
+        let dir = tempdir();
+        let ports = open_ports(dir.path()).await;
+        let installation = create_installation(&ports, &component_id("state-demo")).await;
+        let key = state_key("counter");
+        let v1 = StateSchemaVersion::from_u32(1);
+
+        // 空 store：点读 None + schema 版本 None（§41.3）。
+        assert_eq!(ok(ports.get(installation, &key), "get empty"), None);
+        assert_eq!(
+            ok(ports.schema_version(installation), "schema version empty"),
+            None
+        );
+
+        // 首次写入建立版本（§41.2 atomic update）。
+        ok(
+            StateStorePort::put(&ports, installation, &key, v1, &state_value(b"1")),
+            "put",
+        );
+        assert_eq!(
+            ok(ports.get(installation, &key), "get"),
+            Some(state_value(b"1"))
+        );
+        assert_eq!(
+            ok(ports.schema_version(installation), "schema version"),
+            Some(v1)
+        );
+
+        // 版本不符 → typed mismatch（§41.3），不写入。
+        let mismatch = err(
+            StateStorePort::put(
+                &ports,
+                installation,
+                &key,
+                StateSchemaVersion::from_u32(2),
+                &state_value(b"2"),
+            ),
+            "put mismatch",
+        );
+        assert!(
+            matches!(
+                mismatch,
+                StateStoreError::SchemaVersionMismatch {
+                    current: Some(current),
+                    requested,
+                    ..
+                } if current.as_u32() == 1 && requested.as_u32() == 2
+            ),
+            "version mismatch must be typed"
+        );
+
+        // 删除：键不存在 → NotFound（WIT not-found）。
+        ok(StateStorePort::delete(&ports, installation, &key), "delete");
+        assert_eq!(ok(ports.get(installation, &key), "get after delete"), None);
+        let missing = err(
+            StateStorePort::delete(&ports, installation, &key),
+            "delete again",
+        );
+        assert!(
+            matches!(missing, StateStoreError::NotFound(_)),
+            "delete of absent key must be NotFound"
+        );
+        shutdown_ports(ports).await;
+    }
+
+    #[tokio::test]
+    async fn state_transaction_begin_put_commit_is_atomic() {
+        // §41.2 MUST all-or-nothing：begin → tx_put → tx_get（一致性快照
+        // 含自身未提交写入）→ commit 后事务外读回；提交前事务外不可见。
+        let dir = tempdir();
+        let ports = open_ports(dir.path()).await;
+        let installation = create_installation(&ports, &component_id("state-tx")).await;
+        let v1 = StateSchemaVersion::from_u32(1);
+        ok(
+            StateStorePort::put(
+                &ports,
+                installation,
+                &state_key("seed"),
+                v1,
+                &state_value(b"0"),
+            ),
+            "seed put",
+        );
+
+        let tx = ok(ports.begin_transaction(installation, v1), "begin");
+        ok(
+            ports.tx_put(
+                tx,
+                installation,
+                &state_key("jobs/1"),
+                &state_value(b"queued"),
+            ),
+            "tx put",
+        );
+        assert_eq!(
+            ok(
+                ports.tx_get(tx, installation, &state_key("jobs/1")),
+                "tx get"
+            ),
+            Some(state_value(b"queued"))
+        );
+        // 事务窗口排他（§18.2 单连接）：进行中事务期间点读（事务外命令）
+        // 被拒绝——一致性快照经 tx_get 观察，事务外观察在 commit 后。
+        let conflict = err(
+            ports.get(installation, &state_key("jobs/1")),
+            "point read during transaction window",
+        );
+        assert!(
+            matches!(conflict, StateStoreError::TransactionConflict(_)),
+            "point reads are excluded during an open transaction"
+        );
+        ok(ports.commit(tx), "commit");
+        assert_eq!(
+            ok(
+                ports.get(installation, &state_key("jobs/1")),
+                "get after commit"
+            ),
+            Some(state_value(b"queued"))
+        );
+
+        // 已终止事务继续操作 → TransactionConflict（WIT conflict）。
+        let conflict = err(
+            ports.tx_put(tx, installation, &state_key("after"), &state_value(b"x")),
+            "tx put after commit",
+        );
+        assert!(
+            matches!(conflict, StateStoreError::TransactionConflict(_)),
+            "operation on terminated transaction must conflict"
+        );
+        let conflict = err(ports.commit(tx), "double commit");
+        assert!(matches!(conflict, StateStoreError::TransactionConflict(_)));
+        shutdown_ports(ports).await;
+    }
+
+    #[tokio::test]
+    async fn state_transaction_abort_discards_staged_writes() {
+        let dir = tempdir();
+        let ports = open_ports(dir.path()).await;
+        let installation = create_installation(&ports, &component_id("state-abort")).await;
+        let v1 = StateSchemaVersion::from_u32(1);
+        ok(
+            StateStorePort::put(
+                &ports,
+                installation,
+                &state_key("seed"),
+                v1,
+                &state_value(b"0"),
+            ),
+            "seed put",
+        );
+
+        let tx = ok(ports.begin_transaction(installation, v1), "begin");
+        ok(
+            ports.tx_put(tx, installation, &state_key("staged"), &state_value(b"x")),
+            "tx put",
+        );
+        ok(ports.abort(tx), "abort");
+        // 暂存写入不生效（WIT abort）；已终止事务的 abort 是 no-op。
+        assert_eq!(
+            ok(
+                ports.get(installation, &state_key("staged")),
+                "get after abort"
+            ),
+            None
+        );
+        ok(ports.abort(tx), "abort again is no-op");
+        shutdown_ports(ports).await;
+    }
+
+    #[tokio::test]
+    async fn state_migration_transaction_advances_marker_atomically() {
+        // §20.5 / §41.3：显式 migration 事务 forward-only；commit 时
+        // store schema 版本与数据在同一事务内推进。
+        let dir = tempdir();
+        let ports = open_ports(dir.path()).await;
+        let installation = create_installation(&ports, &component_id("state-migrate")).await;
+        let v1 = StateSchemaVersion::from_u32(1);
+        let v2 = StateSchemaVersion::from_u32(2);
+
+        // 空 store 不可迁移（§20.5：InvalidArgument）。
+        let invalid = err(
+            ports.begin_migration_transaction(installation, v2),
+            "migrate empty store",
+        );
+        assert!(
+            matches!(invalid, StateStoreError::InvalidArgument(_)),
+            "empty store migration must be rejected"
+        );
+
+        // 建立 v1（常规事务路径）。
+        let tx = ok(ports.begin_transaction(installation, v1), "begin");
+        ok(
+            ports.tx_put(tx, installation, &state_key("v1-key"), &state_value(b"old")),
+            "tx put",
+        );
+        ok(ports.commit(tx), "commit");
+
+        // 非前进（<= 当前）→ SchemaVersionMismatch（forward-only，WIT）。
+        let backwards = err(
+            ports.begin_migration_transaction(installation, v1),
+            "migrate to same version",
+        );
+        assert!(
+            matches!(backwards, StateStoreError::SchemaVersionMismatch { .. }),
+            "non-forward migration must be rejected"
+        );
+
+        // 显式 migration 到 v2：guest 写新形态 → 原子提交。
+        let tx = ok(
+            ports.begin_migration_transaction(installation, v2),
+            "begin migration",
+        );
+        ok(
+            ports.tx_put(
+                tx,
+                installation,
+                &state_key("schema-v2"),
+                &state_value(b"new-shape"),
+            ),
+            "guest write",
+        );
+        ok(ports.commit(tx), "commit migration");
+        // §41.3：版本与数据同事务推进。
+        assert_eq!(
+            ok(ports.schema_version(installation), "schema version"),
+            Some(v2)
+        );
+        assert_eq!(
+            ok(
+                ports.get(installation, &state_key("schema-v2")),
+                "migrated value"
+            ),
+            Some(state_value(b"new-shape"))
+        );
+        assert_eq!(
+            ok(
+                ports.get(installation, &state_key("v1-key")),
+                "old value intact"
+            ),
+            Some(state_value(b"old"))
+        );
+        // 迁移后常规写必须绑定 v2。
+        let mismatch = err(
+            StateStorePort::put(
+                &ports,
+                installation,
+                &state_key("late"),
+                v1,
+                &state_value(b"x"),
+            ),
+            "put at stale version",
+        );
+        assert!(matches!(
+            mismatch,
+            StateStoreError::SchemaVersionMismatch { .. }
+        ));
+        shutdown_ports(ports).await;
+    }
+
+    #[tokio::test]
+    async fn component_config_put_reads_back_monotonic_revision() {
+        let dir = tempdir();
+        let ports = open_ports(dir.path()).await;
+        let installation = create_installation(&ports, &component_id("config-demo")).await;
+        let value = |bytes: &[u8]| ok(ConfigValue::new(bytes.to_vec()), "config value");
+
+        // 未就绪：尚无已校验配置 → None（config.wit 无 not-found）。
+        assert_eq!(
+            ok(
+                ComponentConfigStorePort::snapshot(&ports, installation),
+                "snapshot empty"
+            ),
+            None
+        );
+
+        let r1 = ok(
+            ComponentConfigStorePort::put(
+                &ports,
+                installation,
+                ConfigFormat::Json,
+                ConfigSchemaVersion::from_u32(1),
+                &value(b"{\"worker\":1}"),
+            ),
+            "config put 1",
+        );
+        assert_eq!(r1, ConfigRevision::from_u64(1));
+        let r2 = ok(
+            ComponentConfigStorePort::put(
+                &ports,
+                installation,
+                ConfigFormat::Toml,
+                ConfigSchemaVersion::from_u32(2),
+                &value(b"worker = 1"),
+            ),
+            "config put 2",
+        );
+        assert_eq!(r2, ConfigRevision::from_u64(2));
+        let snapshot = ok(
+            ComponentConfigStorePort::snapshot(&ports, installation),
+            "snapshot",
+        );
+        let snapshot = ok(snapshot.ok_or("missing snapshot"), "snapshot record");
+        assert_eq!(snapshot.revision(), ConfigRevision::from_u64(2));
+        assert_eq!(snapshot.value().as_slice(), b"worker = 1");
+        shutdown_ports(ports).await;
+    }
+
+    #[tokio::test]
+    async fn secret_store_put_get_roundtrip_ciphertext_is_opaque() {
+        // §16.6：密文 BLOB 原样落库（storage 不解密、不解释、不回显内容）；
+        // 明文绝不进入本层——本测试全程只接触密文与元数据。
+        let dir = tempdir();
+        let ports = open_ports(dir.path()).await;
+        let installation = create_installation(&ports, &component_id("secret-demo")).await;
+        let name = || ok(SecretName::new("db-password"), "secret name");
+
+        let ciphertext = vec![0x13, 0x37, 0xAB, 0xFF, 0x00];
+        let v1 = ok(
+            SecretStorePort::put(
+                &ports,
+                installation,
+                &name(),
+                ciphertext,
+                "database credential",
+            ),
+            "secret put",
+        );
+        assert_eq!(v1, SecretVersion::from_u64(1));
+        // 轮换：版本递增（insert or replace，§41.2）。
+        let rotated = vec![0x42; 16];
+        let v2 = ok(
+            SecretStorePort::put(
+                &ports,
+                installation,
+                &name(),
+                rotated.clone(),
+                "database credential",
+            ),
+            "secret rotate",
+        );
+        assert_eq!(v2, SecretVersion::from_u64(2));
+
+        let record = ok(ports.ciphertext(installation, &name()), "ciphertext");
+        let record = ok(record.ok_or("missing secret record"), "record");
+        assert_eq!(record.name, name());
+        assert_eq!(record.version, SecretVersion::from_u64(2));
+        assert_eq!(record.ciphertext, rotated);
+
+        // list：名称 + 版本，不含值（§41.2 防泄漏）。
+        let listed = ok(ports.list(installation), "list");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].name(), &name());
+        assert_eq!(listed[0].version(), SecretVersion::from_u64(2));
+
+        // 空密文 → InvalidArgument（结构性校验：存储侧硬上限，§41.2）。
+        let invalid = err(
+            SecretStorePort::put(&ports, installation, &name(), Vec::new(), "d"),
+            "empty ciphertext",
+        );
+        assert!(
+            matches!(invalid, SecretStoreError::InvalidArgument(_)),
+            "empty ciphertext must be rejected"
+        );
+
+        ok(
+            SecretStorePort::delete(&ports, installation, &name()),
+            "delete",
+        );
+        assert_eq!(
+            ok(ports.ciphertext(installation, &name()), "after delete"),
+            None
+        );
+        let missing = err(
+            SecretStorePort::delete(&ports, installation, &name()),
+            "delete again",
+        );
+        assert!(
+            matches!(missing, SecretStoreError::NotFound(_)),
+            "delete of absent secret must be NotFound"
+        );
+        shutdown_ports(ports).await;
+    }
+
+    #[tokio::test]
+    async fn secret_grant_names_filter_grants_table_by_capability_face() {
+        // §17.3 "secret names" scope 维度：名称范围经 grants 表 scope 承载
+        //（JSON 规范化名称集，§13.3 与 grant scope / graph 记录同模式）；
+        // 能力面之外不构成名称 grant（deny-by-default，§17.2）。
+        let dir = tempdir();
+        let ports = open_ports(dir.path()).await;
+        let installation = create_installation(&ports, &component_id("grant-demo")).await;
+        let secret_scope = || {
+            ok(
+                CapabilityScope::new(ok(
+                    serde_json::to_string(&["db-password".to_owned(), "api-key".to_owned()]),
+                    "serialize scope",
+                )),
+                "capability scope",
+            )
+        };
+        ok(
+            ports
+                .executor
+                .replace_grants(
+                    installation,
+                    vec![
+                        (
+                            ok(CapabilityId::new("operune:secret/secret"), "capability"),
+                            secret_scope(),
+                        ),
+                        (
+                            ok(CapabilityId::new("wasi:cli/run"), "capability"),
+                            ok(CapabilityScope::new("run"), "scope"),
+                        ),
+                    ],
+                    audit("grant secret names"),
+                )
+                .await,
+            "replace grants",
+        );
+
+        let granted = ok(ports.granted_names(installation), "granted names");
+        let names: Vec<&str> = granted.iter().map(|name| name.as_str()).collect();
+        assert_eq!(names, vec!["api-key", "db-password"]);
+
+        // 整体替换撤销后 → 空集（deny-by-default，§17.2）。
+        ok(
+            ports
+                .executor
+                .replace_grants(installation, Vec::new(), audit("revoke grants"))
+                .await,
+            "revoke grants",
+        );
+        let granted = ok(ports.granted_names(installation), "granted after revoke");
+        assert!(granted.is_empty());
+        shutdown_ports(ports).await;
+    }
+
+    #[tokio::test]
+    async fn secret_grant_names_fail_closed_on_corrupt_scope() {
+        // 损坏（非法 JSON）→ 存储损坏 fail closed，绝不静默跳过（与
+        // scope_from_storage / graph 记录同模式，§13.3）。
+        let dir = tempdir();
+        let ports = open_ports(dir.path()).await;
+        let installation = create_installation(&ports, &component_id("grant-corrupt")).await;
+        ok(
+            ports
+                .executor
+                .replace_grants(
+                    installation,
+                    vec![(
+                        ok(CapabilityId::new("operune:secret/secret"), "capability"),
+                        ok(CapabilityScope::new("[\"ok-name\"]"), "scope"),
+                    )],
+                    audit("seed secret grant"),
+                )
+                .await,
+            "seed grant",
+        );
+        {
+            let conn = ok(
+                crate::migration::open_authoritative_db(&data_root(dir.path()).db_path()),
+                "raw open (test setup)",
+            );
+            ok(
+                conn.execute(
+                    "UPDATE grants SET scope = '{not-json' WHERE installation_id = ?1",
+                    [installation.to_string()],
+                ),
+                "corrupt scope",
+            );
+        }
+        let error = err(ports.granted_names(installation), "granted names");
+        assert!(
+            matches!(error, GrantError::Storage(ref source)
+                if source.to_string().contains("corrupt")),
+            "corrupt secret grant scope must fail closed: {error:?}"
+        );
+        shutdown_ports(ports).await;
+    }
+
+    #[tokio::test]
+    async fn stateful_audit_events_map_to_component_lifecycle_rows() {
+        // §41.2 audit MUST：0.3 事件落库为 component-lifecycle 审计行
+        //（audit.rs 文档：与 to_storage_audit 同模式）；metadata-only，
+        // 值绝不进入审计（§16.6）。
+        let dir = tempdir();
+        let ports = open_ports(dir.path()).await;
+        let installation = create_installation(&ports, &component_id("audit-demo")).await;
+        let key = state_key("k");
+        ok(
+            StatefulAuditPort::append(
+                &ports,
+                StatefulAuditEvent::StateRead {
+                    installation,
+                    key: key.clone(),
+                },
+            ),
+            "append state read",
+        );
+        ok(
+            StatefulAuditPort::append(
+                &ports,
+                StatefulAuditEvent::StateCasApplied {
+                    installation,
+                    key: key.clone(),
+                },
+            ),
+            "append cas applied",
+        );
+        ok(
+            StatefulAuditPort::append(
+                &ports,
+                StatefulAuditEvent::StateTxCommitted {
+                    installation,
+                    schema_version: StateSchemaVersion::from_u32(1),
+                },
+            ),
+            "append tx committed",
+        );
+        ok(
+            StatefulAuditPort::append(
+                &ports,
+                StatefulAuditEvent::SecretRotated {
+                    installation,
+                    name: ok(SecretName::new("db-password"), "secret name"),
+                    version: SecretVersion::from_u64(1),
+                },
+            ),
+            "append secret rotated",
+        );
+        ok(
+            StatefulAuditPort::append(
+                &ports,
+                StatefulAuditEvent::ConfigFailed {
+                    installation,
+                    operation: "put",
+                    reason: "corrupt",
+                },
+            ),
+            "append config failed",
+        );
+
+        let events = ok(ports.executor.list_audit_recent(10).await, "list audit");
+        let actions: Vec<&str> = events.iter().map(|event| event.action.as_str()).collect();
+        for expected in [
+            "state-read",
+            "state-cas-applied",
+            "state-tx-committed",
+            "secret-rotated",
+            "config-failed",
+        ] {
+            assert!(
+                actions.contains(&expected),
+                "audit row for {expected} missing"
+            );
+            // 0.3 事件全部映射为 component-lifecycle 类别（audit.rs 文档；
+            // 安装辅助调用还写入 Artifact 类别的行，故只检查本次追加的
+            // 事件行）。
+            let row = some(
+                events.iter().find(|event| event.action == expected),
+                "audit row",
+            );
+            assert_eq!(
+                row.category,
+                AuditCategory::ComponentLifecycle,
+                "stateful audit row {expected} must use the component-lifecycle category"
+            );
+        }
+        // 失败类事件 outcome=failure。
+        assert!(
+            events.iter().any(|event| {
+                event.action == "config-failed" && event.outcome == AuditOutcome::Failure
+            }),
+            "config-failed row must have failure outcome"
+        );
         shutdown_ports(ports).await;
     }
 }
