@@ -1,0 +1,59 @@
+package operune:web@0.2.0;
+
+// operune:web@0.2.0 — 0.4.0 Web Application Runtime：navigation / pages（§42.2）
+//
+// 页面声明是**声明面**：Component 在 app descriptor 中声明页面（page-id /
+// 路径 / 权限），Core 据此构建挂载命名空间下的导航（页面列表、默认页、
+// 页面级访问控制）。Core 是导航的唯一执行者（browser navigation 由 Core
+// 托管的 sandboxed frame 承载，§21.3 最低隔离 + 0.4 完整 navigation /
+// embedding policy），guest 没有运行时导航 API——页面集合是安装期事实，
+// 不随运行期变化。
+//
+// ## 导航语义（§42.2）
+// - 页面列表：`pages` 声明（app-descriptor.pages）；
+// - 默认页：`default-page`（app-descriptor.default-page），Core 对挂载点
+//   根路径解析到默认页；
+// - 页面路径是挂载命名空间下的静态路径（无模板段、无参数；动态路径属于
+//   routes 的 path-template）；
+// - 页面权限：`required-permission` 引用 permissions 声明的权限名。
+//
+// ## 权限声明与强制执行点（§42.2 page/action permission declarations）
+// 页面 / action 的权限以声明形态出现在本契约（required-permission），
+// enforcement 在 Core：页面请求经 Core-mediated bridge 时，Core 在服务端
+// 重新执行 authentication → RBAC → grant → page/action permission 检查
+// （§17.5 四层授权链 / §21.3），未授权以确定 HTTP 语义拒绝，不进 guest
+// 错误空间。§43（0.5.0）的 scoped capability policy 是本声明的后续细化，
+// 不改变本版本"声明面 + Core 强制执行点"的形态。
+
+interface navigation {
+    use permissions.{permission-name};
+
+    /// 页面标识符：Component 定义的开放页面标识符。
+    ///
+    /// record wrapper（§13.5）：Core 只做等价比较、审计与导航解析，不
+    /// 解析语义；同一 app descriptor 内不得重复（page-id-conflict）。
+    record page-id {
+        value: string,
+    }
+
+    /// 页面路径：挂载命名空间下的静态路径。
+    ///
+    /// 不变量（Core 校验）：以 "/" 开头、规范化相对路径、不含 ".." 段、
+    /// 空段、反斜杠或模板段（"{...}"）；不得解析到挂载命名空间之外，
+    /// 不得与任何 route 路径模板冲突（path-conflict）。
+    record page-path {
+        value: string,
+    }
+
+    /// 页面声明：一个可导航页面。
+    record page-declaration {
+        /// 页面标识符（导航与权限引用的键）。
+        page-id: page-id,
+        /// 页面路径（静态路径，无参数）。
+        path: page-path,
+        /// 可选展示名（导航 UI 使用；Core 不解析）。
+        display-name: option<string>,
+        /// 访问该页面所需的权限声明引用（可选；Core 强制执行）。
+        required-permission: option<permission-name>,
+    }
+}

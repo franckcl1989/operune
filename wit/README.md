@@ -1,15 +1,17 @@
-# Operune 公共 WIT 契约（0.1.0 首批 + 0.3.0 Stateful Runtime 契约）
+# Operune 公共 WIT 契约（0.1.0 首批 + 0.3.0 Stateful Runtime 契约 + 0.4.0 Web Application Runtime 契约）
 
 本目录是 Operune 公共平台契约（规范 §6.6），全部为**标准 WIT 语言**
 （P3：WIT 是唯一跨边界接口契约；不引入任何私有 IDL / 协议）。
-0.1.0 首批契约（§39 的 descriptor / web bridge）与 0.3.0 Stateful Runtime
-契约（§41 的 state / config / secret / scheduler / event）在同一个
+0.1.0 首批契约（§39 的 descriptor / web bridge）、0.3.0 Stateful Runtime
+契约（§41 的 state / config / secret / scheduler / event）与 0.4.0 Web
+Application Runtime 契约（§42 的 `operune:web@0.2.0`）在同一个
 `operune:*` namespace 下按各自 package 版本独立演进。
 
 | Package | 目录 | 内容 |
 |---|---|---|
 | `operune:component@0.1.0` | `operune/component/` | `descriptor`（Component 身份与平台 metadata 声明）+ 参考 world |
 | `operune:web@0.1.0` | `operune/web/` | `descriptor`（Web UI 声明）、`assets`（内嵌静态资产列举/读取）、`actions`（有界 backend action）+ 参考 world |
+| `operune:web@0.2.0` | `operune/web@0.2.0/` | `app-descriptor`（0.4.0 app descriptor：entry / features 扩展 / pages / routes / permissions 声明）、`navigation`（页面声明与导航语义）、`routes`（typed route/action 注册与声明期冲突诊断）、`permissions`（页面/action 权限声明）、`route-dispatch`（typed 运行期入口）、`assets`/`actions`（0.1 语义继承 + 0.4 增补）+ 参考 world |
 | `operune:state@0.1.0` | `operune/state/` | `state`（typed state service：事务/CAS/版本）、`declaration`（state 契约声明）、`migration`（显式状态迁移）+ 参考 world |
 | `operune:config@0.1.0` | `operune/config/` | `config`（只读配置快照/版本）、`declaration`（config 契约声明）、`validator`（配置校验器）+ 参考 world |
 | `operune:secret@0.1.0` | `operune/secret/` | `secret`（SecretStore port 的 guest 侧：grant/read + 防泄漏契约）+ 参考 world |
@@ -154,6 +156,11 @@ descriptor 明确禁止依赖这些能力（§19.3），因此不存在重复包
 - 新增接口（lifecycle、health、路由 / typed action 等）以新 interface 加入
   对应 package，与既有接口共存；0.4.0 的 web 演进（§21.4 / §42.2）不得推翻
   0.1.0 的 assets / actions 既有语义（§21.4 明文）。
+- 0.4.0 的 web 演进落地为**新 package 版本** `operune:web@0.2.0`
+  （`operune/web@0.2.0/` 目录，与 0.1.0 共存），而不是在 0.1.0 包内增量
+  加 interface：0.1.0 `web-features` flags 无法在版本内扩展（flags 成员
+  变化即类型变化），app descriptor 的 features 扩展必然落到新版本；设计
+  选择与完整理由见 §11.6。旧 0.1.0 组件无需迁移（§8.4 无 flag-day 精神）。
 - 若未来标准（Component Model / WASI）覆盖某项自定义能力，按 §6.6
   通过显式版本化与兼容层迁移，不静默重解释旧 package。
 
@@ -384,8 +391,148 @@ secret、事件与背压语义），0.4 明确不重造第二套状态/事件/�
 
 ### 10.2 语法校验状态
 
-本机无 wasm-tools；全部 WIT 文件的语法校验**待 bindgen/wasm-tools
-集成**（0.1 implementation PR 阶段执行）。文件已按 0.1.0 批次修复后
-的结构惯例书写（类型全部在 interface 内、每包仅一个文件在 package
-声明前携带包级注释、world 只引用 interface 名），并逐文件对照
-assets/actions 的既有形态。
+本机无 wasm-tools；`operune:web@0.2.0` 批次的全部文件已用临时验证工具
+witverify（wit-parser **0.236.1**，仅存在于本机临时目录，不入库）完成
+解析与结构校验（结果见 §11.7）。0.3.0 五包与 0.1.0 首批在本批次中做了
+同工具回归，全部通过。bindgen / wasm-tools 集成验证仍在 0.1 / 0.4
+implementation PR 阶段执行。
+
+---
+
+# 0.4.0 Web Application Runtime 契约（§42）的 §6.6 证明
+
+## 11. `operune:web@0.2.0` 的 §6.6 证明
+
+`operune:web@0.2.0` 是 0.1.0 web bridge 的版本化演进（§21.4：
+"最小闭环 → 完整应用运行时"，不是两套 Component Web 系统）。0.1.0 的
+§6.6 论证（本 README §2：assets ≠ wasi:filesystem、actions ≠ wasi:http
+包装、mount namespace 与原子版本）在本版本继续成立（语义继承，见
+package 注释）；以下论证 0.4.0 **新增**声明面（§42.2 的 navigation /
+routes / permissions 及其运行期形态）为何属于 §6.6 允许的平台领域语义。
+§42.4 的 Web compatibility / conformance suite（测试 Component 仅凭标准
+`.wasm` 提供完整 UI + backend）是验收侧产物，不属于 WIT 面。
+
+### 11.1 app descriptor / navigation / pages
+
+- **Component Model 只表达接口结构，不表达"应用由哪些页面构成"。**
+  §6.7 的 contract surface（接口结构 / 类型关系）与"应用导航模型"
+  （页面列表、默认页、页面路径、页面权限）是正交事实：二进制可观察
+  exports 无法推导导航语义，必须由显式声明契约承载——这与 0.1.0
+  web-descriptor 的"作者声明的 Web 能力声明"（§2.1 同款论证）同构，
+  app descriptor 是其超集演进。
+- **wasi:http 无导航概念。** incoming-handler 是"组件收发通用 HTTP"，
+  无页面 / 路由注册、无默认页、无挂载点下导航的宿主托管模型；且
+  §21.3 明文禁止组件自行 bind 监听端口（wasi:http 的授权模型是网络
+  端点暴露面，与 Operune 的 InstallationId grant 链不可互证，§2.2
+  同款论证）。
+- **Web 平台（浏览器）不托管组件驱动的应用声明。** 页面列表 / 默认页 /
+  导航策略由 Core 在 sandboxed frame + restrictive CSP 边界内执行
+  （§21.3 最低隔离 + 0.4 完整 navigation / embedding policy，§42.2）；
+  标准世界没有"宿主托管组件 Web 应用的导航声明"模型。
+- 页面 / 路由路径解析到 Core 分配的 mount namespace（§21.3），路径
+  规范化与越界校验是 §21.3 / §32 平台安全语义（防 path traversal）。
+
+### 11.2 typed route / action registration + route namespace + conflict diagnostics
+
+- **wasi:http 无路由注册语义。** wasi:http 没有 route-id、HTTP 方法 +
+  路径模板 + 参数类型的声明模型，没有"宿主托管的路由表"；组件自持
+  路由要么靠自解析请求路径（把 Core 的桥当透明代理，破坏 §21.3 的
+  Core-mediated 检查点），要么动态 bind 端口（§21.3 明文禁止）。
+- **route namespace 是 mount namespace 的扩展（Core 分配、不可冲突）。**
+  与 0.1 挂载命名空间同款论证（§2.3）：平台托管语义，标准世界无对应。
+- **声明期 conflict diagnostics 是平台状态机语义。** 冲突检测发生在
+  安装 / 激活的 descriptor 校验阶段，确定性（同一 ContentDigest + 同一
+  contract version 得到同一诊断闭集，§19.3 精神），冲突 candidate 保持
+  quarantine / failed；WASI / Component Model 无"安装期声明校验"状态机。
+- typed action 的结构化参数（param-type / param-value 闭集）兑现 0.1.0
+  actions 注释承诺（"0.4.0 的 typed action 将提供结构化参数"），是
+  Core 分发前按声明校验的平台语义（§22.4 精神：禁止万能动态值 payload）。
+
+### 11.3 page / action permission declarations
+
+- **WASI / Component Model 无组件声明权限要求的契约面。** WASI 的授权
+  是宿主侧能力注入（preopen、socket 授权等），不存在"组件声明页面 /
+  action 需要的命名权限 + 宿主声明期校验 + 运行期强制执行点"的模型；
+  组件自身无从表达，宿主亦无从验证声明一致性（§6.7 交叉校验精神）。
+- **enforcement 是 Core 平台语义。** 页面请求与 route 调用经
+  Core-mediated bridge，服务端重新执行 authentication → RBAC → grant →
+  page / action permission 检查（§17.5 四层授权链 / §21.3），未授权以
+  确定 HTTP 语义拒绝；permission-name → grant scope 的映射与求值是
+  Core 政策。§43（0.5.0）的 scoped capability policy 是后续细化，不
+  改变 0.4 "声明面 + Core 强制执行点"的形态。
+- 本声明只有命名引用（字符串等价比较），不含凭据 / 角色字段（§21.3
+  凭据边界），无泄漏面。
+
+### 11.4 bounded request / response + cancellation 无条件 baseline
+
+- 0.1 论证（§2.2 actions ≠ wasi:http 包装）延续：0.4 的 typed route
+  调用仍是 Core-mediated 有界一次调用，不是网络端点。
+- cancellation / disconnect 语义（Core 侧 deadline、epoch interruption
+  中止、响应交付不保证、已提交副作用不回滚 + operune:state 事务原子性，
+  §20.5）、per-Component HTTP quotas / backpressure（超配额以确定 HTTP
+  语义拒绝，不进 guest 错误空间）是**平台执行语义**：WASI p2 没有
+  "宿主取消 host → guest 调用"的契约，也没有按 InstallationId 的配额
+  治理模型。
+
+### 11.5 P4 自检（禁止复制的 WASI 语义）
+
+本 package 不复制：`wasi:io/streams` / `pollable`（契约中无
+`stream<T>` / `future<T>` / poll 类型，§42.3）、`wasi:http`（不包装
+incoming-handler）、`wasi:filesystem`、`wasi:clocks` / `wasi:random`。
+全部 func 为同步有界形态；不嵌入任何 WASI 版本特有类型（§8.2 SHOULD
+NOT）；没有第二套 IDL（P3）。0.4 的 native realtime / stream 只走标准
+`stream<T>` / `future<T>` / async 路径，且必须在 §8.3 WASI 0.3
+production Gate 通过后以**新 interface 版本**顺延加入（§42.3），本
+版本明确不包含，未通过 Gate 时验收不得假装该能力已存在（§42.4）。
+
+### 11.6 0.1 → 0.2 兼容策略（§21.4 不重造第二套 bridge）
+
+**设计选择：新 package 版本 `operune:web@0.2.0` 内全量定义契约面**
+（`assets` / `actions` 以与 0.1.0 相同的类型形态重新定义、行为语义注释
+继承 0.1），而非"0.2.0 增量引用 0.1.0 接口"。理由：
+
+1. **flags 扩展本身就是破坏性变更**：0.1.0 `web-features`
+   （static-assets / backend-actions）无法在版本内添加 flag（flags 成员
+   变化即类型变化，§4 "WIT record 添加字段是破坏性变更"同款规则）；
+   0.4 的 app descriptor 必须扩展 features（navigation / typed-routes /
+   permissions），descriptor 演进因此必然落到新 package 版本；
+2. **单版本 contract surface**（§6.7）：新组件以 0.2.0 表面表达全部
+   能力，Core 的兼容判断不跨版本拼装组件表面；同一语义角色（assets /
+   actions）在 0.2.0 表面下携带 0.4 语义（caching / integrity、typed
+   入口），并非机械复制；
+3. **解析 / 工具链独立**：`operune/web@0.2.0/` 目录单独可解析，不要求
+   0.1.0 同在解析图（无跨版本 `use` 边）；
+4. **不重造第二套 bridge**（§42.2 明文）：0.2.0 的 assets / actions 是
+   0.1 同一桥接实现的**版本分发表面**，不是第二个实现——asset 缓存键
+   （ContentDigest + asset path）、Core-mediated 检查点、§21.3 隔离底线
+   全部相同。
+
+**旧 0.1 组件继续可运行（无 flag-day，§8.4 精神）**：
+
+- `operune:web@0.1.0` 契约保持冻结且永久受支持：0.1 组件只导出 0.1.0
+  表面即按 0.1.0 语义服务（assets / actions / web descriptor / §21.3
+  隔离底线 / §21.5 原子版本全部不变），升级到 0.4 runtime 不要求旧组件
+  重新导出或迁移（不强制旧组件接受 0.2.0 面）；
+- Core 按二进制可观察的 contract surface（§6.7）分发：同一语义角色
+  同时出现 0.2.0 与 0.1.0 表面时，确定性规则为**优先 0.2.0、回退
+  0.1.0**；同一 ComponentVersion 的 descriptor / assets / backend
+  exports 仍属于同一版本，升级整体原子切换（§21.5），不存在"前端 v2 +
+  后端 v1"拼接。
+
+### 11.7 语法校验状态
+
+`operune:web@0.2.0` 全部 8 个文件已用本机 wit-parser **0.236.1**
+（临时验证工具 witverify，位于本机临时目录，不入库）验证通过：
+
+- **全包解析 PASS**：8 个 package（component、web@0.1.0、web@0.2.0、
+  state、config、secret、scheduler、event）同一 Resolve 解析，含
+  web@0.2.0 world 对 `operune:component/descriptor@0.1.0` 的跨包引用；
+- **关键字核对 PASS**：全部标识符位置（类型名、字段名、case 名、flag
+  名、参数名、func 名、world 名、world item）对照 wit-parser 0.236.1
+  全关键字表，无保留字（含 from / use / type / async / stream / future /
+  error-context / _ 等）；
+- **结构惯例 PASS**：每包恰好一个文件在 package 声明前携带包级注释
+  （web@0.2.0 → app-descriptor.wit）；所有类型定义在 interface 内；
+  world 只引用 interface 名（+ 显式版本化的跨包引用）。
+
+bindgen / wasm-tools 集成验证在 0.4 implementation PR 阶段执行。

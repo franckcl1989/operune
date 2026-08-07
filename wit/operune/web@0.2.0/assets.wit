@@ -1,0 +1,80 @@
+package operune:web@0.2.0;
+
+// operune:web@0.2.0 — 0.4.0 Web Application Runtime：static assets（§42.2）
+//
+// 本 interface 是 0.1.0 `assets` 的**版本内全量定义**：类型形态与行为
+// 语义继承 0.1.0（§21.3），0.4.0 在此基础上增补 Web asset caching /
+// integrity 语义（§42.2）。0.2.0 表面与 0.1.0 表面共用同一个桥接实现
+// （Core 按 §6.7 可观察 contract surface 分发），不是第二套 bridge
+// （§42.2 明文）。
+//
+// ## 语义继承（0.1.0 assets，逐项不变）
+// - Component 导出本 interface 向 Core 提供内嵌静态资产的列举与读取；
+//   Core 在激活阶段读取资产、按内容摘要缓存并直供浏览器，静态资产
+//   请求不必每次重新执行 Wasm（§6.2）；
+// - 缓存事实：缓存键是 `ContentDigest + asset path`（ContentDigest 是
+//   Core 侧事实，不出现在本契约的函数签名中；§6.7 / §19.4）；
+// - 一次性 bounded 读取：无流、无增量、无长连接（0.1 边界延续）；
+// - MIME / CSP / 响应头属于 Core-owned security headers（§21.3），
+//   作者声明不可覆盖 Core 安全判定。
+//
+// ## 0.4.0 增补：Web asset caching / integrity（§42.2，Core 执行）
+// - Core 以内容摘要派生完整性信息（SRI 形态）供浏览器校验，页面 /
+//   资产交付可携带 digest 验证事实；
+// - 缓存策略（immutable 长缓存 + digest 可验证的 URL 形态）由 Core
+//   统一治理，asset URL 永不可由组件或浏览器改写（mount namespace）；
+// - 同一 ComponentVersion 的资产集合随版本原子切换（§21.5）：升级后
+//   任何新页面加载与 asset lookup 解析到同一 active version，禁止
+//   "前端 v2 + 后端 v1" 拼接。
+//
+// ## 与 WASI 的关系（§6.6，论证见 wit/README.md §2.1 / §11）
+// 不复制 wasi:filesystem / wasi:http：读取的是 Component 内嵌数据
+// （以 Core 内容摘要缓存为事实），无 preopen、无宿主文件系统、无网络
+// 暴露、无路径穿越面。
+
+interface assets {
+    use app-descriptor.{asset-path};
+
+    /// 单个资产的元数据（形态与 0.1.0 一致）。
+    record asset-metadata {
+        /// 资产在 Component 内的逻辑路径。
+        path: asset-path,
+        /// 资产字节大小。Core 用于体积预算与缓存决策。
+        size: u64,
+        /// 作者建议的 MIME 类型（例如 "text/html"）。Core 保留最终
+        /// 校验权：响应头、CSP 与 MIME 嗅探防护属于 Core-owned
+        /// security headers（§21.3），作者的声明不可覆盖 Core 的安全
+        /// 判定。
+        content-type: option<string>,
+    }
+
+    /// assets 接口的预期失败（错误形态与 0.1.0 一致）。
+    enum assets-error {
+        /// 请求的资产路径不存在。
+        not-found,
+        /// 路径非法（未规范化、越界、含 ".." 等），Core 视为 contract
+        /// violation。
+        invalid-path,
+        /// 资产超出 Core 单资产体积上限。guest 应主动声明；Core 侧另有
+        /// 宿主硬上限（§7.4 host buffer 上限），超限按 trap / 失败处理。
+        too-large,
+        /// 清单或数据无法解析（数据损坏等）。
+        malformed,
+    }
+
+    /// 列举 Component 内嵌的全部静态资产（语义继承 0.1.0）。
+    ///
+    /// 契约：side-effect-free、bounded、可重复（同一 ContentDigest +
+    /// 同一 contract version 返回同一清单）；Core 对清单体积施加宿主侧
+    /// 上限。
+    list-assets: func() -> result<list<asset-metadata>, assets-error>;
+
+    /// 读取指定资产的字节内容（语义继承 0.1.0）。
+    ///
+    /// - 体积受 Core 宿主侧硬上限约束（§7.4 / §21.3），超限不得无限
+    ///   放大内存；
+    /// - 结果不携带 ContentDigest（Core 侧事实，§19.4）；
+    /// - 无流、无增量、无长连接：一次性 bounded 读取；
+    /// - 0.4.0：缓存 / 完整性信息由 Core 在交付层派生（见本文件顶部）。
+    read-asset: func(path: asset-path) -> result<list<u8>, assets-error>;
+}

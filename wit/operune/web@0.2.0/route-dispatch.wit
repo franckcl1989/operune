@@ -1,0 +1,100 @@
+package operune:web@0.2.0;
+
+// operune:web@0.2.0 — 0.4.0 Web Application Runtime：typed route dispatch
+// （§42.2 typed backend route / action registration 的运行期入口）
+//
+// Component 导出本 interface 处理已声明路由（routes interface 声明、
+// Core 校验与分发）的 typed 调用。0.1.0 的 `actions.handle-action`
+// 保留给未声明路由的无类型 action（语义继承 0.1）；已声明路由一律经
+// 本 interface：route-id + 结构化参数（param-value）+ 辅助载荷
+// （action-payload）。
+//
+// ## typed 语义（§42.2；兑现 0.1.0 注释承诺）
+// - 参数类型在 routes 声明（param-type 闭集），Core 在分发前按声明
+//   校验 / 构造 param-value，类型不符的请求以确定 HTTP 语义拒绝
+//   （400），不进 guest 错误空间；
+// - 因此 guest 收到的 params 与声明一致；guest 侧再发现不一致属于
+//   contract violation（invalid-params 仅作防御性闭集）。
+//
+// ## bounded + cancellation 无条件 baseline（§42.2，Core 执行）
+// 同 actions interface：有界一次调用、Core 侧 deadline / disconnect
+// 可中止并丢弃结果、响应交付不保证、已提交副作用不回滚（原子性写路径
+// 使用 operune:state 事务，§20.5）；per-Component HTTP quotas /
+// backpressure 在 bridge 层以确定 HTTP 语义表达。详见 actions.wit 顶部。
+//
+// ## §42.3 WASI 0.3 条件（本版本的明确边界）
+// 本 interface 是同步 p2 形态：无 `stream<T>`、无 `future<T>`、无 async
+// func、无原生 realtime / long-polling 面。若第 8.3 WASI 0.3 production
+// Gate 通过，native stream / future / async realtime 以**新 interface
+// 版本**沿标准 WIT async 路径顺延加入进入满足 Gate 的后续 release 的
+// production scope（§42.3 顺延规则），禁止为了版本号 / 路线图表面完整
+// 而私造平行 async / stream ABI。可选 polling（浏览器侧轮询）不改变本
+// 契约形态。p2 与未来 p3 的 adapter boundary 由 Core 保留。
+
+interface route-dispatch {
+    use actions.{action-payload};
+    use routes.{route-id};
+
+    /// 结构化参数值（闭集，与 routes.param-type 一一对应）。
+    ///
+    /// Core 按声明类型构造并校验；guest 不应假设出现声明类型之外的
+    /// 变体（出现即 contract violation）。
+    variant param-value {
+        /// UTF-8 文本。
+        text(string),
+        /// 有符号 64 位整数。
+        integer(s64),
+        /// 无符号 64 位整数。
+        unsigned(u64),
+        /// 布尔值。
+        boolean(bool),
+        /// 64 位浮点。
+        decimal(f64),
+    }
+
+    /// 单个命名参数：名称 + 值（Core 按声明校验名称与类型）。
+    record typed-param {
+        name: string,
+        value: param-value,
+    }
+
+    /// typed route 请求。
+    ///
+    /// 不变量：params 与声明一致（数量、名称、类型）；payload 是可选
+    /// 辅助载荷（无参数可携带数据时的 json / raw 形态）。请求结构中
+    /// 没有凭据 / 会话 / CSRF 字段（§21.3 凭据边界）。
+    record route-request {
+        /// 目标 route（声明键；未声明 → not-found）。
+        route-id: route-id,
+        /// 结构化参数（顺序与声明一致）。
+        params: list<typed-param>,
+        /// 可选辅助载荷。
+        payload: option<action-payload>,
+    }
+
+    /// typed route 调用的预期失败（guest 返回值空间）。
+    enum route-error {
+        /// 请求的 route-id 未声明（Core 分发前已按声明路由表检查，
+        /// 该变体仅作防御性闭集）。
+        not-found,
+        /// 参数与声明不一致（数量 / 名称 / 类型；Core 分发前已校验，
+        /// 该变体仅作防御性闭集）。
+        invalid-params,
+        /// 辅助载荷不符合该 route 的预期形态或契约不变量。
+        invalid-payload,
+        /// guest 内部不可恢复错误。
+        internal,
+    }
+
+    /// 处理一次 typed route 调用（同步、有界）。
+    ///
+    /// - Core 在分发前完成：路由表解析、auth → RBAC → grant → action
+    ///   permission（route-declaration 的 required-permission，§17.5 /
+    ///   §21.3）、参数按声明校验、body / deadline / rate / concurrency /
+    ///   quota 检查；
+    /// - 同步返回完整 response（list<u8>，体积受 Core 宿主侧上限）；
+    /// - cancellation / disconnect：客户端断开或超时后 Core 可中止
+    ///   调用并丢弃结果（见本文件顶部与 actions.wit）；
+    /// - 无状态：不承诺跨调用 instance affinity（§7.3）。
+    handle-route: func(request: route-request) -> result<list<u8>, route-error>;
+}

@@ -1,0 +1,42 @@
+package operune:web@0.2.0;
+
+// operune:web@0.2.0 — 参考 world（作者侧便利，非运行时事实源）
+//
+// 0.4.0 完整 Web Application Runtime Component 需要导出的 operune 契约
+// 总览。Core 的兼容判断只依赖二进制中真实可观察的 exports（§6.7），
+// 不依赖 root world 名称。
+//
+// ## 与 0.1.0 world 的关系（兼容策略详见 app-descriptor.wit 顶部与
+// wit/README.md §11.6）
+// - 0.1.0 组件继续导出 `operune-web-component`（operune:web@0.1.0），
+//   Core 永久支持该表面（§8.4 无 flag-day 精神）；
+// - 本 world 面向新组件：以 0.2.0 单版本表面表达完整 0.4 能力（含
+//   assets / actions 的版本内全量定义，语义继承 0.1 行为）。
+//
+// ## §42.3 WASI 0.3 条件（本版本边界）
+// 本 world 与 0.2.0 全部契约均为 p2 同步形态：无 stream / future /
+// async 面；native realtime / stream 在 §8.3 Gate 通过后以新 interface
+// 版本加入（§42.3），不改变本 world 已冻结的表面。
+//
+// ## 安全边界（Core 执行；WIT 面不得与之冲突）
+// 在 0.1 最低隔离底线（sandboxed frame、restrictive CSP、Core-mediated
+// bridge、Core-owned security headers，§21.3）之上，0.4 完整 browser
+// isolation / navigation / embedding policy（§42.2）全部由 Core 生成并
+// 强制：本 package 不存在任何组件可放宽 sandbox / CSP / frame /
+// navigation / popup / download / form / network connect 的配置面；
+// 本 package 全部契约均为 Component 导出（export），Core 是唯一消费者
+// （Host 侧），静态资产由 Core 缓存直供浏览器、action 由 Core-mediated
+// bridge 转发（§21.3），组件不自行 bind 监听端口。
+
+/// 0.4.0 完整 Web Application Runtime Component：导出 0.2.0 全契约面
+/// 与安装 / 身份契约（operune:component/descriptor@0.1.0）。
+world operune-web-application {
+    export operune:component/descriptor@0.1.0;
+    export app-descriptor;
+    export navigation;
+    export routes;
+    export permissions;
+    export assets;
+    export actions;
+    export route-dispatch;
+}
