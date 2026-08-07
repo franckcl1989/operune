@@ -6,6 +6,43 @@ rust-version.workspace = true
 description = "Operune wasm runtime adapter: wasmtime Engine/Component/Store, resource governance, typed ports (spec 24.2)"
 
 [dependencies]
+# §22.2 Wasmtime 36.x LTS —— 0.1.0 production feature set（由 0.1 implementation PR 固化）：
+#
+# 启用的最小生产 feature（全部为当前架构真实所需）：
+#   component-model        Component Model（§4.1/§7.2/§19.2；Component::new 验证+编译）
+#   async                  异步执行与异步 host 函数能力（§22.2 明确列出 "async/runtime"；
+#                           runtime-wasi-p2 的异步 WASI host 函数（含 HTTP）依赖此能力）
+#   cranelift              生产编译后端（§4.1/§22.2 固定 Cranelift）
+#   runtime                Store/Instance/JIT 执行机制（§7.3）
+#   std                    标准库支持
+#   parallel-compilation   并行编译（Component validate+instantiate 冷启动基线，§34.3）
+#
+# 明确不启用（§22.2：experimental proposal、pooling、GC、Winch 等不得仅因上游
+# 提供就进入 production feature set）：
+#   default（其中含 gc/gc-drc/gc-null、pooling-allocator、winch、threads、
+#     stack-switching、profiling、coredump、demangle、addr2line、debug-builtins、
+#     cache、wat）以及 pulley、component-model-async、call-hook、wmemcheck、
+#   trace-log、incremental-cache、memory-protection-keys、all-arch、wave、
+#   custom-*、reexport-wasmparser、profile-pulley。
+wasmtime = { workspace = true, default-features = false, features = [
+    "component-model",
+    "async",
+    "cranelift",
+    "runtime",
+    "std",
+    "parallel-compilation",
+] }
+
+# §22.5：typed error（§14.1）。
+thiserror = { workspace = true }
+
+[dev-dependencies]
+# 仅测试目标使用（§22.8）：wat 文本格式解析（Module::new / Component::new 接受
+# 文本格式）。default-features = false 与 production feature set 保持一致，
+# 避免把 wasmtime default（gc/pooling/winch 等）经测试/`--all-targets` 构建面
+# 混入资格构建（§26.1：不得因 --all-features 或 default 把实验项带入 production
+# feature qualification）。
+wasmtime = { workspace = true, default-features = false, features = ["wat"] }
 
 [lints]
 workspace = true
