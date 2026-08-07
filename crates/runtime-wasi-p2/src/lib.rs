@@ -36,25 +36,31 @@
 //! 对外只提供项目自己的 typed port/value 类型：capability 规格
 //!（[`capability`]）、不透明 context 句柄（[`context`]）、typed error
 //!（[`error`]）。`wasmtime_wasi` 的 p2 具体类型（`WasiCtx` / `WasiCtxBuilder` /
-//! `WasiView` / `p2::add_to_linker_sync`）仅在本 crate 内部使用。
+//! `WasiView` / `p2::add_to_linker_sync`）只出现在两个受控 glue 例外中：
+//! [`context::WasiContext::into_p2_inner`]（context 所有权迁移给 runtime-wasm
+//! 的 `WasiP2HostState::new`）与 [`linker::add_to_linker`] 的 trait bound
+//!（由 runtime-wasm 的 `StoreHostState` 满足）。
 //!
-//! # 与 runtime-wasm / application 的衔接点（集成阶段）
+//! # 与 runtime-wasm / application 的衔接点
 //!
-//! - **上下文**：[`context::WasiContext`] 是集成层（runtime-wasm 的 Store 类型）
-//!   需要持有的 WASI 0.2 状态句柄；
-//! - **linker**：[`linker`] 模块的 `add_to_linker`（pub(crate)）是 WASI 0.2
-//!   世界组装点。由于 wasmtime-wasi 36 的 `WasiView` binding trait 受 orphan
-//!   rule 约束，其实现在集成阶段只能写在持有 Store 类型的 crate
-//!   （runtime-wasm，§8.2 的 MUST NOT 列表不含 runtime-wasm），本 crate 提供
-//!   context 构建与 linker 组装并测试覆盖；公开形态待 Store 类型定型后由
-//!   主 agent 决定（如需偏离 §8.2 字面表述，走 ADR，见 §25.10）；
-//! - **policy 形状**：[`capability::WasiCapabilities`] 是 application 层将来
-//!   按 §17 grant 语义产生的能力值；本阶段仅定义形状与安全默认
-//!   （socket 许可、宿主熵随机源等接线留到 application/集成阶段，YAGNI §12.6）；
+//! - **adapter 契约**：[`adapter`] 实现 runtime-wasm 的
+//!   [`operune_runtime_wasm::wasi::WasiAdapter`]（本 crate 依赖 runtime-wasm
+//!   ——port 定义层，§24.3；runtime-wasm 不依赖本 crate，无环）；
+//! - **上下文**：[`context::WasiContext`] 是集成层需要持有的 WASI 0.2
+//!   状态句柄；经 [`context::WasiContext::into_p2_inner`] 迁移给
+//!   [`adapter`] 的 attach 安装（§8.2 受控 glue 例外，见其文档）；
+//! - **linker**：[`linker::add_to_linker`] 是 WASI 0.2 世界组装点。由于
+//!   wasmtime-wasi 36 的 `WasiView` binding trait 受 orphan rule 约束，
+//!   其实现只能在持有 Store 类型的 crate（runtime-wasm 的 `StoreHostState`，
+//!   §8.2 的 MUST NOT 列表不含 runtime-wasm），本 crate 以泛型
+//!   `T: WasiView` 公开组装入口并测试覆盖；
+//! - **policy 形状**：[`capability::WasiCapabilities`] 是 application 层按
+//!   §17 grant 语义产生的能力值（见 [`adapter`] 的 policy 映射说明；
+//!   socket 许可、宿主熵随机源等接线留到后续里程碑，YAGNI §12.6）；
 //! - **guest fixture 集成测试**：留到 §30 conformance 阶段（本机无
 //!   cargo-component/wasm-tools guest 工具链，已确认不可用）；本阶段只做
 //!   host 侧可测部分（linker 组装、context 默认无权限、capability 校验、
-//!   错误映射）。
+//!   adapter attach、错误映射）。
 //!
 //! # 错误契约（§14.1）
 //!
@@ -70,8 +76,8 @@
 //!   遗留路径），`p3` feature 永不启用（§4.2）；
 //! - `thiserror` 2.x：typed error（§14.1）。
 
+pub mod adapter;
 pub mod capability;
 pub mod context;
 pub mod error;
-
-mod linker;
+pub mod linker;

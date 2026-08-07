@@ -6,6 +6,16 @@ rust-version.workspace = true
 description = "Operune WASI 0.2 linker/context/binding adapter (spec 8.2 / 24.2); p2-side replacement point for WASI version isolation"
 
 [dependencies]
+# §24.3 依赖方向：adapter ---> port 定义层。`WasiAdapter` trait 定义在
+# runtime-wasm（crates/runtime-wasm/src/wasi.rs）；本 crate 实现该 trait
+#（[`crate::adapter`]：`impl WasiAdapter for WasiContextBuilder`）并经
+# runtime-wasm 的 `StoreHostState::set_wasi_state` / `WasiP2HostState::new`
+# 安装 WASI 0.2 context，因此依赖 runtime-wasm。无环：runtime-wasm 不依赖
+# 本 crate（其 Cargo.toml 只有 wasmtime / wasmtime-wasi / thiserror）——
+# 本 crate 是 WASI 版本具体 linker/binding 的 adapter（§8.2 / §24.2），
+# 位于 runtime-wasm 之下。
+operune-runtime-wasm = { path = "../runtime-wasm" }
+
 # §22.2 Wasmtime 36.x LTS production line（与 runtime-wasm 同 release line，禁止混搭）。
 # 根 workspace.dependencies 已声明 default-features = false（§22.2 feature
 # 最小化：不启用 gc/winch/pooling/watch/cache/profiling/threads/stack-switching

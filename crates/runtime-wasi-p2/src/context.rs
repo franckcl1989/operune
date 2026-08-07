@@ -115,24 +115,33 @@ impl WasiContextBuilder {
 /// 内部持有 `wasmtime_wasi::WasiCtx`（WASI 0.2 的 Host 状态），该具体类型
 /// 只存在于本 crate 内部（§8.2：不把 p2 具体类型泄漏到公开 API）。
 ///
-/// 集成阶段衔接点：runtime-wasm 的 Store 类型定型后，本句柄需要把内部
-/// WASI context 交由其持有并实现 wasmtime_wasi 的 `WasiView` binding trait；
-/// 由于 orphan rule，`WasiView` 的实现只能写在持有 Store 类型的 crate，
-/// 本 crate 提供 context 构建与（内部的）linker 组装（见 [`crate::linker`]
-/// 模块文档）。跨 crate 的公开暴露形态届时由主 agent 按
-/// runtime-wasm 的 Store 形状决定。
+/// 集成衔接点：runtime-wasm 的 Store 类型已定型（`StoreHostState` 的
+/// `WasiView` 接线 + [`WasiP2HostState::new`] 安装点，§8.2 受控 glue
+/// 例外），本句柄经 [`WasiContext::into_p2_inner`] 把内部 context 迁移给
+/// adapter 的 attach（[`crate::adapter`]）安装；linker 组装见
+/// [`crate::linker`]。
 pub struct WasiContext {
-    // 0.1.0 阶段该字段只被测试（及未来的集成接线）消费，lib 构建允许 dead_code
-    //（集成阶段 runtime-wasm 的 Store 定型后由公开访问路径替代，见模块文档）。
-    #[cfg_attr(not(test), allow(dead_code))]
     inner: wasmtime_wasi::WasiCtx,
 }
 
 impl WasiContext {
-    /// 供本 crate 内部（及 linker 组装）访问 WASI 0.2 context。
-    #[cfg_attr(not(test), allow(dead_code))] // 同上：0.1.0 集成接线点
+    /// 供本 crate 内部（及 linker 组装测试）访问 WASI 0.2 context。
+    #[cfg_attr(not(test), allow(dead_code))] // 仅测试（linker/context 断言）消费
     pub(crate) fn as_p2_mut(&mut self) -> &mut wasmtime_wasi::WasiCtx {
         &mut self.inner
+    }
+
+    /// 消费式取出内部 WASI 0.2 context（迁移所有权）。
+    ///
+    /// 用途：[`crate::adapter`] 的 attach 把构建好的 context 迁移给
+    /// runtime-wasm 的 [`WasiP2HostState::new`] 并经
+    /// `StoreHostState::set_wasi_state` 安装。这是本 crate 公开签名中
+    /// 唯一出现 `wasmtime_wasi` 具体类型的受控 glue 例外（与 runtime-wasm
+    /// 的 `WasiP2HostState::new` 同一 glue 例外族，0020e24 审计裁决：
+    /// §8.2 的 MUST NOT 列表不含被接线层之间的上下文迁移点）；消费式
+    /// 保证迁移后本句柄不可再用（§13.4 不合法状态不可表示）。
+    pub fn into_p2_inner(self) -> wasmtime_wasi::WasiCtx {
+        self.inner
     }
 }
 

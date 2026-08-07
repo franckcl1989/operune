@@ -1,21 +1,22 @@
-//! WASI 0.2 linker 组装（本 crate 内部；对外衔接在集成阶段）。
+//! WASI 0.2 linker 组装（§8.2 / §24.2：WASI 版本具体 linker/binding 只存在
+//! 于本 adapter crate）。
 //!
-//! 所有 `wasmtime_wasi::p2` 的 linker 相关绑定只存在于本 crate
-//! （§8.2 / §24.2："WASI 版本具体 linker/binding 只存在于明确的 adapter
-//! crate"）。
+//! 所有 `wasmtime_wasi::p2` 的 linker 相关绑定只存在于本 crate。
 //!
-//! # 为什么 0.1.0 不公开 linker 入口（集成阶段的衔接点）
+//! # 公开形态（集成接线点）
 //!
 //! wasmtime-wasi 36 的 `p2::add_to_linker_sync` 要求 Store 的宿主状态类型
 //! `T` 实现其 `WasiView` binding trait。由于 orphan rule，`WasiView` 的实现
-//! 只能写在**拥有 Store 类型**的 crate（runtime-wasm 或集成层），本 adapter
-//! crate 无法为外部 Store 类型提供该实现。
+//! 只能写在**拥有 Store 类型**的 crate（runtime-wasm，受控 glue 例外
+//! 0020e24 审计裁决，见 git 历史）。因此本 crate 的 linker 入口以泛型
+//! `T: wasmtime_wasi::WasiView` 公开：调用方（集成层 application）以
+//! `Linker<StoreHostState>` 调用——runtime-wasm 已为 `StoreHostState`
+//! 实现 `WasiView`（§8.2 的 MUST NOT 列表不含 runtime-wasm）。
 //!
-//! 因此 0.1.0 的公开 API 保持全项目类型（§8.2：不把 wasmtime_wasi 的 p2
-//! 具体类型泄漏到公开 API），此处提供被单元测试覆盖的组装函数作为接线点，
-//! 并在 [`crate::context::WasiContext`] 文档中记录衔接形状。待 runtime-wasm
-//! 的 Store 类型定型后，由主 agent 决定公开形态（可能涉及 ADR：§8.2 的
-//! "binding 只存在于 adapter" 与 orphan rule 的张力，详见 crate 根文档）。
+//! 分层说明：本签名把 wasmtime 的 `Linker<T>` 暴露为参数类型（wasmtime
+//! 类型本身不在 §8.2 禁止名单，[`domain`/`application` 的 Cargo.toml 依赖
+//! 面已含 wasmtime）；`wasmtime_wasi` 具体类型只出现在 trait bound 中，
+//! 由调用方的 Store 状态类型满足，调用方无需 import wasmtime_wasi。
 //!
 //! # p3 隔离（§4.2 / §8.4）
 //!
@@ -32,8 +33,9 @@ use crate::error::WasiP2Error;
 /// 不建立平行接口），错误映射为本 crate 的 typed error（§14.1）。
 ///
 /// `T` 是 Store 的宿主状态类型，必须实现 `wasmtime_wasi::WasiView`
-///（见模块文档的 orphan rule 说明）。context 由 [`crate::context::WasiContext`]
-/// 持有。
+///（见模块文档的 orphan rule 说明：runtime-wasm 的 `StoreHostState` 已
+/// 实现）。context 由 [`crate::context::WasiContext`] 持有，能力经
+/// [`crate::adapter`] 的 attach 安装。
 ///
 /// 说明：该函数组装的是标准 `wasi:cli/imports` 全集（含 `wasi:random/*`
 /// 与 `wasi:sockets/*`）；"无 ambient authority"（§7.6）由
@@ -44,10 +46,7 @@ use crate::error::WasiP2Error;
 ///
 /// - `WasiP2Error::LinkerAssembly`：linker 定义冲突（如未开启 shadowing 时
 ///   重复组装同名实例）。
-#[cfg_attr(not(test), allow(dead_code))] // 0.1.0 集成接线点：等 runtime-wasm Store 类型定型（见模块文档）
-pub(crate) fn add_to_linker<T>(
-    linker: &mut wasmtime::component::Linker<T>,
-) -> Result<(), WasiP2Error>
+pub fn add_to_linker<T>(linker: &mut wasmtime::component::Linker<T>) -> Result<(), WasiP2Error>
 where
     T: wasmtime_wasi::WasiView,
 {
