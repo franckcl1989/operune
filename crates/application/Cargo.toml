@@ -6,6 +6,40 @@ rust-version.workspace = true
 description = "Operune application layer: use-case orchestration and ports (spec 24.2)"
 
 [dependencies]
+# §24.3 依赖方向：adapters ---> application ---> domain。
+# application 不得知道 SQLite / Axum / WASI p2 具体类型（§24.2）；它依赖
+# domain（纯领域类型）与 workspace member runtime-wasm / runtime-wasi-p2
+# 的项目自有 typed API（§8.2 只禁止 wasmtime_wasi::p2/p3 具体类型与
+# SQLite/Axum 类型，不禁止这些 member crate 的 typed port 面）。
+operune-domain = { path = "../domain" }
+operune-runtime-wasm = { path = "../runtime-wasm" }
+operune-runtime-wasi-p2 = { path = "../runtime-wasi-p2" }
+
+# §22.2 Wasmtime 36.x LTS（同一 release line）。
+# 最小 production feature 集（§22.2）：component-model（Component API 与
+# bindgen! 宏）、runtime（Store/Instance/Func/Val 执行类型）、std。
+# 不启用 cranelift / async / wat：Engine 由 runtime-wasm 创建（其已启用
+# cranelift + parallel-compilation），本 crate 只做 Host binding 集成；
+# cranelift/wat 仅出现在 dev-dependencies（测试需要本地 Engine 与文本格式）。
+wasmtime = { workspace = true, default-features = false, features = [
+    "component-model",
+    "runtime",
+    "std",
+] }
+
+# §22.5 / §14.1：typed error 契约。
+thiserror = { workspace = true }
+# §22.4：用例级记录的内部持久/配置边界序列化（storage 适配层需要）。
+serde = { workspace = true, features = ["derive"] }
+# §15.5 / §20.3：read-mostly 不可变 Active 快照 + 原子切换（arc-swap）。
+arc-swap = { workspace = true }
+
+[dev-dependencies]
+# §22.8 test/dev-only：真实 wasmtime 集成测试需要本地 JIT 后端（cranelift）
+# 与 wat 文本格式解析（构造最小 Component fixture）。
+wasmtime = { workspace = true, features = ["cranelift", "wat"] }
+# §22.4：audit 事件序列化的测试断言（§16.6 不记 secret 的证明）。
+serde_json = { workspace = true }
 
 [lints]
 workspace = true
