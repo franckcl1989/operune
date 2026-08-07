@@ -5,7 +5,14 @@ edition.workspace = true
 rust-version.workspace = true
 description = "Operune cross-platform ports and value definitions, no OS specifics (spec 24.2)"
 
+# §24.2 platform：跨平台 port/value definitions，不含 OS 具体实现。
+# §23.2：版本一律从 workspace.dependencies 取值（§22.5）。
+# - operune-domain：ArtifactPath（§13.1/§18.7 制品相对路径），用于 data root
+#   下的相对路径解析；
+# - thiserror：封闭 typed error（§14.1）。
 [dependencies]
+operune-domain = { path = "../domain" }
+thiserror = { workspace = true }
 
 [lints]
 workspace = true

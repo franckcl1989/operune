@@ -5,7 +5,23 @@ edition.workspace = true
 rust-version.workspace = true
 description = "Operune core tracing/metrics/audit plumbing (spec 24.2)"
 
+# §24.2 observability：Core 自身 tracing/metrics/audit plumbing（§5.1）。
+# §23.2：版本一律从 workspace.dependencies 取值（§22.7/§22.4/§22.5）。
+# - tracing / tracing-subscriber（§22.7）：tracing-subscriber 启用 json feature
+#   提供结构化事件输出（每行 JSON）；过滤器为确定性 typed 配置，不读取环境变量。
+# - serde / serde_json（§22.4）：审计事件序列化边界（§16.6：不序列化 secret）。
+# - time（§22.5）：OffsetDateTime 审计时间戳；serde feature 提供 RFC3339 序列化。
+# - thiserror（§22.5）：封闭 typed error（§14.1）。
+# 不引入外部 metrics crate（YAGNI §12.6；0.1.0 最小 typed 计数器/直方图自实现）。
+# 不引入 tokio：审计 port 为同步形状，异步持久化由 storage-sqlite/server 装配
+# （§24.3 依赖方向）。
 [dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+time = { workspace = true, features = ["serde"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["json"] }
 
 [lints]
 workspace = true

@@ -5,7 +5,13 @@ edition.workspace = true
 rust-version.workspace = true
 description = "Operune Windows OS-specific adapter (spec 24.2)"
 
+# §24.2 platform-windows：唯一允许承载 Windows 特定 cfg 与 safe wrapper
+# integration 的地方（§9.4）。
+# 0.1.0 实现 §18.0 冻结的 Windows 默认数据路径解析：`%LOCALAPPDATA%\operune`
+# （实现本身为纯 Safe Rust 跨平台代码：std 环境读取 + 路径校验，无需 cfg）。
+# 错误类型复用 platform crate 的 port 错误（§14.1），不新增依赖。
 [dependencies]
+operune-platform = { path = "../platform" }
 
 [lints]
 workspace = true
