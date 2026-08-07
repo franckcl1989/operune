@@ -83,6 +83,41 @@
 //!   （route-id / page-id 重复、路径冲突、非法路径模板、参数不一致、非法
 //!   权限引用、非法默认页）。
 //!
+//! # 0.5.0 公开面（§43 Security & Governance 中的 domain 部分）
+//!
+//! 契约语义与 §43 对齐（无独立 WIT 契约——平台级 RBAC / 策略 / 配额 /
+//! 审计是 Core 内部治理面，§5.1；对外暴露经 Root Admin Web 与
+//! `operune:web` 权限声明，§42）：
+//! - RBAC（§43.2 complete RBAC roles/groups；§5.1 平台级 RBAC 是 Core
+//!   责任）：[`RoleId`] / [`RoleName`] / [`Role`]（id + 展示名 + 权限
+//!   集合）、[`GroupId`] / [`Group`]（用户集合 + 角色引用集合）、
+//!   [`UserId`]、[`PermissionGrant`]（资源 + 动作 + scope，§17.3 资源级
+//!   scope 非 boolean）、[`PermissionAction`]（§43.2 fine-grained Component
+//!   administration permissions 闭集）、[`PermissionResource`]；
+//!   Root Admin/Operator separation（§43.2）：[`Role::root_admin`]（全量
+//!   权限，不可移除/降权）与 [`Role::operator`]（非破坏性默认权限集），
+//!   id 常量 [`ROOT_ADMIN_ROLE_ID`] / [`OPERATOR_ROLE_ID`]；
+//! - Scoped capability policies（§43.2 / §17.3）：[`PolicyScope`]
+//!   （17.3 六维 scope 闭集 + All）、[`CapabilityPolicy`]（CapabilityId +
+//!   允许 scope 集合）、[`PolicyVersion`] / [`PolicySnapshot`]（§43.2
+//!   policy snapshot/versioning：u64 单调版本、不可变快照、`new_after`
+//!   单调性由构造保证）；
+//! - Resource quota hierarchy（§43.2 / §7.4）：[`QuotaHierarchy`]
+//!   （Global → Group → Installation 层级树，构造校验形状与 id 唯一性）、
+//!   [`QuotaNode`] / [`QuotaBudget`]（§7.4 七维预算，`None` = 该层不约束）、
+//!   [`EffectiveQuota`]（层级求值结果：最严格生效 + 每维绑定层，
+//!   见 `quota.rs` 模块文档裁决）、[`QuotaLevel`] / [`QuotaCount`] /
+//!   [`BudgetDimension`]；
+//! - Permission change impact analysis（§43.2）：[`PolicyChange`]
+//!   （add/modify/remove 策略条目，modify 带前后对比）、[`PolicyDiff`]
+//!   （两版本快照的确定性 diff）、[`ImpactAnalysis`]（受影响
+//!   InstallationId / 用户 / 组集合，application 层生成可解释报告）；
+//! - 可审计 policy chain（§43.3 验收 / §17.5 四层授权链）：
+//!   [`PolicyChainLayer`]（contract-need → resolution → grant →
+//!   invocation-enforcement）、[`PolicyChainEntry`]（层 + 授权/拒绝依据
+//!   摘要）、[`PolicyDecision`]、[`PolicyChain`]（四层良构链，结论由条目
+//!   派生，`explain()` 输出可读摘要——"管理员能解释为什么"的领域基础）。
+//!
 //! # 0.2.0 公开面（§40 Capability Composition 中的 domain 部分）
 //!
 //! - Capability Provider identity（§40.2）：[`ProviderId`]——"提供某能力的
@@ -116,16 +151,21 @@
 mod test_support;
 
 mod bytes;
+mod chain;
 mod config;
 mod digest;
 mod error;
 mod event;
 mod graph;
 mod id;
+mod impact;
 mod interface;
 mod lifecycle;
 mod path;
+mod policy;
 mod provider;
+mod quota;
+mod rbac;
 mod scheduler;
 mod secret;
 mod size;
@@ -135,6 +175,7 @@ mod upgrade;
 mod version;
 mod web;
 
+pub use chain::{PolicyChain, PolicyChainEntry, PolicyChainLayer, PolicyDecision};
 pub use config::{ConfigFormat, ConfigRevision, ConfigSchemaVersion, ConfigSnapshot, ConfigValue};
 pub use digest::ContentDigest;
 pub use error::{DomainError, ValueKind};
@@ -144,12 +185,24 @@ pub use graph::{
     ProviderRecord, ResolvedEdge,
 };
 pub use id::{CapabilityId, ComponentId, InstallationId};
+pub use impact::{ImpactAnalysis, PolicyChange, PolicyDiff};
 pub use interface::{
     InterfaceId, InterfaceName, InterfaceRequirement, PackageName, interface_compatible,
 };
 pub use lifecycle::{ComponentLifecycleEvent, ComponentLifecycleState};
 pub use path::ArtifactPath;
+pub use policy::{
+    CapabilityPolicy, FileSystemPath, HostName, NetworkScheme, PolicyScope, PolicySnapshot,
+    PolicyVersion,
+};
 pub use provider::ProviderId;
+pub use quota::{
+    BudgetDimension, EffectiveQuota, QuotaBudget, QuotaCount, QuotaHierarchy, QuotaLevel, QuotaNode,
+};
+pub use rbac::{
+    Group, GroupId, OPERATOR_ROLE_ID, PermissionAction, PermissionGrant, PermissionResource,
+    ROOT_ADMIN_ROLE_ID, Role, RoleId, RoleName, UserId,
+};
 pub use scheduler::{ScheduleTrigger, ScheduledTaskId, TaskState, TaskStatus, TriggerPayload};
 pub use secret::{SecretMetadata, SecretName, SecretVersion};
 pub use size::ByteSize;

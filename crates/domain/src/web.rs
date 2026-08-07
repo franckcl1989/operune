@@ -1667,14 +1667,15 @@ impl WebDeclarationError {
 // 共用校验
 // ---------------------------------------------------------------------------
 
-/// 挂载命名空间路径共用的结构性校验（[`PagePath`] / [`AssetPath`]）：
+/// 挂载命名空间路径共用的结构性校验（[`PagePath`] / [`AssetPath`] / 0.5.0
+/// [`FileSystemPath`](crate::FileSystemPath)）：
 /// 非空、以 "/" 开头、已规范化（无空段 / "." / ".." 段；拒绝而不是归一化
 /// 输入，fail closed，§32）、无反斜杠 / 控制字符、长度 ≤ `MAX_PATH_LEN`
 /// 字节。
 ///
 /// `forbid_templates` 为 true 时额外拒绝任何含 '{' / '}' 的段（页面路径是
 /// 静态路径，无模板段）。
-fn validate_mount_path(
+pub(crate) fn validate_mount_path(
     value: &str,
     forbid_templates: bool,
     kind: ValueKind,

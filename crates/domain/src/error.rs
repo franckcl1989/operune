@@ -120,6 +120,51 @@ pub enum ValueKind {
     TypedParam,
     /// [`PermissionName`](crate::PermissionName)（0.4.0 web application runtime，§42.2）。
     PermissionName,
+    /// [`RoleId`](crate::RoleId)（0.5.0 RBAC，§43.2）。
+    RoleId,
+    /// [`RoleName`](crate::RoleName)（0.5.0 RBAC，§43.2）。
+    RoleName,
+    /// [`GroupId`](crate::GroupId)（0.5.0 RBAC，§43.2）。
+    GroupId,
+    /// [`UserId`](crate::UserId) 字符串解析（0.5.0 RBAC，§43.2）。
+    UserId,
+    /// [`PermissionAction`](crate::PermissionAction) 字符串解析（0.5.0 RBAC，§43.2）。
+    PermissionAction,
+    /// [`Role`](crate::Role) 权限集合校验（0.5.0 RBAC，§43.2）。
+    Role,
+    /// [`NetworkScheme`](crate::NetworkScheme) 字符串解析（0.5.0 scoped
+    /// capability policies，§43.2 / §17.3）。
+    NetworkScheme,
+    /// [`HostName`](crate::HostName)（0.5.0 scoped capability policies，§43.2）。
+    HostName,
+    /// [`FileSystemPath`](crate::FileSystemPath)（0.5.0 scoped capability
+    /// policies，§43.2）。
+    FileSystemPath,
+    /// [`PolicySnapshot`](crate::PolicySnapshot) 组装校验（0.5.0 policy
+    /// snapshot/versioning，§43.2）。
+    PolicySnapshot,
+    /// [`PolicyDiff`](crate::PolicyDiff)（0.5.0 permission change impact
+    /// analysis，§43.2）。
+    PolicyDiff,
+    /// [`PolicyChain`](crate::PolicyChain)（0.5.0 可审计 policy chain，§43.3）。
+    PolicyChain,
+    /// [`PolicyChainLayer`](crate::PolicyChainLayer) 字符串解析（0.5.0
+    /// policy chain，§43.3 / §17.5）。
+    PolicyChainLayer,
+    /// [`PolicyDecision`](crate::PolicyDecision) 字符串解析（0.5.0 policy
+    /// chain，§43.3）。
+    PolicyDecision,
+    /// [`QuotaHierarchy`](crate::QuotaHierarchy) 层级形状 / id 唯一性校验
+    /// （0.5.0 resource quota hierarchy，§43.2）。
+    QuotaHierarchy,
+    /// [`QuotaBudget`](crate::QuotaBudget)（0.5.0 quota hierarchy，§43.2；
+    /// 全局层必须全量预算）。
+    QuotaBudget,
+    /// [`QuotaLevel`](crate::QuotaLevel) 字符串解析（0.5.0 quota hierarchy，§43.2）。
+    QuotaLevel,
+    /// [`BudgetDimension`](crate::BudgetDimension) 字符串解析（0.5.0 quota
+    /// hierarchy，§43.2）。
+    BudgetDimension,
 }
 
 impl fmt::Display for ValueKind {
@@ -160,6 +205,24 @@ impl fmt::Display for ValueKind {
             Self::ParamValue => "param-value",
             Self::TypedParam => "typed-param",
             Self::PermissionName => "permission-name",
+            Self::RoleId => "role-id",
+            Self::RoleName => "role-name",
+            Self::GroupId => "group-id",
+            Self::UserId => "user-id",
+            Self::PermissionAction => "permission-action",
+            Self::Role => "role",
+            Self::NetworkScheme => "network-scheme",
+            Self::HostName => "host-name",
+            Self::FileSystemPath => "filesystem-path",
+            Self::PolicySnapshot => "policy-snapshot",
+            Self::PolicyDiff => "policy-diff",
+            Self::PolicyChain => "policy-chain",
+            Self::PolicyChainLayer => "policy-chain-layer",
+            Self::PolicyDecision => "policy-decision",
+            Self::QuotaHierarchy => "quota-hierarchy",
+            Self::QuotaBudget => "quota-budget",
+            Self::QuotaLevel => "quota-level",
+            Self::BudgetDimension => "budget-dimension",
         };
         f.write_str(s)
     }
