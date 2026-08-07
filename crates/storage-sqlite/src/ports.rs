@@ -972,6 +972,42 @@ fn to_storage_audit(event: &AuditEvent) -> Result<crate::model::AuditEvent, Audi
             AuditOutcome::Success,
             Some(format!("from {from} to {to}")),
         ),
+        // 0.2.0 provider graph（§40.2 / §40.4）：沿用 ComponentLifecycle 类别
+        //（graph 门控属于安装 / 激活 / 升级编排）；action 前缀 graph- 区分。
+        AuditEvent::ProviderGraphRejected {
+            installation,
+            reason,
+        } => (
+            AuditCategory::ComponentLifecycle,
+            "provider-graph-rejected",
+            Some(installation.to_string()),
+            AuditOutcome::Failure,
+            Some((*reason).to_owned()),
+        ),
+        AuditEvent::GraphRecordsCommitted { installation } => (
+            AuditCategory::ComponentLifecycle,
+            "graph-records-committed",
+            Some(installation.to_string()),
+            AuditOutcome::Success,
+            None,
+        ),
+        AuditEvent::GraphRecordsRemoved { installation } => (
+            AuditCategory::ComponentLifecycle,
+            "graph-records-removed",
+            Some(installation.to_string()),
+            AuditOutcome::Success,
+            None,
+        ),
+        AuditEvent::GraphPolicyUpdated {
+            bindings,
+            exclusions,
+        } => (
+            AuditCategory::ComponentLifecycle,
+            "graph-policy-updated",
+            None,
+            AuditOutcome::Success,
+            Some(format!("{bindings} bindings, {exclusions} exclusions")),
+        ),
     };
     crate::model::AuditEvent::new(
         AuditActor::System,
