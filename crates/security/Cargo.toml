@@ -5,7 +5,27 @@ edition.workspace = true
 rust-version.workspace = true
 description = "Operune security: password/session/CSRF/grant policy/secret handling (spec 24.2)"
 
+# §22.6 Security 基线。版本一律从 workspace.dependencies 取值（§23.2），禁止字面量。
+# feature 规则（§22.6 / §22.0「生产 feature set 由 0.1 implementation PR 固化」）：
+# - argon2：default-features = false + ["std"]；"std" 隐含 alloc 与 password-hash，
+#   不启用默认的 "rand"（盐由 getrandom 生成）。
+# - base64：§22.6 强制 default-features = false，只启用所需 "std"，
+#   绝不启用默认 "simd-unsafe"（本路径为低吞吐安全路径）。
+# - rustls：default-features = false + ["std"]；本 crate 只用 pki-types 类型族
+#   （CertificateDer / PrivateKeyDer），不引入 crypto provider（aws-lc-rs/ring）
+#   —— ServerConfig 装配与 provider 选择是 web-admin 的职责（§16.2 边界）。
 [dependencies]
+argon2 = { workspace = true, default-features = false, features = ["std"] }
+base64 = { workspace = true, default-features = false, features = ["std"] }
+cookie = { workspace = true }
+getrandom = { workspace = true }
+rustls = { workspace = true, default-features = false, features = ["std"] }
+secrecy = { workspace = true }
+sha2 = { workspace = true }
+subtle = { workspace = true }
+thiserror = { workspace = true }
+time = { workspace = true }
+zeroize = { workspace = true }
 
 [lints]
 workspace = true
