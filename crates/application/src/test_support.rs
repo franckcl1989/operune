@@ -839,6 +839,10 @@ pub(crate) struct FakeActive {
 }
 
 impl ActiveRuntime for FakeActive {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn check_readiness(&self) -> Result<(), RuntimeExecutionError> {
         let state = self
             .state

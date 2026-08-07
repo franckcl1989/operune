@@ -466,6 +466,25 @@ impl StateService {
         }
     }
 
+    /// 运行时接线层的 schema 版本绑定解析（§41.2 / state.wit：运行时操作
+    /// 绑定"当前声明的 schema version"）。
+    ///
+    /// 0.3.0 接线层尚未读取 guest 的 `declaration` 导出（
+    /// `get-state-declaration` 的接线在 migration 里程碑），本方法以 store
+    /// 当前 schema version 为绑定（fresh store 绑定 0）——写入侧的版本一致
+    /// 性仍由存储层强制（§41.3），契约的 `unsupported-schema-version` 门控
+    /// 在 declaration 接线后精确化。crate 内部（runtime 接线层专用）。
+    pub(crate) fn schema_binding_version(
+        &self,
+        installation: InstallationId,
+    ) -> Result<StateSchemaVersion, StateError> {
+        match self.store.schema_version(installation) {
+            Ok(Some(version)) => Ok(version),
+            Ok(None) => Ok(StateSchemaVersion::from_u32(0)),
+            Err(error) => Err(map_store_error(error)),
+        }
+    }
+
     /// 版本绑定检查（WIT 明文）：migration 窗口 → not-ready；存储版本
     /// ≠ 声明版本 → unsupported-schema-version（空 store 由首次写入建立
     /// 版本，不拦截）。

@@ -54,6 +54,10 @@
 //!   `ComponentLifecycleState` 衔接，§20.4 有界 drain + CancellationToken）。
 //! - [`cancel`]：最小第一方 CancellationToken（§15.3 structured
 //!   cancellation；与 server crate 同模式）。
+//! - [`stateful_imports`]：0.3.0 operune:state/config/secret 三包
+//!   Component import 的宿主注册（`StatefulHostServices` + Linker 动态
+//!   注册，§41.2）；`runtime` 的 [`SchedulerRuntimeDelivery`] /
+//!   [`EventRuntimeDelivery`] 是 scheduler/event 交付 port 的生产接线。
 //!
 //! # 时序契约（Wasm 执行，§7.5 / §19.3）
 //!
@@ -86,6 +90,7 @@ pub mod runtime;
 pub mod scheduler;
 pub mod secret;
 pub mod state;
+pub mod stateful_imports;
 pub mod upgrade;
 pub mod web;
 pub mod wit_bindings;
@@ -121,10 +126,12 @@ pub use ports::{
     StateStorePort, StatefulAuditEvent, StatefulAuditPort,
 };
 pub use runtime::{
-    ActiveRuntime, CompiledWasm, PreparedRuntime, RuntimePlan, WasmRuntime, WasmtimeRuntime,
+    ActiveRuntime, CompiledWasm, EventRuntimeDelivery, PreparedRuntime, RuntimePlan,
+    SchedulerRuntimeDelivery, WasmRuntime, WasmtimeRuntime,
 };
 pub use scheduler::{SchedulerError, SchedulerLimits, SchedulerService};
 pub use secret::{SecretError, SecretService};
 pub use state::{CasOutcome, MigrationGate, StateError, StateService};
+pub use stateful_imports::StatefulHostServices;
 pub use upgrade::UpgradeService;
 pub use web::{AssetCache, AssetResponse, WebBridge};

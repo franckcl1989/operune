@@ -35,6 +35,21 @@
 //!   [`operune_runtime_wasi_p2::linker::add_to_linker`]（标准
 //!   `wasi:cli/imports` 接口，P4：不建立平行接口）。
 //!
+//! # 0.3.0 Stateful Runtime 接线（§41.2）
+//!
+//! - **scheduler/event 交付**（本模块）：[`SchedulerRuntimeDelivery`] /
+//!   [`EventRuntimeDelivery`] 把运行中的 candidate（[`ActiveRuntime`]）绑定
+//!   为 [`crate::ports::SchedulerDeliveryPort`] / [`crate::ports::EventDeliveryPort`]
+//!   ——fire/投递时经 Instance Set 有界 lease（§7.3/§7.4）调用 guest 导出的
+//!   `operune:scheduler/handler.on-trigger` / `operune:event/handler.on-event`
+//!   （动态 `Func::call`，载荷按 handler.wit record 逐字段编码；trap/失败 =
+//!   已消费，at-most-once，错误只用于宿主侧观测）；
+//! - **state/config/secret import**（[`crate::stateful_imports`]）：Core 提供
+//!   的宿主实现经 `LinkerInstance::func_new` 动态注册（bindgen 全量生成被
+//!   §25 裁决一阻挡），接入 [`StatefulHostServices`]（StateService /
+//!   ConfigService / SecretService；composition root 注入，未注入时带此类
+//!   import 的组件以确定性 link 错误失败，deny-by-default §19.5）。
+//!
 //! # Safe Rust（§11）
 //!
 //! 全部调用为 Safe Wasmtime API（`Linker` / `Instance::get_export_index` /
@@ -46,7 +61,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use operune_domain::InstallationId;
+use operune_domain::{EventPayload, InstallationId, TriggerPayload};
 use operune_runtime_wasi_p2::adapter::WasiContextAdapter;
 use operune_runtime_wasi_p2::linker::add_to_linker;
 use operune_runtime_wasm::{
@@ -62,11 +77,16 @@ use crate::contract::{
     parse_web_descriptor_val,
 };
 use crate::error::{ErrorSource, RuntimeExecutionError};
+use crate::event::DeliveredEvent;
 use crate::model::{
     ContractSurface, GrantSnapshot, RuntimeConfig, WebAssetEntry, WebAssetPath, WebManifestData,
     WebManifestFeatures,
 };
-use crate::ports::ConfigPort;
+use crate::ports::{
+    ConfigPort, EventDeliveryError, EventDeliveryPort, SchedulerDeliveryError,
+    SchedulerDeliveryPort,
+};
+use crate::stateful_imports::StatefulHostServices;
 
 /// 已编译的 Component（§7.2）的 opaque 句柄（编排层不接触 wasmtime 类型）。
 pub trait CompiledWasm: Send + Sync {
@@ -90,6 +110,11 @@ pub trait PreparedRuntime: Send + Sync {
 /// 运行中的 runtime candidate / active 版本（§7.3 有界 Instance Set）的
 /// opaque 句柄。
 pub trait ActiveRuntime: Send + Sync {
+    /// 生产实现内部访问（`WasmtimeRuntime` 专用；与 [`CompiledWasm`] /
+    /// [`PreparedRuntime`] 同模式，§24.2 受控泄漏——跨 trait 对象 downcast
+    /// 由生产实现的接线面使用）。
+    fn as_any(&self) -> &dyn std::any::Any;
+
     /// readiness / health 验证（§19.3：在真实 grant/resource 环境执行；
     /// 0.1.0 stateless contract——readiness 由实例化完整性 + web manifest
     /// 校验覆盖，本调用验证 Instance Set 可调度；0.3 起扩展为真实健康检查）。
@@ -163,6 +188,10 @@ pub trait WasmRuntime: Send + Sync {
 pub struct WasmtimeRuntime {
     engine: Arc<EngineHandle>,
     config: Arc<dyn ConfigPort>,
+    /// 0.3.0（§41.2）：stateful 宿主服务（operune:state/config/secret 三包
+    /// import 的宿主实现；`None` = 不注册任何 operune import——带此类
+    /// import 的组件以确定性 link 错误失败，deny-by-default §19.5）。
+    stateful: Option<Arc<StatefulHostServices>>,
 }
 
 /// 生产实现的已编译组件（包装 runtime-wasm 的 [`ComponentHandle`]）。
@@ -218,6 +247,12 @@ struct SlotBindings {
     web_descriptor: Option<Func>,
     assets: Option<Func>,
     actions: Option<Func>,
+    /// 0.3.0（§41.2）：scheduler handler 导出（`operune:scheduler/handler`
+    /// 的 `on-trigger`，guest export——Core 在 fire 时刻同步调用）。
+    scheduler_handler: Option<Func>,
+    /// 0.3.0（§41.2）：event handler 导出（`operune:event/handler` 的
+    /// `on-event`，guest export——Core 在投递时刻同步调用）。
+    event_handler: Option<Func>,
 }
 
 /// in-flight 调用计数守卫（drain 等待的观测点，§20.4）。
@@ -235,7 +270,22 @@ impl WasmtimeRuntime {
     /// 构造（注入共享 Engine 与 config 快照来源；Engine 由 composition
     /// root 创建一次，§7.1）。
     pub fn new(engine: Arc<EngineHandle>, config: Arc<dyn ConfigPort>) -> Self {
-        Self { engine, config }
+        Self {
+            engine,
+            config,
+            stateful: None,
+        }
+    }
+
+    /// 0.3.0：附加 stateful 宿主服务（§41.2）——operune:state/config/secret
+    /// 三包 Component import 的宿主实现（StateService / ConfigService /
+    /// SecretService，[`StatefulHostServices`]；§24.2 composition root
+    /// 注入）。未附加时（默认）本 runtime 不注册任何 operune import——
+    /// 带此类 import 的组件以确定性 link 错误失败（deny-by-default，
+    /// §17.2/§19.5）。
+    pub fn with_stateful_services(mut self, services: Arc<StatefulHostServices>) -> Self {
+        self.stateful = Some(services);
+        self
     }
 
     /// 生产实现的内部组件访问（跨 trait 对象 downcast，类型不符 = 内部
@@ -438,6 +488,17 @@ impl WasmRuntime for WasmtimeRuntime {
                 })
             })?;
         }
+        // 0.3.0（§41.2）：operune:state/config/secret 三包 import 的宿主
+        // 注册——composition root 注入 services 时注册（关闭期按安装实例
+        // 绑定）；未注入 = deny-by-default：带此类 import 的组件以确定性
+        // link 错误失败（§19.5）。
+        if let Some(stateful) = &self.stateful {
+            crate::stateful_imports::register_stateful_imports(
+                &mut linker,
+                stateful,
+                plan.installation,
+            )?;
+        }
         let pre = linker
             .instantiate_pre(real.inner.component())
             .map_err(|error| {
@@ -500,6 +561,22 @@ impl WasmRuntime for WasmtimeRuntime {
                     Self::optional_interface_func(store, &instance, &["assets"], "list-assets")?;
                 let actions =
                     Self::optional_interface_func(store, &instance, &["actions"], "handle-action")?;
+                // 0.3.0（§41.2）：scheduler/event handler 导出（可选接口——
+                // 无 handler 导出的组件在交付时以观测错误表达，不阻碍激活）。
+                // 接口名接受两种 world 写法（§6.7 实例名不是身份事实源）：
+                // 短名 "handler" 与完整 WIT 名（同 descriptor 查找惯例）。
+                let scheduler_handler = Self::optional_interface_func(
+                    store,
+                    &instance,
+                    &["handler", "operune:scheduler/handler@0.1.0"],
+                    "on-trigger",
+                )?;
+                let event_handler = Self::optional_interface_func(
+                    store,
+                    &instance,
+                    &["handler", "operune:event/handler@0.1.0"],
+                    "on-event",
+                )?;
                 let binding = bindings
                     .get_mut(slot)
                     .ok_or(RuntimeExecutionError::Internal("invalid instance slot"))?;
@@ -509,6 +586,8 @@ impl WasmRuntime for WasmtimeRuntime {
                     web_descriptor,
                     assets,
                     actions,
+                    scheduler_handler,
+                    event_handler,
                 });
                 Ok::<(), RuntimeExecutionError>(())
             })?;
@@ -565,7 +644,153 @@ impl WasmtimeActiveRuntime {
     }
 }
 
+/// 0.3.0（§41.2）——scheduler/event 交付的 guest handler 调用面。
+///
+/// Core-mediated push（handler.wit 明文）：调用返回即已消费，trap 也视为
+/// 已消费（不重投、不计入错过）；错误只用于宿主侧观测。调用时序遵循
+/// §7.5：deadline → begin_execution → `Func::call` → post_return →
+/// classify（错误映射）。
+impl WasmtimeActiveRuntime {
+    /// 调用 guest 的 `operune:scheduler/handler.on-trigger`（一次 fire 的
+    /// 交付；payload 按 handler.wit `trigger-payload` record 编码）。
+    fn invoke_scheduler_handler(
+        &self,
+        payload: TriggerPayload,
+    ) -> Result<(), SchedulerDeliveryError> {
+        let _guard = InFlightGuard {
+            counter: &self.in_flight,
+        };
+        self.with_lease(|slot, store| {
+            let bindings = self.slot_bindings(slot)?;
+            let Some(handler) = bindings.scheduler_handler else {
+                return Err(RuntimeExecutionError::MissingOperuneExport(
+                    "scheduler handler",
+                ));
+            };
+            let deadline = self.call_deadline().ok_or(RuntimeExecutionError::Internal(
+                "call deadline is required for scheduler delivery",
+            ))?;
+            prepare_store_call(store, deadline)?;
+            let param = build_trigger_payload_val(&payload);
+            let mut results: [Val; 0] = [];
+            handler
+                .call(store.store_mut(), &[param], &mut results)
+                .map_err(|error| {
+                    RuntimeExecutionError::from_classified(store, ErrorSource::from(error))
+                })?;
+            handler.post_return(store.store_mut()).map_err(|error| {
+                RuntimeExecutionError::from_classified(store, ErrorSource::from(error))
+            })?;
+            Ok(())
+        })
+        .map_err(map_scheduler_delivery_error)
+    }
+
+    /// 调用 guest 的 `operune:event/handler.on-event`（一次事件的投递；
+    /// payload 按 handler.wit `event` record 编码，dropped 计数透传）。
+    fn invoke_event_handler(&self, event: DeliveredEvent) -> Result<(), EventDeliveryError> {
+        let _guard = InFlightGuard {
+            counter: &self.in_flight,
+        };
+        self.with_lease(|slot, store| {
+            let bindings = self.slot_bindings(slot)?;
+            let Some(handler) = bindings.event_handler else {
+                return Err(RuntimeExecutionError::MissingOperuneExport("event handler"));
+            };
+            let deadline = self.call_deadline().ok_or(RuntimeExecutionError::Internal(
+                "call deadline is required for event delivery",
+            ))?;
+            prepare_store_call(store, deadline)?;
+            let param = build_event_val(&event);
+            let mut results: [Val; 0] = [];
+            handler
+                .call(store.store_mut(), &[param], &mut results)
+                .map_err(|error| {
+                    RuntimeExecutionError::from_classified(store, ErrorSource::from(error))
+                })?;
+            handler.post_return(store.store_mut()).map_err(|error| {
+                RuntimeExecutionError::from_classified(store, ErrorSource::from(error))
+            })?;
+            Ok(())
+        })
+        .map_err(map_event_delivery_error)
+    }
+}
+
+/// `SchedulerDeliveryPort` 的 wasmtime 生产接线（§41.2 Core-mediated push）：
+/// 把运行中的 runtime candidate（[`ActiveRuntime`]）绑定为 scheduler 交付
+/// port——fire 时经有界 Instance Set lease 调用 guest 的
+/// `operune:scheduler/handler.on-trigger`（§24.2 composition root 注入
+/// [`crate::scheduler::SchedulerService`]）。
+///
+/// 安装实例绑定：适配器绑定创建时传入的 ActiveRuntime——端口签名不带
+/// 安装实例（已提交稳定，scheduler.wit 交付对象是安装实例），接线方按
+/// "每安装实例一个适配器"装配（0.3.0 composition 接线面）。
+pub struct SchedulerRuntimeDelivery {
+    active: Arc<dyn ActiveRuntime>,
+}
+
+impl SchedulerRuntimeDelivery {
+    /// 绑定运行中的 candidate。须为 [`WasmtimeRuntime`] 实例化的 runtime
+    /// （绑定类型不符 = 内部接线错误，fail-fast，§14.3）。
+    pub fn new(active: Arc<dyn ActiveRuntime>) -> Result<Self, RuntimeExecutionError> {
+        Self::real_active(active.as_ref())?;
+        Ok(Self { active })
+    }
+
+    /// 跨 trait 对象 downcast（`as_any` 模式，同 [`Self::new`] 的文档）。
+    fn real_active(
+        active: &dyn ActiveRuntime,
+    ) -> Result<&WasmtimeActiveRuntime, RuntimeExecutionError> {
+        active
+            .as_any()
+            .downcast_ref::<WasmtimeActiveRuntime>()
+            .ok_or(RuntimeExecutionError::Internal(
+                "active runtime is not a WasmtimeActiveRuntime",
+            ))
+    }
+}
+
+impl SchedulerDeliveryPort for SchedulerRuntimeDelivery {
+    fn on_trigger(&self, payload: TriggerPayload) -> Result<(), SchedulerDeliveryError> {
+        let real = Self::real_active(self.active.as_ref()).map_err(map_scheduler_delivery_error)?;
+        real.invoke_scheduler_handler(payload)
+    }
+}
+
+/// `EventDeliveryPort` 的 wasmtime 生产接线（§41.2 Core-mediated push）：
+/// 把运行中的 runtime candidate（[`ActiveRuntime`]）绑定为 event 交付
+/// port——投递时经有界 Instance Set lease 调用 guest 的
+/// `operune:event/handler.on-event`（§24.2 composition root 注入
+/// [`crate::event::EventService`]）。
+///
+/// 安装实例绑定：同 [`SchedulerRuntimeDelivery`]（端口签名不带安装实例，
+/// 接线方按每安装实例一个适配器装配）。
+pub struct EventRuntimeDelivery {
+    active: Arc<dyn ActiveRuntime>,
+}
+
+impl EventRuntimeDelivery {
+    /// 绑定运行中的 candidate（类型不符 = 内部接线错误，fail-fast，§14.3）。
+    pub fn new(active: Arc<dyn ActiveRuntime>) -> Result<Self, RuntimeExecutionError> {
+        SchedulerRuntimeDelivery::real_active(active.as_ref())?;
+        Ok(Self { active })
+    }
+}
+
+impl EventDeliveryPort for EventRuntimeDelivery {
+    fn on_event(&self, event: DeliveredEvent) -> Result<(), EventDeliveryError> {
+        let real = SchedulerRuntimeDelivery::real_active(self.active.as_ref())
+            .map_err(map_event_delivery_error)?;
+        real.invoke_event_handler(event)
+    }
+}
+
 impl ActiveRuntime for WasmtimeActiveRuntime {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn check_readiness(&self) -> Result<(), RuntimeExecutionError> {
         // 0.1.0 stateless contract：readiness = 实例化完整性 + web manifest
         // 校验（管线已执行）；此处验证 Instance Set 可调度（§7.3）。
@@ -907,21 +1132,128 @@ fn map_dispatch_error(error: operune_runtime_wasm::DispatchError) -> RuntimeExec
     }
 }
 
+// ---------------------------------------------------------------------------
+// 0.3.0（§41.2）——交付载荷的 Val 编码与交付错误映射
+// ---------------------------------------------------------------------------
+
+/// 把一次 fire 的交付载荷编成 guest 调用面的 `Val`（handler.wit
+/// `trigger-payload` record 对齐：task-id / sequence / scheduled-at /
+/// missed-fires；`scheduled-at` 按 WIT `datetime` 的 seconds/nanoseconds
+/// wire 形态编码，`UtcInstant::as_unix_parts` 即该逆操作）。
+fn build_trigger_payload_val(payload: &TriggerPayload) -> Val {
+    let (seconds, nanoseconds) = payload.scheduled_at().as_unix_parts();
+    Val::Record(vec![
+        (
+            "task-id".to_owned(),
+            Val::Record(vec![(
+                "value".to_owned(),
+                Val::U64(payload.task_id().as_u64()),
+            )]),
+        ),
+        ("sequence".to_owned(), Val::U64(payload.sequence())),
+        (
+            "scheduled-at".to_owned(),
+            Val::Record(vec![
+                ("seconds".to_owned(), Val::U64(seconds)),
+                ("nanoseconds".to_owned(), Val::U32(nanoseconds)),
+            ]),
+        ),
+        ("missed-fires".to_owned(), Val::U64(payload.missed_fires())),
+    ])
+}
+
+/// 把一次投递的事件编成 guest 调用面的 `Val`（handler.wit `event` record
+/// 对齐：id / topic / payload / dropped；`event-payload` 按 WIT variant
+/// 的 json/raw 两种形态编码）。
+fn build_event_val(event: &DeliveredEvent) -> Val {
+    let payload = match event.payload() {
+        EventPayload::Json(text) => Val::Variant(
+            "json".to_owned(),
+            Some(Box::new(Val::String(text.as_str().to_owned()))),
+        ),
+        EventPayload::Raw(bytes) => Val::Variant(
+            "raw".to_owned(),
+            Some(Box::new(u8_list_val(bytes.as_slice()))),
+        ),
+    };
+    Val::Record(vec![
+        (
+            "id".to_owned(),
+            Val::Record(vec![("value".to_owned(), Val::U64(event.id().as_u64()))]),
+        ),
+        (
+            "topic".to_owned(),
+            Val::Record(vec![(
+                "value".to_owned(),
+                Val::String(event.topic().as_str().to_owned()),
+            )]),
+        ),
+        ("payload".to_owned(), payload),
+        ("dropped".to_owned(), Val::U64(event.dropped())),
+    ])
+}
+
+/// `list<u8>` 的 Val 编码（WIT bytes 形态；交付载荷与 state/config/secret
+/// import 共用）。
+fn u8_list_val(bytes: &[u8]) -> Val {
+    Val::List(bytes.iter().map(|byte| Val::U8(*byte)).collect())
+}
+
+/// scheduler 交付错误的宿主侧映射（§14.1 封闭 typed）。trap/超时/超预算
+/// = 已消费（handler.wit）：调用方（服务层 consumer）不重试、不补投，
+/// 错误只用于宿主侧观测。
+fn map_scheduler_delivery_error(error: RuntimeExecutionError) -> SchedulerDeliveryError {
+    SchedulerDeliveryError::Guest(match error {
+        RuntimeExecutionError::DeadlineExceeded => "guest scheduler handler deadline exceeded",
+        RuntimeExecutionError::Busy => "instance set busy",
+        RuntimeExecutionError::MissingOperuneExport(_) => {
+            "component does not export the scheduler handler"
+        }
+        _ => "guest scheduler handler trap",
+    })
+}
+
+/// event 交付错误的宿主侧映射（同 scheduler；trap = 已消费，不重投）。
+fn map_event_delivery_error(error: RuntimeExecutionError) -> EventDeliveryError {
+    EventDeliveryError::Guest(match error {
+        RuntimeExecutionError::DeadlineExceeded => "guest event handler deadline exceeded",
+        RuntimeExecutionError::Busy => "instance set busy",
+        RuntimeExecutionError::MissingOperuneExport(_) => {
+            "component does not export the event handler"
+        }
+        _ => "guest event handler trap",
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{FakeConfig, ok, test_failure};
+    use crate::config::ConfigService;
+    use crate::secret::SecretService;
+    use crate::state::{CasOutcome, MigrationGate, StateService};
+    use crate::stateful_imports::StatefulHostServices;
+    use crate::test_support::{
+        FakeConfig, FakeConfigStore, FakeSecretGrants, FakeSecretStore, FakeStateStore,
+        FakeStatefulAudit, ok, test_failure,
+    };
+    use operune_domain::{
+        ConfigFormat, ConfigSchemaVersion, ConfigValue, EventId, EventTopic, ScheduledTaskId,
+        SecretName, StateKey, StateSchemaVersion, StateValue, UtcInstant,
+    };
     use operune_runtime_wasi_p2::capability::{EnvVarSpec, WasiCapabilities};
     use operune_runtime_wasm::{EngineConfig, EngineHandle};
+    use operune_security::secret::SecretBytes;
+    use operune_security::secret_store::{KEK_SIZE, SecretCipher};
 
-    /// 真实 wasmtime 测试环境：共享 Engine + 默认 config + WasmtimeRuntime。
-    fn real_runtime() -> Arc<WasmtimeRuntime> {
+    /// 真实 wasmtime 测试环境：共享 Engine + 默认 config + WasmtimeRuntime
+    ///（拥有形态；stateful 测试经 `with_stateful_services` 链式装配）。
+    fn real_runtime() -> WasmtimeRuntime {
         let engine = Arc::new(ok(
             EngineHandle::new(EngineConfig::default()),
             "engine creation",
         ));
         let config = Arc::new(FakeConfig::new(RuntimeConfig::default()));
-        Arc::new(WasmtimeRuntime::new(engine, config))
+        WasmtimeRuntime::new(engine, config)
     }
 
     /// 最小合法 Component（无 import、无 operune 导出）。
@@ -1217,5 +1549,671 @@ mod tests {
         );
         // drain（§20.4）：close + 释放。
         ok(Arc::clone(&active).drain(Duration::from_secs(1)), "drain");
+    }
+
+    // ------------------------------------------------------------------
+    // 0.3.0（§41.2）——scheduler/event 交付的 guest handler 调用面
+    // ------------------------------------------------------------------
+
+    /// 夹具：导出 `operune:scheduler/handler@0.1.0`（on-trigger，WIT
+    /// `trigger-payload` record 参数——全部数值形态；core 函数空实现——
+    /// 调用成功 + post_return 契约可观测）。
+    /// 夹具：导出 `operune:scheduler/handler@0.1.0`（on-trigger，WIT
+    /// `trigger-payload` record 参数——全部数值形态；core 函数空实现——
+    /// 调用成功 + post_return 契约可观测）。
+    ///
+    /// WAT 结构注（wasmparser 0.236.1 源码核实）：导出 func/instance 所
+    /// 引用的一切 record/enum 类型必须是**命名且导出**的类型（
+    /// `all_valtypes_named_in_*`，类型导出先于 func 导出）；`list<u8>` /
+    /// `option` 可匿名（其元素须已命名）。
+    fn scheduler_handler_component_wat() -> &'static str {
+        r#"(component
+            (core module $m
+                (func (export "on-trigger") (param i64 i64 i64 i32 i64))
+            )
+            (core instance $i (instantiate $m))
+            (type $task-id (record (field "value" u64)))
+            (type $scheduled-at (record (field "seconds" u64) (field "nanoseconds" u32)))
+            (type $trigger-payload (record
+                (field "task-id" $task-id)
+                (field "sequence" u64)
+                (field "scheduled-at" $scheduled-at)
+                (field "missed-fires" u64)))
+            (func $on-trigger (param "payload" $trigger-payload)
+                (canon lift (core func $i "on-trigger")))
+            (instance $handler
+                (export "task-id" (type $task-id))
+                (export "scheduled-at" (type $scheduled-at))
+                (export "trigger-payload" (type $trigger-payload))
+                (export "on-trigger" (func $on-trigger)))
+            (export "operune:scheduler/handler@0.1.0" (instance $handler))
+        )"#
+    }
+
+    /// 夹具：on-trigger 立即 trap（unreachable）——已消费语义的观测面。
+    fn scheduler_handler_trap_wat() -> &'static str {
+        r#"(component
+            (core module $m
+                (func (export "on-trigger") (param i64 i64 i64 i32 i64)
+                    (unreachable))
+            )
+            (core instance $i (instantiate $m))
+            (type $task-id (record (field "value" u64)))
+            (type $scheduled-at (record (field "seconds" u64) (field "nanoseconds" u32)))
+            (type $trigger-payload (record
+                (field "task-id" $task-id)
+                (field "sequence" u64)
+                (field "scheduled-at" $scheduled-at)
+                (field "missed-fires" u64)))
+            (func $on-trigger (param "payload" $trigger-payload)
+                (canon lift (core func $i "on-trigger")))
+            (instance $handler
+                (export "task-id" (type $task-id))
+                (export "scheduled-at" (type $scheduled-at))
+                (export "trigger-payload" (type $trigger-payload))
+                (export "on-trigger" (func $on-trigger)))
+            (export "operune:scheduler/handler@0.1.0" (instance $handler))
+        )"#
+    }
+
+    /// 夹具：导出 `operune:event/handler@0.1.0`（on-event，WIT `event`
+    /// record 参数——含 string/list 的完整 payload；guest 经自身 memory +
+    /// realloc 接收 lowered 参数）。
+    fn event_handler_component_wat() -> &'static str {
+        r#"(component
+            (core module $m
+                (memory (export "memory") 1)
+                (func (export "realloc") (param i32 i32 i32 i32) (result i32)
+                    (local $ptr i32)
+                    (local.set $ptr (i32.load (i32.const 4)))
+                    (i32.store (i32.const 4) (i32.add (local.get $ptr) (i32.const 64)))
+                    (local.get $ptr))
+                (func (export "on-event") (param i64 i32 i32 i32 i32 i32 i64))
+                (data (i32.const 4) "\10\00\00\00"))
+            (core instance $i (instantiate $m))
+            (type $event-id (record (field "value" u64)))
+            (type $topic (record (field "value" string)))
+            (type $event-payload (variant
+                (case "json" string)
+                (case "raw" (list u8))))
+            (type $event (record
+                (field "id" $event-id)
+                (field "topic" $topic)
+                (field "payload" $event-payload)
+                (field "dropped" u64)))
+            (func $on-event (param "event" $event)
+                (canon lift (core func $i "on-event") (memory $i "memory") (realloc (func $i "realloc"))))
+            (instance $handler
+                (export "event-id" (type $event-id))
+                (export "topic" (type $topic))
+                (export "event-payload" (type $event-payload))
+                (export "event" (type $event))
+                (export "on-event" (func $on-event)))
+            (export "operune:event/handler@0.1.0" (instance $handler))
+        )"#
+    }
+
+    #[test]
+    fn real_scheduler_delivery_calls_guest_handler() {
+        let runtime = real_runtime();
+        let component = ok(
+            runtime.compile(scheduler_handler_component_wat().as_bytes()),
+            "component compile",
+        );
+        let installation = InstallationId::new();
+        let prepared = ok(
+            runtime.prepare(&component, &delivery_plan(installation)),
+            "prepare",
+        );
+        let active = ok(runtime.instantiate(&prepared), "instantiate");
+        let delivery: Arc<dyn SchedulerDeliveryPort> = Arc::new(ok(
+            SchedulerRuntimeDelivery::new(Arc::clone(&active)),
+            "scheduler delivery binding",
+        ));
+        let payload = TriggerPayload::new(
+            ScheduledTaskId::from_u64(7),
+            3,
+            ok(
+                UtcInstant::from_unix_parts(1_752_000_000, 123_456_789),
+                "utc instant",
+            ),
+            2,
+        );
+        ok(delivery.on_trigger(payload), "first delivery");
+        // 第二次调用：post_return 契约成立（实例锁已复位，无
+        // CannotEnterComponent）。
+        ok(
+            delivery.on_trigger(TriggerPayload::new(
+                ScheduledTaskId::from_u64(8),
+                1,
+                ok(UtcInstant::from_unix_parts(1_752_000_010, 0), "utc instant"),
+                0,
+            )),
+            "second delivery",
+        );
+        ok(Arc::clone(&active).drain(Duration::from_secs(1)), "drain");
+    }
+
+    #[test]
+    fn real_event_delivery_calls_guest_handler() {
+        let runtime = real_runtime();
+        let component = ok(
+            runtime.compile(event_handler_component_wat().as_bytes()),
+            "component compile",
+        );
+        let installation = InstallationId::new();
+        let prepared = ok(
+            runtime.prepare(&component, &delivery_plan(installation)),
+            "prepare",
+        );
+        let active = ok(runtime.instantiate(&prepared), "instantiate");
+        let delivery: Arc<dyn EventDeliveryPort> = Arc::new(ok(
+            EventRuntimeDelivery::new(Arc::clone(&active)),
+            "event delivery binding",
+        ));
+        // json 形态载荷（string 参数经 guest realloc 传输）。
+        let event = DeliveredEvent::new(
+            EventId::from_u64(9),
+            ok(EventTopic::new("order.created"), "topic"),
+            ok(EventPayload::json("{\"order\":1}"), "payload"),
+            1,
+        );
+        ok(delivery.on_event(event), "json delivery");
+        // raw 形态载荷（list<u8>）。
+        let raw_event = DeliveredEvent::new(
+            EventId::from_u64(10),
+            ok(EventTopic::new("ops.log"), "topic"),
+            ok(EventPayload::raw(vec![0, 1, 2, 255]), "payload"),
+            0,
+        );
+        ok(delivery.on_event(raw_event), "raw delivery");
+        ok(Arc::clone(&active).drain(Duration::from_secs(1)), "drain");
+    }
+
+    #[test]
+    fn real_delivery_missing_handler_is_guest_observation() {
+        // 无 handler 导出的组件：交付以观测错误返回（handler.wit：已消费
+        // 语义，调用方不重试/补投）。
+        let runtime = real_runtime();
+        let component = ok(
+            runtime.compile(minimal_component_wat().as_bytes()),
+            "component compile",
+        );
+        let installation = InstallationId::new();
+        let prepared = ok(
+            runtime.prepare(&component, &delivery_plan(installation)),
+            "prepare",
+        );
+        let active = ok(runtime.instantiate(&prepared), "instantiate");
+        let scheduler: Arc<dyn SchedulerDeliveryPort> = Arc::new(ok(
+            SchedulerRuntimeDelivery::new(Arc::clone(&active)),
+            "scheduler delivery binding",
+        ));
+        let event: Arc<dyn EventDeliveryPort> = Arc::new(ok(
+            EventRuntimeDelivery::new(Arc::clone(&active)),
+            "event delivery binding",
+        ));
+        let payload = TriggerPayload::new(
+            ScheduledTaskId::from_u64(1),
+            1,
+            ok(UtcInstant::from_unix_parts(1_752_000_000, 0), "utc instant"),
+            0,
+        );
+        assert!(
+            matches!(
+                scheduler.on_trigger(payload),
+                Err(SchedulerDeliveryError::Guest(_))
+            ),
+            "missing scheduler handler must be a guest observation error"
+        );
+        let event_payload = DeliveredEvent::new(
+            EventId::from_u64(1),
+            ok(EventTopic::new("order.created"), "topic"),
+            ok(EventPayload::json("{}"), "payload"),
+            0,
+        );
+        assert!(
+            matches!(
+                event.on_event(event_payload),
+                Err(EventDeliveryError::Guest(_))
+            ),
+            "missing event handler must be a guest observation error"
+        );
+        ok(Arc::clone(&active).drain(Duration::from_secs(1)), "drain");
+    }
+
+    #[test]
+    fn real_delivery_handler_trap_is_consumed_observation() {
+        // handler trap = 已消费（handler.wit：不重投、不计入错过）；错误
+        // 只用于宿主侧观测。
+        let runtime = real_runtime();
+        let component = ok(
+            runtime.compile(scheduler_handler_trap_wat().as_bytes()),
+            "component compile",
+        );
+        let installation = InstallationId::new();
+        let prepared = ok(
+            runtime.prepare(&component, &delivery_plan(installation)),
+            "prepare",
+        );
+        let active = ok(runtime.instantiate(&prepared), "instantiate");
+        let delivery: Arc<dyn SchedulerDeliveryPort> = Arc::new(ok(
+            SchedulerRuntimeDelivery::new(Arc::clone(&active)),
+            "scheduler delivery binding",
+        ));
+        let payload = TriggerPayload::new(
+            ScheduledTaskId::from_u64(2),
+            1,
+            ok(UtcInstant::from_unix_parts(1_752_000_000, 0), "utc instant"),
+            0,
+        );
+        assert!(
+            matches!(
+                delivery.on_trigger(payload),
+                Err(SchedulerDeliveryError::Guest(_))
+            ),
+            "handler trap must surface as a guest observation error"
+        );
+        ok(Arc::clone(&active).drain(Duration::from_secs(1)), "drain");
+    }
+
+    // ------------------------------------------------------------------
+    // 0.3.0（§41.2）——operune:state/config/secret import 的宿主注册
+    // ------------------------------------------------------------------
+
+    /// 空 grant 的 RuntimePlan（delivery/import 测试的快照形状，§19.3）。
+    fn delivery_plan(installation: InstallationId) -> RuntimePlan {
+        RuntimePlan {
+            installation,
+            grants: GrantSnapshot {
+                installation,
+                wasi: WasiCapabilities::empty(),
+                budget: ResourceBudget::default(),
+            },
+        }
+    }
+
+    /// 0.3.0 stateful 宿主服务装配（fakes；import 注册的测试面）。
+    struct StatefulHarness {
+        services: Arc<StatefulHostServices>,
+        state: Arc<StateService>,
+        config: Arc<ConfigService>,
+        secret: Arc<SecretService>,
+        secret_grants: Arc<FakeSecretGrants>,
+    }
+
+    fn stateful_harness() -> StatefulHarness {
+        let state = Arc::new(StateService::new(
+            Arc::new(FakeStateStore::new()),
+            Arc::new(FakeStatefulAudit::new()),
+            Arc::new(MigrationGate::new()),
+        ));
+        let config = Arc::new(ConfigService::new(
+            Arc::new(FakeConfigStore::new()),
+            Arc::new(FakeStatefulAudit::new()),
+        ));
+        let secret_grants = Arc::new(FakeSecretGrants::new());
+        let secret_grants_port: Arc<dyn crate::ports::SecretGrantPort> = secret_grants.clone();
+        let secret = Arc::new(SecretService::new(
+            Arc::new(FakeSecretStore::new()),
+            secret_grants_port,
+            ok(
+                SecretCipher::new(&SecretBytes::from_slice(&[0x42; KEK_SIZE])),
+                "secret cipher",
+            ),
+            Arc::new(FakeStatefulAudit::new()),
+        ));
+        let services = Arc::new(StatefulHostServices::new(
+            Arc::clone(&state),
+            Arc::clone(&config),
+            Arc::clone(&secret),
+        ));
+        StatefulHarness {
+            services,
+            state,
+            config,
+            secret,
+            secret_grants,
+        }
+    }
+
+    /// 直接实例化带 operune import 的组件（绕过 Instance Set——import
+    /// 注册面的聚焦测试；`WasmtimeRuntime::prepare`/`instantiate` 的集成
+    /// 面由 real_prepare_and_instantiate_with_stateful_imports 覆盖）。
+    fn instantiate_import_fixture(
+        runtime: &WasmtimeRuntime,
+        component: &Arc<dyn CompiledWasm>,
+        installation: InstallationId,
+    ) -> Result<(Instance, StoreHandle), RuntimeExecutionError> {
+        let real = runtime.real_component(component.as_ref())?;
+        let mut linker =
+            Linker::<operune_runtime_wasm::StoreHostState>::new(runtime.engine.engine());
+        if let Some(stateful) = &runtime.stateful {
+            crate::stateful_imports::register_stateful_imports(
+                &mut linker,
+                stateful,
+                installation,
+            )?;
+        }
+        let config = runtime.config_snapshot()?;
+        let mut store = StoreFactory::new(&runtime.engine)
+            .new_store(&config.descriptor_budget)
+            .map_err(RuntimeExecutionError::Runtime)?;
+        prepare_store_call(&mut store, config.descriptor_deadline)?;
+        let instance = linker
+            .instantiate(store.store_mut(), real.inner.component())
+            .map_err(|error| {
+                RuntimeExecutionError::from_classified(&mut store, ErrorSource::from(error))
+            })?;
+        Ok((instance, store))
+    }
+
+    /// 调用夹具的根级导出（单结果；u32/u64 判别式或值形态）。
+    fn call_fixture_export(
+        instance: &Instance,
+        store: &mut StoreHandle,
+        name: &'static str,
+    ) -> Result<Val, RuntimeExecutionError> {
+        let index = instance
+            .get_export_index(store.store_mut(), None, name)
+            .ok_or(RuntimeExecutionError::MissingOperuneExport(name))?;
+        let func = instance
+            .get_func(store.store_mut(), index)
+            .ok_or(RuntimeExecutionError::MissingOperuneExport(name))?;
+        prepare_store_call(store, Duration::from_secs(5))?;
+        let mut results = [Val::Bool(false)];
+        func.call(store.store_mut(), &[], &mut results)
+            .map_err(|error| {
+                RuntimeExecutionError::from_classified(store, ErrorSource::from(error))
+            })?;
+        func.post_return(store.store_mut()).map_err(|error| {
+            RuntimeExecutionError::from_classified(store, ErrorSource::from(error))
+        })?;
+        Ok(results[0].clone())
+    }
+
+    /// 夹具：导入 `operune:config/config@0.1.0` 的 get-config，导出 run
+    ///（result 判别式：ok = 0 / err = 1）。
+    ///
+    /// WAT 结构注：canon lower 的 memory/realloc 选项引用**已实例化**的
+    /// core instance（wast 255 解析器：core 导出引用在 CoreInstance 命名
+    /// 空间解析）——libc 模块（提供 memory/realloc）先实例化，lowered
+    /// func 绑定其内存；consumer 模块经 `with` 接线 lowered func。
+    fn config_import_component_wat() -> &'static str {
+        r#"(component
+            (import "operune:config/config@0.1.0" (instance $config
+                (type $config-version (record (field "revision" u64)))
+                (type $config-value (record (field "data" (list u8))))
+                (export "config-version" (type $config-version' (eq $config-version)))
+                (export "config-value" (type $config-value' (eq $config-value)))
+                (type $config-snapshot (record
+                    (field "version" $config-version')
+                    (field "value" $config-value')))
+                (type $config-error (enum "not-ready" "corrupt" "internal"))
+                (export "config-snapshot" (type $config-snapshot' (eq $config-snapshot)))
+                (export "config-error" (type $config-error' (eq $config-error)))
+                (export "get-config" (func (result (result $config-snapshot' (error $config-error')))))))
+            (core module $libc
+                (memory (export "memory") 1)
+                (func (export "realloc") (param i32 i32 i32 i32) (result i32)
+                    (local $ptr i32)
+                    (local.set $ptr (i32.load (i32.const 4)))
+                    (i32.store (i32.const 4) (i32.add (local.get $ptr) (i32.const 64)))
+                    (local.get $ptr))
+                (func (export "discriminant") (result i32)
+                    (i32.load (i32.const 4096)))
+                (data (i32.const 4) "\00\20\00\00"))
+            (core instance $libc (instantiate $libc))
+            (core func $cfg (canon lower (func $config "get-config") (memory $libc "memory") (realloc (func $libc "realloc"))))
+            (core module $m
+                (import "config" "get-config" (func $get-config (param i32)))
+                (import "libc" "discriminant" (func $discriminant (result i32)))
+                (func (export "run") (result i32)
+                    (call $get-config (i32.const 4096))
+                    (call $discriminant)))
+            (core instance $i (instantiate $m
+                (with "config" (instance (export "get-config" (func $cfg))))
+                (with "libc" (instance (export "discriminant" (func $libc "discriminant"))))))
+            (func (export "run") (result u32) (canon lift (core func $i "run")))
+        )"#
+    }
+
+    /// 夹具：导入 `operune:secret/secret@0.1.0` 的 read-secret，导出 run
+    ///（result 判别式）；名称 `db-password` 经 libc data 段驻留 canonical
+    /// memory（lowered func 从该内存读取 string 参数）。
+    fn secret_import_component_wat() -> &'static str {
+        r#"(component
+            (import "operune:secret/secret@0.1.0" (instance $secret
+                (type $secret-name (record (field "value" string)))
+                (type $secret-value (record (field "data" (list u8))))
+                (type $secret-error (enum "denied" "invalid-name" "unavailable" "corrupt" "over-budget" "internal"))
+                (export "secret-name" (type $secret-name' (eq $secret-name)))
+                (export "secret-value" (type $secret-value' (eq $secret-value)))
+                (export "secret-error" (type $secret-error' (eq $secret-error)))
+                (export "read-secret" (func (param "name" $secret-name')
+                    (result (result $secret-value' (error $secret-error')))))))
+            (core module $libc
+                (memory (export "memory") 1)
+                (func (export "realloc") (param i32 i32 i32 i32) (result i32)
+                    (local $ptr i32)
+                    (local.set $ptr (i32.load (i32.const 4)))
+                    (i32.store (i32.const 4) (i32.add (local.get $ptr) (i32.const 64)))
+                    (local.get $ptr))
+                (func (export "discriminant") (result i32)
+                    (i32.load (i32.const 4096)))
+                (data (i32.const 4) "\00\20\00\00")
+                (data (i32.const 2000) "db-password"))
+            (core instance $libc (instantiate $libc))
+            (core func $secret_read (canon lower (func $secret "read-secret") (memory $libc "memory") (realloc (func $libc "realloc"))))
+            (core module $m
+                (import "secret" "read-secret" (func $read-secret (param i32 i32 i32)))
+                (import "libc" "discriminant" (func $discriminant (result i32)))
+                (func (export "run") (result i32)
+                    (call $read-secret (i32.const 2000) (i32.const 11) (i32.const 4096))
+                    (call $discriminant)))
+            (core instance $i (instantiate $m
+                (with "secret" (instance (export "read-secret" (func $secret_read))))
+                (with "libc" (instance (export "discriminant" (func $libc "discriminant"))))))
+            (func (export "run") (result u32) (canon lift (core func $i "run")))
+        )"#
+    }
+
+    /// 夹具：导入 `operune:state/state@0.1.0` 的 get，导出 run（result
+    /// 判别式）；键 `alpha` 经 libc data 段驻留 canonical memory。
+    fn state_get_component_wat() -> &'static str {
+        r#"(component
+            (import "operune:state/state@0.1.0" (instance $state
+                (type $state-key (record (field "value" string)))
+                (type $state-value (record (field "data" (list u8))))
+                (type $state-error (enum "not-ready" "not-found" "conflict" "corrupt" "over-budget" "invalid-key" "unsupported-schema-version" "internal"))
+                (export "state-key" (type $state-key' (eq $state-key)))
+                (export "state-value" (type $state-value' (eq $state-value)))
+                (export "state-error" (type $state-error' (eq $state-error)))
+                (export "get" (func (param "key" $state-key')
+                    (result (result (option $state-value') (error $state-error')))))))
+            (core module $libc
+                (memory (export "memory") 1)
+                (func (export "realloc") (param i32 i32 i32 i32) (result i32)
+                    (local $ptr i32)
+                    (local.set $ptr (i32.load (i32.const 4)))
+                    (i32.store (i32.const 4) (i32.add (local.get $ptr) (i32.const 64)))
+                    (local.get $ptr))
+                (func (export "discriminant") (result i32)
+                    (i32.load (i32.const 4096)))
+                (data (i32.const 4) "\00\20\00\00")
+                (data (i32.const 2000) "alpha"))
+            (core instance $libc (instantiate $libc))
+            (core func $state_get (canon lower (func $state "get") (memory $libc "memory") (realloc (func $libc "realloc"))))
+            (core module $m
+                (import "state" "get" (func $get (param i32 i32 i32)))
+                (import "libc" "discriminant" (func $discriminant (result i32)))
+                (func (export "run") (result i32)
+                    (call $get (i32.const 2000) (i32.const 5) (i32.const 4096))
+                    (call $discriminant)))
+            (core instance $i (instantiate $m
+                (with "state" (instance (export "get" (func $state_get))))
+                (with "libc" (instance (export "discriminant" (func $libc "discriminant"))))))
+            (func (export "run") (result u32) (canon lift (core func $i "run")))
+        )"#
+    }
+
+    #[test]
+    fn real_prepare_rejects_operune_imports_without_stateful_services() {
+        // §19.5 deny-by-default：未注入 stateful services 时，带 operune
+        // import 的组件以确定性 link 错误失败（不"先运行，失败时 trap"）。
+        let runtime = real_runtime();
+        let component = ok(
+            runtime.compile(config_import_component_wat().as_bytes()),
+            "component compile",
+        );
+        let result = runtime.prepare(&component, &delivery_plan(InstallationId::new()));
+        assert!(
+            matches!(result, Err(RuntimeExecutionError::Runtime(_))),
+            "operune import without stateful services must fail at link time"
+        );
+    }
+
+    #[test]
+    fn real_prepare_and_instantiate_with_stateful_imports() {
+        // §41.2：注入 stateful services 后，带 operune import 的组件通过
+        // prepare（link 解析）+ instantiate（Instance Set 实例化）+
+        // readiness 全链路。
+        let harness = stateful_harness();
+        let runtime = real_runtime().with_stateful_services(Arc::clone(&harness.services));
+        let component = ok(
+            runtime.compile(config_import_component_wat().as_bytes()),
+            "component compile",
+        );
+        let installation = InstallationId::new();
+        let prepared = ok(
+            runtime.prepare(&component, &delivery_plan(installation)),
+            "prepare",
+        );
+        let active = ok(runtime.instantiate(&prepared), "instantiate");
+        ok(active.check_readiness(), "readiness");
+        ok(Arc::clone(&active).drain(Duration::from_secs(1)), "drain");
+    }
+
+    #[test]
+    fn real_stateful_config_import_round_trip() {
+        // get-config 的完整 canonical ABI 往返：guest 调用 → 宿主闭包 →
+        // ConfigService → result 判别式与快照 revision 落回 guest 内存。
+        let harness = stateful_harness();
+        let runtime = real_runtime().with_stateful_services(Arc::clone(&harness.services));
+        let installation = InstallationId::new();
+        let component = ok(
+            runtime.compile(config_import_component_wat().as_bytes()),
+            "component compile",
+        );
+        let (instance, mut store) = ok(
+            instantiate_import_fixture(&runtime, &component, installation),
+            "fixture instantiation",
+        );
+        // 无已校验配置：get-config → not-ready（err 判别式 = 1）。
+        assert_eq!(
+            ok(call_fixture_export(&instance, &mut store, "run"), "run"),
+            Val::U32(1),
+            "no validated config must surface the err discriminant"
+        );
+        // 管理侧写入已校验配置（revision 单调递增）。
+        ok(
+            harness.config.put(
+                installation,
+                ConfigFormat::Json,
+                ConfigSchemaVersion::from_u32(1),
+                &ok(ConfigValue::new(b"{\"a\":1}".to_vec()), "config value"),
+            ),
+            "config put",
+        );
+        // 再次调用：ok（判别式 0）——快照 record（含 list<u8>）经 canonical
+        // ABI 完整往返 lowered 进 libc memory（ok 判别式即编码成功的证明）。
+        assert_eq!(
+            ok(call_fixture_export(&instance, &mut store, "run"), "run"),
+            Val::U32(0),
+            "validated config must surface the ok discriminant"
+        );
+    }
+
+    #[test]
+    fn real_stateful_secret_import_round_trip() {
+        // read-secret 的完整 canonical ABI 往返（string 参数经 guest 内存
+        // 读取）：无 grant → denied（err 判别式）；grant + rotate 后 →
+        // ok（判别式 0）。
+        let harness = stateful_harness();
+        let runtime = real_runtime().with_stateful_services(Arc::clone(&harness.services));
+        let installation = InstallationId::new();
+        let component = ok(
+            runtime.compile(secret_import_component_wat().as_bytes()),
+            "component compile",
+        );
+        let (instance, mut store) = ok(
+            instantiate_import_fixture(&runtime, &component, installation),
+            "fixture instantiation",
+        );
+        assert_eq!(
+            ok(call_fixture_export(&instance, &mut store, "run"), "run"),
+            Val::U32(1),
+            "ungranted secret must surface the err discriminant"
+        );
+        let name = ok(SecretName::new("db-password"), "secret name");
+        harness
+            .secret_grants
+            .set_granted(installation, vec![name.clone()]);
+        ok(
+            harness.secret.rotate(
+                installation,
+                &name,
+                &SecretBytes::from_slice(b"top-secret"),
+                "database credential",
+            ),
+            "rotate",
+        );
+        assert_eq!(
+            ok(call_fixture_export(&instance, &mut store, "run"), "run"),
+            Val::U32(0),
+            "granted secret must surface the ok discriminant"
+        );
+    }
+
+    #[test]
+    fn real_stateful_state_import_round_trip() {
+        // state get 的完整 canonical ABI 往返：键不存在 → ok(None)；seed
+        // 后 → ok（判别式 0）。
+        let harness = stateful_harness();
+        let runtime = real_runtime().with_stateful_services(Arc::clone(&harness.services));
+        let installation = InstallationId::new();
+        let component = ok(
+            runtime.compile(state_get_component_wat().as_bytes()),
+            "component compile",
+        );
+        let (instance, mut store) = ok(
+            instantiate_import_fixture(&runtime, &component, installation),
+            "fixture instantiation",
+        );
+        assert_eq!(
+            ok(call_fixture_export(&instance, &mut store, "run"), "run"),
+            Val::U32(0),
+            "missing key must surface the ok (None) discriminant"
+        );
+        let key = ok(StateKey::new("alpha"), "state key");
+        let value = ok(StateValue::new(b"v1".to_vec()), "state value");
+        assert_eq!(
+            ok(
+                harness.state.cas(
+                    installation,
+                    StateSchemaVersion::from_u32(0),
+                    &key,
+                    None,
+                    Some(&value),
+                ),
+                "cas seed"
+            ),
+            CasOutcome::Applied
+        );
+        assert_eq!(
+            ok(call_fixture_export(&instance, &mut store, "run"), "run"),
+            Val::U32(0),
+            "seeded state must surface the ok discriminant"
+        );
     }
 }

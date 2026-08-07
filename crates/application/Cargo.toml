@@ -44,6 +44,15 @@ arc-swap = { workspace = true }
 # feature 最小集：rt + sync + time + macros（select! 宏；不使用
 # net/io 等生产 feature）。
 tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }
+# 0.3.0 operune:secret import 接线（§41.2 / §16.6）：read-secret 的宿主
+# 闭包把 SecretBytes 明文编入 Val 返回值——明文取用入口是
+# secrecy::ExposeSecret（security 层对 SecretBytes 的实现，
+# ADR-0001 §16.6 进程内暴露面）。取值发生在 canonical ABI 边界（值立即
+# 编码进 Val 写入 guest 内存，不进入日志/审计/错误），该 trait 必须在本
+# crate 作用域内。secrecy 是 §22.6 冻结 workspace 基线既有条目（security
+# crate 已采用），本条目是 application 对同一冻结依赖的采用，无新增
+# workspace 条目（§23 无需 Gate）。
+secrecy = { workspace = true }
 
 [dev-dependencies]
 # §22.8 test/dev-only：真实 wasmtime 集成测试需要本地 JIT 后端（cranelift）

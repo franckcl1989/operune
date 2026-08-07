@@ -36,6 +36,12 @@ pub trait CheckpointPort: Send + Sync {
 /// 进程内默认实现（composition root 与测试共用）：0.1.0 的 in-memory 事实
 /// 无持久化面（WIT：定时任务持久化是 Core 实现细节；event 不承诺持久化），
 /// checkpoint 为 no-op，并以调用计数供观测/测试断言编排顺序。
+///
+/// 0.3.0 评估结论（2026-08-08）：保持 no-op 实现，无需增强——[`crate::state::StateService`]
+/// 的写路径（`cas`/事务 commit）是同步持久写（StateStorePort 存储层原子
+/// 提交），SQLite 持久化天然 crash-safe（§18.5/§41.3），checkpoint 的
+/// "stop 前显式确认权威状态已 flush"语义由该同步写路径自动满足；本 port
+/// 的编排钩子职责（§20.4/§41.2 顺序断言）不变。
 #[derive(Debug, Default)]
 pub struct InProcessCheckpoint {
     calls: AtomicU64,
