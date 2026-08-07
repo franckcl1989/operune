@@ -1,0 +1,106 @@
+/// operune:component@0.1.0 — Component descriptor 契约
+///
+/// 本 interface 是 Operune Core 在安装流程的 descriptor 阶段（规范 §19.2 / §19.3）
+/// 调用的 Component 导出契约。它只表达"作者声明的逻辑产品/应用身份与平台
+/// metadata"，是仅 Operune 平台拥有而 WASI / Component Model 不表达的语义
+/// （§6.6，论证见 wit/README.md）。
+///
+/// ## 契约约束（§19.3 明文要求，由 Core 强制执行）
+/// - descriptor export 必须是 side-effect-free、bounded、可重复的元数据读取契约：
+///   不得依赖当前时间、随机数、外部网络或宿主可变文件；
+/// - 同一 ContentDigest 在同一 contract version 下必须得到同一 canonical descriptor，
+///   任何不一致都视为 contract violation，candidate 保持 quarantine/failed；
+/// - descriptor 阶段的 Store 不提供任何 operational grants
+///   （无 network / filesystem / secret / scheduler / event 等能力，§19.3）；
+/// - Core 对 descriptor 的返回值体积、执行 deadline、memory / table / instance /
+///   host-buffer 预算施加与正常运行相同或更严格的宿主侧硬上限（§19.3），
+///   超限按 trap / 超时处理，不进入返回值空间。
+///
+/// ## 四种身份的契约位置（§19.4，必须永久分离）
+/// WIT 层只出现作者声明的两种身份：
+/// - `component-id`：作者声明的逻辑产品/应用身份；
+/// - `component-version`：作者声明的发布版本（结构化 semver）。
+/// 另外两种身份是 Core 侧事实，不得出现在本契约的任何字段或参数中：
+/// - `ContentDigest`：对收到的原始 Component 字节计算得到的不可变内容事实，
+///   由 Core 在任何 guest 代码执行前即可得到（§6.7）；
+/// - `InstallationId`：由 Core 创建并持久化的安装实例身份，承载 grant、
+///   enable/active 状态与本机生命周期（§17 / §19.4）。
+/// 运行时兼容判断只依赖二进制中真实可观察的 contract surface（§6.7），
+/// 不依赖 root package / world 名称能否从最终 `.wasm` 可靠恢复。
+package operune:component@0.1.0;
+
+/// 作者声明的逻辑产品/应用身份（§6.7 / §19.4 ComponentId）。
+///
+/// 采用 record wrapper 而非裸 string（§13.5）：WIT type alias 不提供
+/// Rust 风格 nominal type distinction，record 让 `component-id` 与其它
+/// 同为字符串的标识符无法被调用者误传。
+record component-id {
+    /// 唯一且稳定的逻辑产品/应用标识符，由作者维护。
+    /// Core 只按字符串等价比较并作为注册表逻辑键，不做语义解析。
+    value: string,
+}
+
+/// 作者声明的发布版本（§19.4 ComponentVersion），结构化 semver（§13.2 / §13.5）。
+///
+/// 0.1.0 表达主 / 次 / 补丁三段。pre-release 与 build metadata 语义
+/// 属于 semver 排序规则，由未来 interface 版本按 semver 规范增量演进；
+/// 禁止降级为字符串版本字段。
+record component-version {
+    major: u32,
+    minor: u32,
+    patch: u32,
+}
+
+/// 作者 / 供应商的可选展示性元数据（非身份事实，不参与兼容判断）。
+record author-info {
+    /// 作者 / 供应商展示名，用于注册表与 UI 展示。
+    display-name: string,
+    /// 可选主页 / 联系 URL。Core 只作展示，不解析、不访问。
+    homepage: option<string>,
+    /// 可选人类可读描述。
+    description: option<string>,
+}
+
+/// descriptor 的返回结构：作者声明的完整身份与平台 metadata。
+record component-descriptor {
+    /// 逻辑产品/应用身份（作者声明，§19.4 ComponentId）。
+    component-id: component-id,
+    /// 发布版本（作者声明，§19.4 ComponentVersion）。
+    version: component-version,
+    /// 人类可读展示名。作者可见的应用名称必须由 descriptor 显式声明，
+    /// 不得从文件 / 上传路径 / root world 名推断（§6.7）。
+    display-name: string,
+    /// 可选作者 / 供应商元数据。
+    author: option<author-info>,
+}
+
+/// descriptor 阶段的预期失败（WIT result 表达预期失败，§6.3）。
+///
+/// trap、超时、超预算不属于返回值空间：它们由 Core 在宿主侧观察
+/// （epoch interruption / StoreLimits，§7.4 / §7.5），candidate 保持
+/// quarantine/failed（§19.3）。
+enum descriptor-error {
+    /// 返回的 metadata 无法解析或违反契约不变量
+    /// （例如空 component-id、空 display-name 或不可表示的版本）。
+    malformed,
+    /// 未来演进：平台不再支持该 descriptor contract 版本。
+    unsupported-contract-version,
+    /// guest 内部不可恢复错误。
+    internal,
+}
+
+/// Component 通过导出本 interface 向 Core 声明身份与平台 metadata。
+///
+/// Core 在 descriptor-only Store（零 operational grant）中调用，调用顺序
+/// 严格位于"先确定字节事实、再确定应用身份"两阶段安装的第二步（§19.2）。
+interface descriptor {
+    /// 读取作者声明的 descriptor。
+    ///
+    /// 契约（§19.3，Core 强制执行）：
+    /// - side-effect-free：本调用不得改变任何可观察状态；
+    /// - bounded：返回值受宿主侧体积上限约束；
+    /// - 可重复：同一 ContentDigest + 同一 contract version 必须返回同一
+    ///   canonical descriptor；实现不得依赖当前时间、随机数、外部网络
+    ///   或宿主可变文件。
+    get-descriptor: func() -> result<component-descriptor, descriptor-error>;
+}

@@ -1,0 +1,84 @@
+/// operune:web@0.1.0 — 最小 Component Web bridge：bounded backend actions（§21.3）
+///
+/// Component 导出本 interface，通过 Core-mediated bridge 处理来自其 Web UI
+/// 的有界 backend action 调用。
+///
+/// ## 边界（§21.3 明文）
+/// - 只有 bounded request / response：无 WebSocket、无任意长连接、无流、
+///   无 stream / realtime；0.1.0 不提供 native async / stream 语义
+///   （完整 Web Application Runtime 与 realtime 属于 0.4.0，且必须满足
+///   §8.3 WASI 0.3 production Gate 才进入 production scope，§21.4 / §42.3）；
+/// - action 是无状态一次调用：0.1.0 stateless contract 不承诺跨调用
+///   instance affinity（§7.3），guest 不得假设 linear memory / 实例局部
+///   变量在下次调用仍存在。
+///
+/// ## Core-mediated（Core 执行语义；本契约设计不得与之冲突）
+/// Core 将 frame / channel 与 InstallationId + ComponentVersion 绑定，并在
+/// 服务端重新执行 authentication、RBAC、grant、action permission、
+/// body / deadline / rate / concurrency 检查（§21.3）。InstallationId 是
+/// Core 侧事实（§19.4），不出现在本契约的任何参数中。
+///
+/// ## 凭据边界
+/// 浏览器内 Component 代码不接触 Root Admin session bearer 或 CSRF secret
+/// （§16.5 / §21.3）。因此本契约的请求结构没有任何会话、cookie、CSRF、
+/// 认证凭据字段；Core 的认证信息永远不会转发进 `action-request`。
+/// 未授权、超时、超预算、速率 / 并发限制由 Core 在 bridge 层以确定的
+/// HTTP 语义拒绝，不进入 guest 的错误返回值空间。
+///
+/// ## 原子版本（§21.5）
+/// backend action export 与 web assets、web descriptor 属于同一
+/// ComponentVersion；升级通过 active snapshot 一次性切换，任何新 action
+/// 调用解析到同一 active version，禁止前后端版本拼接。
+package operune:web@0.1.0;
+
+/// action 名称：Component 定义的开放动作标识符（如 "run-check"）。
+///
+/// record wrapper（§13.5）：Core 只做等价比较与审计记录，不解析语义；
+/// 0.5.0 的 scoped capability policy 可进一步按 action 绑定授权（§43）。
+record action-name {
+    value: string,
+}
+
+/// action 载荷的互斥形态（variant 表达互斥的不同形态，§6.3）。
+///
+/// 仅两种形态：结构化文本载荷或原始字节载荷。禁止把任意动态值当作
+/// 万能 payload（§22.4 serde_json 不得作为 Domain 万能动态值）；
+/// 0.4.0 的 typed action 将提供结构化参数（§42.2），本 variant 是
+/// 0.1.0 的过渡边界，不得作为未来动态值的后门。
+variant action-payload {
+    /// JSON 文本载荷（UI 表单 / 交互的常规形态）。
+    json(string),
+    /// 原始字节载荷。
+    raw(list<u8>),
+}
+
+/// 有界 action 请求（§21.3 bounded request）。
+///
+/// 不变量：载荷体积受 Core 宿主侧硬上限约束（body 上限，§21.3 / §7.4）；
+/// 结构中没有凭据、会话或 CSRF 字段（见本文件顶部"凭据边界"）。
+record action-request {
+    action: action-name,
+    payload: action-payload,
+}
+
+/// action 的预期失败（guest 返回值空间）。
+enum action-error {
+    /// 请求的 action 名称不存在。
+    not-found,
+    /// 载荷不符合该 action 的预期形态或契约不变量。
+    invalid-payload,
+    /// guest 内部不可恢复错误。
+    internal,
+}
+
+interface actions {
+    /// 处理一次有界 backend action 调用。
+    ///
+    /// - 同步返回：一次调用对应一次完整 response，无流、无增量、
+    ///   无长连接（§21.3）；
+    /// - 响应体积受 Core 宿主侧硬上限约束；
+    /// - Core 侧拒绝（未授权、超时、超预算、限流）不进入本返回值空间，
+    ///   由 bridge 以确定语义在 HTTP 层表达（§21.3）；
+    /// - 无状态：不承诺跨调用 instance affinity（§7.3）。
+    handle-action: func(request: action-request) -> result<list<u8>, action-error>;
+}
