@@ -35,6 +35,15 @@ impl Duration {
         Duration(duration)
     }
 
+    /// 转换为 `std::time::Duration`（与 [`Duration::from_std`] 互为逆操作；
+    /// §13.3 适配层边界输出）。
+    ///
+    /// `Duration` 为 `Copy`，返回内部值的拷贝，不改变 validate-on-construct
+    /// 语义（构造时已保证非负，无需再次校验）。
+    pub const fn as_std(self) -> StdDuration {
+        self.0
+    }
+
     /// 有符号秒转换构造：负数拒绝（validate-on-construct，§13.3）。
     pub fn try_from_secs_i64(secs: i64) -> Result<Duration, DomainError> {
         u64::try_from(secs)
@@ -227,6 +236,15 @@ mod tests {
             Duration::from_std(StdDuration::from_secs(7)),
             Duration::from_secs(7)
         );
+    }
+
+    #[test]
+    fn as_std_roundtrip() {
+        // from_std ↔ as_std 互逆（§13.3 适配层边界输入/输出成对）。
+        let std_duration = StdDuration::from_millis(1234);
+        assert_eq!(Duration::from_std(std_duration).as_std(), std_duration);
+        assert_eq!(Duration::from_secs(30).as_std(), StdDuration::from_secs(30));
+        assert_eq!(Duration::ZERO.as_std(), StdDuration::ZERO);
     }
 
     #[test]

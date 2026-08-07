@@ -7,14 +7,22 @@ use crate::budget::{CallDeadline, ResourceBudget};
 use crate::engine::EngineHandle;
 use crate::error::{ResourceLimitKind, RuntimeError};
 use crate::limiter::StoreResourceLimiter;
-use crate::wasi::{WasiAdapter, WasiError, WasiPolicy};
+use crate::wasi::{WasiAdapter, WasiError, WasiP2HostState, WasiPolicy};
 
 /// 每个 Store 的宿主状态（Wasmtime `Store<T>` 的数据类型）。
 ///
 /// 对上层不暴露 wasmtime 具体类型（§8.2）：所有公开成员均为项目自有类型。
 /// WASI adapter 通过 [`StoreHostState::replace_adapter_state`] 保存其自有
-/// 状态（opaque `dyn Any` 槽），在实例化阶段的 linker 绑定闭包中 downcast
-/// 使用（衔接点见 [`crate::wasi::WasiAdapter`] 文档）。
+/// 附加状态（opaque `dyn Any` 槽，adapter 专用）。
+///
+/// WASI 0.2 上下文（§7.6 deny-by-default）：[`crate::wasi::WasiP2HostState`]
+/// 在 Store 构建时**预置零权限空 context**，只有显式
+/// [`crate::wasi::WasiAdapter::attach`] 经 [`StoreHostState::set_wasi_state`]
+/// 才替换为 policy 构建的上下文（无 ambient authority，§7.6）。
+///
+/// WASI 接线（§8.2 受控 glue 例外）：本类型实现 `wasmtime_wasi::WasiView`
+///（orphan rule 强制，0020e24 审计裁决），直接从专用字段接线；语义见该
+/// 实现文档。
 ///
 /// 并发保证：本类型不实现 `Sync`（拒绝记录为 `Cell`）；Store 遵循单一执行
 /// 模型（§7.3），不在线程间共享。
@@ -22,6 +30,37 @@ pub struct StoreHostState {
     pub(crate) limiter: StoreResourceLimiter,
     pub(crate) adapter_state: Option<Box<dyn Any + Send>>,
     budget: ResourceBudget,
+    wasi_ctx: WasiP2HostState,
+}
+
+/// §8.2 受控 glue 例外（0020e24 审计裁决，见 git 历史）：`wasmtime_wasi::WasiView`
+/// binding trait 属 wasmtime-wasi，orphan rule 强制只能由持有 Store 类型的
+/// crate 实现，因此本实现必须存在于 runtime-wasm。本实现只做接线，不含任何
+/// WASI binding/linker 逻辑——WASI 具体 linker/binding 仍以 runtime-wasi-p2
+/// 为主导（§24.2）。
+///
+/// 语义（deny-by-default，§7.6）：WASI 0.2 上下文存于专用字段
+/// [`crate::wasi::WasiP2HostState`]，Store 构建时预置零权限空 context，
+/// 只有 [`crate::wasi::WasiAdapter::attach`] 经 [`StoreHostState::set_wasi_state`]
+/// 显式替换为 policy 构建的上下文。因此 `ctx` **无失败路径、无 downcast、
+/// 无回退分支**——"未 attach WASI 即返回安全空上下文"由构造时预置表达
+///（比惰性回退更强：不存在"未预置"的窗口）。
+///
+/// 设计说明（为何不采用"adapter 状态槽 + downcast"）：`WasiView::ctx` 的
+/// 返回借用与 `&mut self` 同生命周期，borrow checker 不允许在借出状态槽
+/// 之后、函数返回之前回填替换（E0506：返回借用 region 覆盖整个函数体，
+/// 已实测拒绝 loop / 递归两种回填形态）；且 `dyn Any` 的 downcast 返回
+/// Option，"不可达的失败分支"在 Safe Rust 无 panic 约束（§14.2）下无法
+/// 表达。专用字段使 `ctx` 天然无 Option、无失败路径（§13.4 不合法状态
+/// 不可表示）。
+impl wasmtime_wasi::WasiView for StoreHostState {
+    fn ctx(&mut self) -> wasmtime_wasi::WasiCtxView<'_> {
+        let state = &mut self.wasi_ctx;
+        wasmtime_wasi::WasiCtxView {
+            ctx: &mut state.ctx,
+            table: &mut state.table,
+        }
+    }
 }
 
 impl StoreHostState {
@@ -45,6 +84,17 @@ impl StoreHostState {
         state: Box<dyn Any + Send>,
     ) -> Option<Box<dyn Any + Send>> {
         self.adapter_state.replace(state)
+    }
+
+    /// 安装 WASI 0.2 上下文（adapter 在 [`WasiAdapter::attach`] 中调用；上层
+    /// 不得直接写入）。
+    ///
+    /// §7.6 deny-by-default：Store 构建时预置零权限空 context
+    ///（[`WasiP2HostState::empty`]），只有显式 attach 才以 policy 构建的
+    /// 上下文替换。本方法是 [`StoreHostState`] 的 `wasmtime_wasi::WasiView`
+    /// 接线的安装点（§8.2 受控 glue 例外，见该实现文档）。
+    pub fn set_wasi_state(&mut self, state: WasiP2HostState) {
+        self.wasi_ctx = state;
     }
 
     /// 本 Store 的资源预算快照（§7.4：adapter 可读取，如 wasi-http body 上限）。
@@ -98,6 +148,10 @@ impl<'a> StoreFactory<'a> {
             limiter: StoreResourceLimiter::new(budget.clone()),
             adapter_state: None,
             budget: budget.clone(),
+            // §7.6 deny-by-default：预置零权限 WASI context（无文件系统/
+            // 网络/环境变量/随机资源）；WASI 能力只经 attach 显式替换
+            //（见 StoreHostState 结构文档与 WasiView 实现文档）。
+            wasi_ctx: WasiP2HostState::empty(),
         };
         let mut store = wasmtime::Store::new(self.engine.engine(), host);
         // §7.4：注入 wasmtime 资源限制器。闭包不捕获任何变量 →
@@ -251,7 +305,7 @@ mod tests {
     use crate::test_support::{
         self, engine, expect_ok, expect_some, store_with_budget, test_failure,
     };
-    use crate::wasi::{WasiAdapter, WasiError, WasiPolicy, WasiVersion};
+    use crate::wasi::{WasiAdapter, WasiError, WasiP2HostState, WasiPolicy, WasiVersion};
     use crate::{TrapKind, WasmFailure};
 
     /// 测试用 WASI adapter：把 marker 写入宿主状态槽（验证 §8.2 port 形状）。
@@ -271,6 +325,28 @@ mod tests {
             host_state: &mut StoreHostState,
         ) -> Result<(), WasiError> {
             host_state.replace_adapter_state(Box::new(TestWasiMarker(42)));
+            Ok(())
+        }
+    }
+
+    /// 测试用 WASI adapter：attach 时经 [`StoreHostState::set_wasi_state`]
+    /// 安装带 marker env 的 WASI 0.2 context——WasiView 接线的正常路径
+    ///（adapter 侧构建，runtime-wasm 侧接线）。
+    struct WasiViewAdapter;
+
+    impl WasiAdapter for WasiViewAdapter {
+        fn version(&self) -> WasiVersion {
+            WasiVersion::P2
+        }
+
+        fn attach(
+            &self,
+            _policy: &WasiPolicy,
+            host_state: &mut StoreHostState,
+        ) -> Result<(), WasiError> {
+            let mut builder = wasmtime_wasi::WasiCtxBuilder::new();
+            builder.env("OPERUNE_WASI_VIEW_TEST", "attached");
+            host_state.set_wasi_state(WasiP2HostState::new(builder.build()));
             Ok(())
         }
     }
@@ -337,6 +413,44 @@ mod tests {
             Ok(_) => test_failure("store must be rejected when WASI attach fails"),
             Err(e) => assert!(matches!(e, RuntimeError::Wasi(_))),
         }
+    }
+
+    #[test]
+    fn wasi_view_returns_attached_wasi_context() {
+        // WasiView 接线（正常路径）：attach 经 set_wasi_state 安装的 WASI
+        // 0.2 context 被 ctx() 原样返回（marker env 可见，证明返回的是
+        // attach 时的 context 而非构造时预置的空 context）。
+        let engine = engine();
+        let factory = expect_ok(
+            StoreFactory::with_wasi(&engine, &WasiViewAdapter, &WasiPolicy::p2()),
+            "store factory with wasi view adapter",
+        );
+        let mut store = expect_ok(
+            factory.new_store(&ResourceBudget::default()),
+            "store creation with wasi",
+        );
+        let view = wasmtime_wasi::WasiView::ctx(store.store.data_mut());
+        assert_eq!(
+            view.ctx.cli().environment,
+            vec![("OPERUNE_WASI_VIEW_TEST".to_owned(), "attached".to_owned())]
+        );
+    }
+
+    #[test]
+    fn wasi_view_without_attach_returns_deny_by_default_context() {
+        // §7.6 deny-by-default：未 attach WASI 的 Store 的 ctx() 返回零权限
+        // 空 context（构造时预置）——无环境变量/参数、网络结构性关闭、
+        // 零熵随机源；guest 拿不到任何宿主能力。
+        let engine = engine();
+        let mut store = store_with_budget(&engine, &ResourceBudget::default());
+        assert!(store.store.data().adapter_state().is_none());
+        let view = wasmtime_wasi::WasiView::ctx(store.store.data_mut());
+        assert!(view.ctx.cli().environment.is_empty());
+        assert!(view.ctx.cli().arguments.is_empty());
+        assert!(!view.ctx.sockets().allowed_network_uses.tcp);
+        assert!(!view.ctx.sockets().allowed_network_uses.udp);
+        assert!(!view.ctx.sockets().allowed_network_uses.ip_name_lookup);
+        assert_eq!(view.ctx.random().insecure_random_seed, 0);
     }
 
     #[test]

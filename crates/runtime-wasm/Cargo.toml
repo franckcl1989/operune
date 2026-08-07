@@ -33,6 +33,20 @@ wasmtime = { workspace = true, default-features = false, features = [
     "parallel-compilation",
 ] }
 
+# §22.2 wasmtime-wasi 36.x LTS（与 wasmtime 同 release line，§22.2 三件套；
+# 36.0.13）。启用原因（受控 glue 例外，0020e24 审计裁决，见 git 历史）：
+# WasiView binding trait 属本 crate（wasmtime-wasi），orphan rule 强制只能
+# 由持有 Store 类型的 crate 实现 → StoreHostState 的 WasiView 接线必须写在
+# runtime-wasm（§8.2 的 MUST NOT 列表不含 runtime-wasm；该 §8.2 张力已在
+# 0020e24 审计中裁决，见 git 历史）。
+#
+# 边界（§8.2/§24.2）：WASI 具体 linker/binding 仍以 runtime-wasi-p2 为主导；
+# 本 crate 只做 WasiView 接线（专用字段，构造时预置零权限 context，见
+# store.rs 的 WasiView 实现文档）。default-features = false 继承根条目：
+# preview1（wiggle 遗留）与 p3（experimental，§4.2 MUST NOT）不启用；
+# p2 是恒在模块，无需 feature 开关。
+wasmtime-wasi = { workspace = true }
+
 # §22.5：typed error（§14.1）。
 thiserror = { workspace = true }
 

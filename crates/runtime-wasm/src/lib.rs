@@ -40,6 +40,13 @@
 //! `storage` 不得 import `wasmtime_wasi::p2`/`p3` 具体类型（§8.2）；本 crate
 //! 是隔离层，[`wasi::WasiAdapter`] 是 runtime-wasm ↔ runtime-wasi-p2 的
 //! adapter 契约（本 crate 不 import runtime-wasi-p2 的具体类型）。
+//!
+//! 受控 glue 例外（0020e24 审计裁决，见 git 历史）：`wasmtime_wasi::WasiView`
+//! binding trait 因 orphan rule 只能由持有 Store 类型的 crate 实现，故
+//! [`store::StoreHostState`] 的 WasiView 接线必须存在于此（§8.2 的 MUST NOT
+//! 列表不含 runtime-wasm）。该例外只覆盖接线本身：公开面限于
+//! [`wasi::WasiP2HostState`] 与其安装点 [`store::StoreHostState::set_wasi_state`]，
+//! WASI 具体 linker/binding 仍只存在于 runtime-wasi-p2（§24.2）。
 //! 错误模型（§14）：[`error::RuntimeError`] 为封闭 typed error，第三方错误
 //! 装箱为可诊断 source（[`error::ErrorSource`]），不向公共边界返回 anyhow/
 //! `Box<dyn Error>` 本身。
@@ -68,7 +75,7 @@ pub use budget::{
 };
 pub use component::ComponentHandle;
 pub use engine::{EngineConfig, EngineHandle, EpochTicker};
-pub use error::{ResourceLimitKind, RuntimeError, TrapKind, WasmFailure};
+pub use error::{ResourceLimitKind, RuntimeError, TrapKind, WasmFailure, classify_wasm_error};
 pub use instance::{DispatchError, InstanceLease, InstanceSet};
 pub use store::{StoreFactory, StoreHandle, StoreHostState};
-pub use wasi::{WasiAdapter, WasiError, WasiPolicy, WasiVersion};
+pub use wasi::{WasiAdapter, WasiError, WasiP2HostState, WasiPolicy, WasiVersion};
