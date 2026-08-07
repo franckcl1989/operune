@@ -20,6 +20,15 @@
 //!   [`operune_runtime_wasi_p2::adapter::WasiContextAdapter`]；
 //! - **domain**（§18.3 记录类型）：[`operune_domain`]。
 //!
+//! # 0.2.0 Capability Composition（§40）
+//!
+//! §40.2 MUST scope 的 capability composition conformance suite 见
+//! [`composition_suite`]：真实 wasmtime 观察（§40.3 事实源）→ records →
+//! application [`operune_application::CompositionService`]（graph 构建 /
+//! 门控 / 升级分析 / §40.4 确定性）→ runtime-wasm
+//! [`operune_runtime_wasm::LinkedComponentSet`]（§40.2 宿主桥接，规格从
+//! graph 快照映射）。§40 链接夹具见 [`fixtures`]（`LINKED_*_WAT`）。
+//!
 //! wasmtime 具体类型（[`wasmtime::component::Linker`] / `Instance` / `Func`）只在
 //! 集成测试面出现（runtime-wasm engine.rs / store.rs 定义的"受控泄漏点"，
 //! §8.2——与 application 的 [`operune_application::WasmtimeRuntime`] 同一位置）。
@@ -61,6 +70,8 @@
 //! [`test_support::test_failure`]（runtime-wasm / application 的 test_support
 //! 同模式，§26.1 允许测试断言语义）。
 
+#[cfg(test)]
+mod composition_suite;
 #[cfg(test)]
 mod fixtures;
 #[cfg(test)]

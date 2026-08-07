@@ -30,6 +30,13 @@
 //! | Web assets + sandbox escape attempt component | 导出 web descriptor/assets/actions 的组件（§21.3 闭环）与尝试逃逸（越权读取、遍历 asset path、绕过 Core bridge）的攻击组件（§32） | `operune:web@0.1.0` 导出 | 同上 |
 //! | （间接）supply-chain conflict 全链路 | 同一 `ComponentId+ComponentVersion` 不同 digest 的显式阻断经真实 descriptor 的端到端验证（§39.4；当前由 application 单测以 fake 覆盖） | `operune:component/descriptor` | 同上 |
 //!
+//! # 0.2.0 Capability Composition（§40.2 / §40.3）相关缺口
+//!
+//! | §40.2 条目 | 缺口夹具 | 需要的 guest 契约 | 补齐条件 |
+//! |---|---|---|---|
+//! | 复杂 WIT 类型的链接端口（record/variant/enum/string 等非 primitive） | record/variant 签名（如 `checkout(cart: record)`）的 provider/consumer 链接夹具 | 由 cargo-component 生成 canonical ABI 编解码的 guest 组件 | cargo-component 工具链就绪后构建。0.2.0 里程碑 runtime 侧以 `UnsupportedPortType` 明确拒绝非 primitive 端口（runtime-wasm linked.rs），拒绝路径已由 conformance 的 primitive 夹具覆盖；**成功链接路径**待工具链 + 里程碑扩展后补充 |
+//! | provider upgrade 全链路（真实升级二进制对） | v1 → v2 两版真实 provider 二进制的端到端升级（§40.2 consumer compatibility analysis 的完整编排；当前 conformance 以真实 surface 观察 + records 构造覆盖门控语义） | 同 interface 两版本的 guest 组件对 | cargo-component 工具链就绪后构建同一 interface 多版本二进制，验证"升级后旧版本实例排空、新版本接管"的完整编排 |
+//!
 //! 另注：`wasi:cli/run@0.2.0` 这类**复杂签名**的 WASI import（`result<(), error-code>`
 //! 变体）同样无法手写 wat（named-type 注册要求），只支持 primitive 签名
 //! 的 WASI import（本套件 `UNKNOWN_IMPORT_COMPONENT_WAT` 采用
@@ -75,6 +82,14 @@ const GAPS: &[Gap] = &[
     Gap {
         section30: "supply-chain conflict 全链路（间接）",
         description: "同一 ComponentId+ComponentVersion 不同 digest 的端到端阻断需真实 descriptor",
+    },
+    Gap {
+        section30: "0.2.0 复杂 WIT 类型的链接端口（record/variant/enum/string）",
+        description: "record/variant 签名链接夹具需 cargo-component（canonical ABI 编解码）；0.2.0 以 UnsupportedPortType 拒绝非 primitive 端口，成功路径待工具链",
+    },
+    Gap {
+        section30: "0.2.0 provider upgrade 全链路（真实升级二进制对）",
+        description: "同 interface 多版本真实 provider 二进制对需 cargo-component；当前以真实 surface + records 构造覆盖门控语义",
     },
 ];
 
