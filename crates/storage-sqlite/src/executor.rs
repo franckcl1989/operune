@@ -1842,23 +1842,49 @@ mod tests {
 
     #[tokio::test]
     async fn aborted_task_cancels_queued_request() {
-        // 结构化取消：caller future 被 drop → RAII 探针置位 → Cancelled。
+        // 结构化取消：caller future 被 drop → RAII 探针置位 → 队列中请求被取消
+        // （§18.2）。确定性驱动（§26.5，不用 sleep 猜测时序）：
+        //   1. `sent` 信号 = 请求已入队（gate 阻塞 worker，请求停留在队列）；
+        //   2. `task.await` = join 完成 ⇒ 运行时已 drop 任务 future ⇒
+        //      CancelGuard 已置位探针。`task.abort()` 只标记任务，future 的
+        //      drop 是异步的——若在 worker 的取消检查前尚未 drop，请求会带
+        //      未置位探针执行（旧版间歇失败根因）。join 完成保证 guard 的
+        //      drop 先于 gate 释放，任何交错下都断言同一不变量。
         let dir = tempdir();
         let ex = std::sync::Arc::new(open_executor(dir.path()).await);
         let release = gate(&ex).await;
+        let (sent_tx, sent_rx) = tokio::sync::oneshot::channel();
         let task = {
             let ex = std::sync::Arc::clone(&ex);
             tokio::spawn(async move {
-                ex.set_config("aborted.key".into(), "x".into(), audit("aborted"))
-                    .await
+                let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                let cancel = Arc::new(AtomicBool::new(false));
+                // RAII 取消 guard：本 future 被 drop（abort）即置位探针。
+                let _cancel_guard = CancelGuard(cancel.clone());
+                ex.try_submit_request(Request {
+                    cmd: Command::SetConfig {
+                        key: "aborted.key".into(),
+                        value: "x".into(),
+                        audit: audit("aborted"),
+                    },
+                    cancel,
+                    reply: reply_tx,
+                })?;
+                let _ = sent_tx.send(());
+                let _ = reply_rx.await;
+                Ok::<(), StorageError>(())
             })
         };
-        // 给任务时间把请求送入队列（gate 保证 worker 不会消费）。
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // 同步点 1：请求已入队（worker 仍被 gate 阻塞，请求留在队列中）。
+        ok(sent_rx.await, "request enqueued");
         task.abort();
+        // 同步点 2：join 完成 ⇒ 任务 future 已被 drop ⇒ 探针已置位。
+        let join = task.await;
+        assert!(
+            matches!(&join, Err(error) if error.is_cancelled()),
+            "aborted task must report cancellation, got {join:?}"
+        );
         unit_ok(release.send(()), "release gate");
-        // 稍候 worker 处理（队列中的请求看到探针已置位）。
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert!(
             ok(ex.get_config("aborted.key".into()).await, "get config").is_none(),
             "aborted request must not commit"
