@@ -11,7 +11,11 @@ use std::sync::{Arc, Mutex};
 
 use operune_application::cancel::CancellationToken;
 use operune_application::contract::GuestActionPayload;
-use operune_application::{ActionName, WebAssetPath};
+use operune_application::{
+    ActionContext, ActionDenied, ActionName, ActionPolicyPort, AuditError, AuditEvent, AuditPort,
+    ConfigError, ConfigPort, PermissionDenied, RuntimeConfig, WebAssetPath, WebPermissionContext,
+    WebPermissionPolicyPort,
+};
 use operune_domain::{AppDeclaration, ContentDigest, InstallationId, PageId, RouteId, TypedParam};
 
 use crate::bridge::ComponentWebPort;
@@ -37,6 +41,85 @@ pub(crate) fn some<T>(value: Option<T>, what: &str) -> T {
     match value {
         Some(value) => value,
         None => unreachable!("上面的断言已保证 is_some"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// application 用例 port 的最小 fake（0.4 接线测试用；§32 注入缝）
+// ---------------------------------------------------------------------------
+// application 的 test_support 是 `#[cfg(test)]` 模块（不跨 crate 导出），
+// 这里按接线测试所需构造最小 fake：`FakeConfig` / `FakeAudit` 固定行为；
+// `AllowAllActionPolicy` / `AllowAllWebPermissionPolicy` 放行全部——授权链
+// 的前置阶段（auth / RBAC）由 HTTP 层负责（§24.2），application 的检查点
+// 只是链上环节，放行不改变被测试的接线语义（拒绝语义由 bridge 的映射
+// 单测覆盖）。
+
+/// 固定 `RuntimeConfig` 快照的 config fake（§18.0；接线测试用默认值）。
+pub(crate) struct FakeConfig {
+    snapshot: RuntimeConfig,
+}
+
+impl FakeConfig {
+    pub(crate) fn new() -> Self {
+        Self {
+            snapshot: RuntimeConfig::default(),
+        }
+    }
+}
+
+impl ConfigPort for FakeConfig {
+    fn snapshot(&self) -> Result<RuntimeConfig, ConfigError> {
+        Ok(self.snapshot.clone())
+    }
+}
+
+/// 记录审计事件数的 audit fake（§16.6 metadata-only；接线测试只断言计数，
+/// 不解析事件内容）。
+pub(crate) struct FakeAudit {
+    events: Mutex<usize>,
+}
+
+impl FakeAudit {
+    pub(crate) fn new() -> Self {
+        Self {
+            events: Mutex::new(0),
+        }
+    }
+
+    pub(crate) fn events(&self) -> usize {
+        match self.events.lock() {
+            Ok(count) => *count,
+            Err(_) => 0,
+        }
+    }
+}
+
+impl AuditPort for FakeAudit {
+    fn append(&self, _event: AuditEvent) -> Result<(), AuditError> {
+        if let Ok(mut count) = self.events.lock() {
+            *count = count.saturating_add(1);
+        }
+        Ok(())
+    }
+}
+
+/// action policy fake：放行全部（§21.3 服务端重做链的 grant/body/rate
+/// 环节不在接线测试范围）。
+pub(crate) struct AllowAllActionPolicy;
+
+impl ActionPolicyPort for AllowAllActionPolicy {
+    fn check(&self, _context: &ActionContext) -> Result<(), ActionDenied> {
+        Ok(())
+    }
+}
+
+/// web permission policy fake：放行全部（§17.5 第四层检查点的接线测试中
+/// 不注入拒绝；拒绝 → `BridgeError` 的映射由单测覆盖）。
+pub(crate) struct AllowAllWebPermissionPolicy;
+
+impl WebPermissionPolicyPort for AllowAllWebPermissionPolicy {
+    fn check_permission(&self, _context: &WebPermissionContext) -> Result<(), PermissionDenied> {
+        Ok(())
     }
 }
 

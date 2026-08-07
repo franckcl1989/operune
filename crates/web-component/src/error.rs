@@ -40,8 +40,10 @@ pub enum BridgeError {
     // ------------------------------------------------------------------
     // 0.4.0（§42.2 Web Application Runtime）
     // ------------------------------------------------------------------
-    /// 0.4 面未接线（接线点：application 的 WebAppService 落地后由
-    /// [`crate::bridge::AppWebBridge`] 委托；未接线时 0.4 面确定性拒绝）。
+    /// 0.4 面未接线（接线点：[`crate::bridge::AppWebBridge`] 委托
+    /// application 的 [`operune_application::WebAppService`]；0.4.0 起生产
+    /// 接线已落地，本变体保留在封闭集合中以表达未注入服务的组合状态——
+    /// 当前无生产构造点，防御性保留）。
     #[error("0.4 web application surface is not wired (application WebAppService adapter pending)")]
     WebAppNotWired,
     /// 页面不存在（导航；§42.2 pages——挂载命名空间下的静态页面路径）。
@@ -70,6 +72,9 @@ pub enum BridgeError {
     /// 断开或 deadline 后 Core 中止调用并丢弃结果）。
     #[error("request cancelled")]
     Cancelled,
+    /// route 调用 deadline 到期（§42.2：运行时 epoch 强制；504 语义）。
+    #[error("route call deadline exceeded")]
+    DeadlineExceeded,
     /// route 路径非法（防御性；正常请求路径不产生）。
     #[error("invalid route path: {0}")]
     InvalidRoutePath(&'static str),
@@ -105,6 +110,7 @@ impl BridgeError {
             BridgeError::PageDenied | BridgeError::RouteDenied => StatusCode::FORBIDDEN,
             BridgeError::QuotaExceeded => StatusCode::TOO_MANY_REQUESTS,
             BridgeError::Cancelled => StatusCode::REQUEST_TIMEOUT,
+            BridgeError::DeadlineExceeded => StatusCode::GATEWAY_TIMEOUT,
             BridgeError::QuotaDenied(QuotaDenied::RateLimited) => StatusCode::TOO_MANY_REQUESTS,
             BridgeError::QuotaDenied(QuotaDenied::Busy) => StatusCode::SERVICE_UNAVAILABLE,
         }
