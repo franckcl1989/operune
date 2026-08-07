@@ -1,0 +1,18 @@
+package operune:scheduler@0.1.0;
+
+// operune:scheduler@0.1.0 — 参考 world（作者侧便利，非运行时事实源）
+//
+// 使用 scheduler 服务的 Component 在 0.1.0 需要与 operune:scheduler
+// 相关的契约总览：导入 scheduler（注册/取消/状态查询），导出 handler
+// （Core 在 fire 时刻同步调用）。
+// Core 的兼容判断只依赖二进制中真实可观察的 contract surface（§6.7），
+// 不依赖 root world 名称。
+//
+// 完整 stateful Component 还导出 operune:component/descriptor@0.1.0 及
+// 按需的其它 operune 契约；各 package 的参考 world 可组合。
+
+/// 使用 Operune scheduler 服务的 Component 参考 world。
+world operune-scheduler-component {
+    import scheduler;
+    export handler;
+}

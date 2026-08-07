@@ -1,0 +1,156 @@
+/// operune:scheduler@0.1.0 — scheduler 契约（规范 §41.2）
+///
+/// 0.3.0 MUST Scope 的 scheduler：注册/取消定时任务，与
+/// scheduler backpressure（§41.2 MUST）。
+///
+/// ## 交付模型：Core-mediated push（guest 导出 handler，Core 触发）
+/// - 定时器到期时 Core 调用本 package `handler` interface（guest
+///   export）——与 operune:web/actions 相同的"Core 同步调用 guest
+///   export"形态，**不需要 async func**（§8.3 WASI 0.3 Gate 通过前
+///   不引入 async，§42.3）；
+/// - 交付落在 bounded Instance Set 的任一实例（§7.3）：不承诺跨调用
+///   instance affinity——0.3.0 的权威状态在 Core-managed state store
+///   （operune:state），handler 无需实例亲和；
+/// - 定时任务本体（fire 序列）是 Core 侧事实：跨实例、跨重启存活
+///   （持久化策略是 Core 实现细节）；guest 每次 fire 收到完整载荷，
+///   无需在自身保存任务状态。
+///
+/// ## deadline / trigger 语义
+/// - `fire-at`（one-shot）与 `next-fire-at`（periodic）是 UTC 硬时刻
+///   （`datetime`，自 Unix epoch 起），不是相对延迟；
+/// - `schedule` 时目标时刻已过去 → `invalid-trigger`（guest 应先读
+///   时钟计算未来时刻；本契约不含时间读取，时间读取用 wasi:clocks）；
+/// - periodic 的 `interval` 受 Core 策略性最小间隔约束，低于策略下限
+///   → `invalid-trigger`（策略值不进入契约）。
+///
+/// ## 交付与 backpressure 语义（§41.2 MUST，确定性契约）
+/// - 交付为 **at-most-once**：无重试、无 catch-up 回放；每次 fire
+///   要么交付一次、要么计入错过；
+/// - 错过（missed）来源：交付队列溢出（实例忙/实例集受限，§7.3）、
+///   Core 停机期间错过的 fire、handler 调用自身 trap（fire 视为已
+///   消费，不重投）;
+/// - 错过计数 `missed-fires` 随下一次成功交付可见（handler 载荷），
+///   或经 `get-task-status` 查询（one-shot 全错过时 guest 以此
+///   可观测）；周期性任务恢复后从当前时刻继续，不补投；
+/// - Core 侧每安装实例的待交付队列有界（§7.4 最大排队）；
+///   注册任务总数受 §7.4"Component 生成的后台任务数量"上限约束 →
+///   `over-budget`；
+/// - `cancel` 竞态：cancel 返回 ok 后不再产生新 fire，但已在途的
+///   一次 fire 仍可能先到（线性化点）；guest 用 `sequence` 幂等
+///   （见 handler.wit）。
+///
+/// ## 与 wasi:clocks 的差异（P4，论证见 wit/README.md §8）
+/// wasi:clocks 是读时钟接口（monotonic/wall-clock 的 now/resolution，
+/// 及 monotonic 上的 subscribe-duration→pollable 睡眠原语），
+/// 不提供任务注册、周期触发、取消、宿主侧预算与背压、交付契约；
+/// WASI 亦无 timers/scheduling 提案。guest 自行 poll 时钟自调度是
+/// guest 内部事实：无宿主侧注册/取消/预算/可观测性，且占用 guest
+/// CPU——本 package 是仅 Operune 平台拥有的领域契约（§6.6）。
+///
+/// ## 与 0.4 web 演进的关系（§21.4 / §42，不重复实现）
+/// 本契约是 stateful substrate 的一部分：0.4 的 per-Component HTTP
+/// quotas/backpressure 复用本契约确立的交付/背压模式，不重造第二套
+/// 调度系统；本 package 按自身版本独立演进（§6.6）。
+package operune:scheduler@0.1.0;
+
+/// 定时任务注册服务（Component import）。
+interface scheduler {
+    /// UTC 时刻（record wrapper；WIT 无原生 datetime，§8.2 不嵌入
+    /// wasi:clocks 的类型，自持定义）。
+    ///
+    /// 不变量：`nanoseconds < 1_000_000_000`；语义为自 Unix epoch 起
+    /// 的 UTC 秒 + 纳秒偏移。不含时区/日历语义。
+    record datetime {
+        seconds: u64,
+        nanoseconds: u32,
+    }
+
+    /// 周期（record wrapper，§13.5；毫秒精度）。
+    record duration {
+        millis: u64,
+    }
+
+    /// 任务触发形态（variant 表达互斥形态，§6.3）。
+    variant schedule-trigger {
+        /// 一次性：在 `fire-at` 时刻触发一次。
+        one-shot(datetime),
+        /// 周期：`next-fire-at` 时刻首次触发，此后每 `interval` 触发。
+        /// 错过不补投（见本文件顶部交付语义）。
+        periodic {
+            next-fire-at: datetime,
+            interval: duration,
+        },
+    }
+
+    /// 待注册的定时任务（0.1.0 只携带触发形态）。
+    ///
+    /// 任务语义数据由 guest 自己关联（handler 载荷带 `task-id`，
+    /// guest 可在 operune:state 中保存任务映射）。
+    record scheduled-task {
+        trigger: schedule-trigger,
+    }
+
+    /// Core 分配的任务标识（record wrapper，§13.5）。
+    record scheduled-task-id {
+        value: u64,
+    }
+
+    /// 任务生命周期状态（enum 表达闭集，§6.3）。
+    enum task-state {
+        /// 已注册，等待未来触发。
+        scheduled,
+        /// 已取消（`cancel` 成功；不再触发）。
+        cancelled,
+        /// 已结束：one-shot 已触发/已错过，或周期性任务被取消前
+        /// 的终态以外情形（见 `cancelled`）。
+        completed,
+    }
+
+    /// 任务状态查询结果（供错过观测与诊断）。
+    record task-status {
+        state: task-state,
+        /// 自上次成功交付以来被背压/停机错过的 fire 数
+        /// （与 handler 载荷的 `missed-fires` 同源）。
+        missed-fires: u64,
+        /// 下一次计划触发时刻（一次性已触发或已取消时为 none）。
+        next-fire-at: option<datetime>,
+    }
+
+    /// scheduler 的预期失败（§6.3）。
+    enum scheduler-error {
+        /// 未获 scheduler 能力授权（grant 解析/撤销，§17.1/§17.5）。
+        denied,
+        /// 触发形态违反契约不变量（目标时刻已过去、interval 低于
+        /// 策略下限、schedule 频率超限等）。
+        invalid-trigger,
+        /// 任务不存在（`cancel`/`get-task-status` 的未知或已结束任务；
+        /// 已触发的一次性任务视为不存在）。
+        not-found,
+        /// 调度器未就绪（激活窗口/恢复中）。稍后重试。
+        not-ready,
+        /// 超出预算：注册任务总数（§7.4 后台任务数量）、待交付队列
+        /// 或调度速率上限。
+        over-budget,
+        /// guest/host 内部不可恢复错误。
+        internal,
+    }
+
+    /// 注册一个定时任务（§41.2 scheduler）。
+    ///
+    /// 返回 Core 分配的任务标识；触发形态立即被校验（`invalid-trigger`
+    /// 在注册期拒绝，不产生任务）。
+    schedule: func(task: scheduled-task) -> result<scheduled-task-id, scheduler-error>;
+
+    /// 取消已注册任务。
+    ///
+    /// - 返回 ok：任务已从调度器移除，之后不再产生新 fire；已在途的
+    ///   一次 fire 仍可能先到（见本文件顶部 cancel 竞态）；
+    /// - 一次性任务已触发/已错过、或任务未知 → `not-found`。
+    cancel: func(id: scheduled-task-id) -> result<_, scheduler-error>;
+
+    /// 查询任务状态（错过观测与诊断；side-effect-free）。
+    ///
+    /// 一次性任务被错过（missed-fires > 0 且状态 completed）时，
+    /// guest 以此可观测全错过的交付损失。
+    get-task-status: func(id: scheduled-task-id) -> result<task-status, scheduler-error>;
+}

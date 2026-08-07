@@ -1,0 +1,43 @@
+package operune:config@0.1.0;
+
+// operune:config@0.1.0 — config validation（Component 导出，Core 写入/升级时调用）
+//
+// validation 语义（§41.2 MUST："Component config storage/validation"）：
+// - 校验逻辑属于 Component 自身（P6：Core 永远不懂具体运维产品——
+//   Core 无法判断业务配置"对不对"，只能要求 Component 判断）；
+// - Core 在配置写入与升级重校验时，以与正常运行相同或更严格的预算
+//   （§7.4/§7.5：memory/table/instance/host-buffer/deadline）调用本
+//   interface 的 `validate`；返回错误 → 配置不被接受，当前配置保持，
+//   版本不递增（原子性，见 config.wit 顶部）；
+// - validate 是纯函数契约：side-effect-free、bounded、可重复；不得
+//   依赖当前时间、随机数、外部网络或宿主可变文件（§19.3 精神）；
+// - validate 不接触 operune:secret：校验逻辑不得读取 secret 参与判定
+//   （配置不得包含敏感值，见 config.wit 顶部三分离）。
+
+/// Component 的 config 校验器（Core 消费）。
+interface validator {
+    use config.{config-value};
+
+    /// 配置校验失败的诊断（variant 携带面向管理员的有界原因文本）。
+    ///
+    /// 原因文本由 Core 显示在管理面（长度受宿主侧上限约束），
+    /// 不进入审计日志的敏感字段；配置值本身不是 secret（§41.2
+    /// 三分离），原因文本中也不得回显配置值内容。
+    variant config-validation-error {
+        /// 值无法按声明格式解析（Core 的格式解析与 Component 的
+        /// 校验共同覆盖该情形；Component 侧给出补充原因）。
+        invalid-format(string),
+        /// 值解析成功但语义校验失败（业务不变量违反等）。
+        invalid-value(string),
+        /// guest 内部不可恢复错误。
+        internal,
+    }
+
+    /// 校验一份待接受的配置值。
+    ///
+    /// 契约：side-effect-free、bounded、可重复（见本文件顶部）；
+    /// 返回 ok 表示"该值可在本 ComponentVersion 下作为当前配置
+    /// 生效"。Core 保证同一版本下多次调用结果一致（不一致视为
+    /// contract violation，配置保持未接受）。
+    validate: func(value: config-value) -> result<_, config-validation-error>;
+}

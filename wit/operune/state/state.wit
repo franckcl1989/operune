@@ -1,0 +1,192 @@
+/// operune:state@0.1.0 — typed Component state service（规范 §41.2）
+///
+/// 本 package 表达 0.3.0 Stateful Runtime 的 Component state 契约。§41.2 对
+/// Config / State / Secret 三分离的明确定义中，State 是：
+///
+/// > State 是 Component 产生的权威持久业务状态。
+///
+/// 即：State 由 Component 的业务运行产生（不是管理员输入、不是凭据），
+/// 是权威的持久事实，绝不把 linear memory 当持久事实源（§41.1 目标；
+/// P8 版本与状态必须可恢复，§3）。
+///
+/// ## 0.1.0 stateless → 0.3.0 stateful 的边界（§7.3，必须保持）
+/// 0.3.0 引入权威状态存储**不**意味着 §7.3 的 stateless 边界回归：
+/// 权威状态在 Core-managed state store（§20.5），不在 linear memory、
+/// 不在实例局部变量；实例仍然可互换（bounded Instance Set，不承诺跨调用
+/// instance affinity）。本契约正是"把持久事实从 linear memory 移出"的
+/// 承载——guest 不得把 Store/Instance 当跨调用持久容器，任何需要跨调用
+/// 存活的事实都必须落进本 state store。
+///
+/// ## 与 wasi:keyvalue 的关系（P4，论证见 wit/README.md §5）
+/// wasi:keyvalue 是 WASI 的 key-value store 预览提案（Phase 2 draft），
+/// wasmtime 不提供其生产支持（仅独立的非持久 in-memory crate）。
+/// 其单键 get/set/CAS 子集本契约承认是 WASI 的标准草稿表达；但 §41.2
+/// MUST 的事务/原子更新、state schema version、显式 migration、
+/// 失败回滚、跨 migration 崩溃恢复、按安装实例的预算与审计语义均不被
+/// 其表达。本 package 是仅 Operune 平台拥有的领域契约（§6.6）。
+///
+/// ## versioned state 与显式 migration（§41.2 / §20.5）
+/// - 每个安装实例的 state store 有一个整体 `state-schema-version`；
+/// - 运行时操作绑定到"当前声明的 schema version"：`begin-transaction`
+///   显式携带版本参数（契约层的版本表达），版本不符返回
+///   `unsupported-schema-version`；migration 进行中返回 `not-ready`；
+/// - 升级路径：新 ComponentVersion 声明新版本 → Core 调用本 package 的
+///   `migration` interface（guest export）→ 成功则原子 commit，失败则
+///   abort 回滚（§20.5：migration 必须版本化、原子、可失败、有 rollback
+///   policy）→ 旧版本保持可运行；migration 期间的崩溃恢复由 Core 基于
+///   持久化迁移日志执行（§18.5 crash consistency），guest 只观测到
+///   `not-ready` 窗口；
+/// - 已提交迁移后的降级（reverse migration）是未来 interface 演进，
+///   0.1.0 不定义。
+///
+/// ## 预期失败闭集（§6.3 result 表达预期失败）
+/// `state-error` 是本契约的完整预期失败集合：not-ready（存储未就绪 /
+/// migration 窗口 / 恢复中）、not-found、conflict（并发修改冲突或对已
+/// 终止事务的操作）、corrupt（持久数据完整性/schema 检查失败）、
+/// over-budget（value 体积 / 事务操作数 / 安装实例总状态预算，§7.4）、
+/// invalid-key（违反 key 不变量）、unsupported-schema-version、internal。
+/// trap、超时、超预算（宿主侧硬上限，§7.4/§7.5）由 Core 在宿主侧观察，
+/// 不进入返回值空间。
+///
+/// ## 审计（§41.2 state audit）
+/// Core 对状态操作做审计记录（操作元数据：key、操作类型、事务结果、
+/// 安装实例），审计事件不携带 value 内容；value 是业务数据而非凭据，
+/// 但审计仍只记录元数据。
+///
+/// ## 与 0.4 web 演进的关系（§21.4 / §42，不重复实现）
+/// 本契约是 stateful substrate 的一部分：0.4 的 Web Application Runtime
+/// 复用本契约与 config/secret/scheduler/event 提供的状态与能力语义，
+/// 不重造第二套状态系统；各 package 按自身版本独立演进（§6.6）。
+package operune:state@0.1.0;
+
+/// 运行时 state 服务（Component import，Core 提供）。
+///
+/// 本 interface 是 state 契约的核心：有界、类型化的状态访问，全部写路径
+/// 通过单键 CAS 或事务（atomic update semantics，§41.2 MUST）完成，不存在
+/// 非原子的裸 put/delete。
+interface state {
+    /// 状态键（record wrapper，§13.5；非裸 string）。
+    ///
+    /// 不变量：非空；仅含可打印 ASCII（`[A-Za-z0-9._-/]`，不含控制字符与
+    /// 空白）；长度受 Core 宿主侧上限约束。违反不变量返回 `invalid-key`。
+    /// key 命名空间属于安装实例私有（InstallationId 作用域，§19.4），
+    /// 本契约不存在跨安装实例的 key 引用，因此无 key 级 grant 面
+    /// （与 operune:secret 的 grant 语义不同，见 secret package）。
+    record state-key {
+        value: string,
+    }
+
+    /// 状态值：平台不透明的序列化业务字节。
+    ///
+    /// 平台不解析、不解释 value 内容（P6：Core 永远不懂具体运维产品）。
+    /// 值的结构化形态是 Component 与自身 schema 之间的事实（typed 由
+    /// schema version 与 Component 自身序列化保证）；平台侧的类型化表达
+    /// 在操作层（事务 / CAS / 版本 / 预算 / 预期失败闭集），不在 value 内。
+    /// 体积受 Core 宿主侧单值上限与安装实例总预算约束（§7.4），超限
+    /// 返回 `over-budget`。
+    record state-value {
+        data: list<u8>,
+    }
+
+    /// 安装实例 state store 的 schema 版本（契约层"versioned state"，
+    /// §41.2 / §20.5）。
+    ///
+    /// Core 以 `migration` interface 驱动 store 从旧版本迁移到新声明版本；
+    /// 见本文件顶部"versioned state 与显式 migration"。
+    record state-schema-version {
+        value: u32,
+    }
+
+    /// 单键 CAS 的结果（优化并发读-改-写，无事务开销）。
+    enum cas-outcome {
+        /// 期望值匹配，新值已原子写入。
+        applied,
+        /// 期望值不匹配，未写入；调用者应重新读取后再试。
+        rejected,
+    }
+
+    /// state 操作的预期失败闭集（§6.3）。
+    enum state-error {
+        /// state store 未就绪：激活窗口、migration 进行中或崩溃恢复中。
+        /// guest 应稍后重试；不得视为数据丢失。
+        not-ready,
+        /// 键不存在（读取/删除不存在的键）。
+        not-found,
+        /// 并发修改冲突（事务 commit 时发现重叠键被其它事务修改），
+        /// 或对已终止（已 commit/abort）事务继续操作。
+        conflict,
+        /// 持久数据完整性 / schema 检查失败（数据损坏）。
+        /// 平台不会静默返回损坏数据；该状态需要管理介入。
+        corrupt,
+        /// 超出预算：value 体积、事务操作数或安装实例总状态预算（§7.4）。
+        over-budget,
+        /// key 违反本契约不变量（见 `state-key`）。
+        invalid-key,
+        /// 存储的 schema version 与请求的版本不符（migration 待执行），
+        /// 或请求的版本不被当前 ComponentVersion 支持。
+        unsupported-schema-version,
+        /// guest/host 内部不可恢复错误。
+        internal,
+    }
+
+    /// 事务句柄（resource 表达有生命周期的 state 句柄，§6.3）。
+    ///
+    /// 生命周期契约：
+    /// - 事务必须短生命周期：在发起它的那次调用内 begin → commit/abort；
+    ///   跨调用持有事务句柄是契约违规（§7.3 不承诺 instance affinity，
+    ///   事务句柄是 Core 侧资源，不跨实例可移植）；
+    /// - `commit` 原子生效（all-or-nothing）：并发期间被其它事务修改的
+    ///   重叠键导致 `conflict`，此时整个事务无效果，调用者可重试；
+    /// - `abort` 无返回值：对已终止事务调用 abort 是 no-op；drop 句柄
+    ///   等价于 abort；
+    /// - 事务内读取看到的是一致性快照（同 schema version 下）。
+    resource state-transaction {
+        /// 读取事务内键值（未写过的键读取到 store 当前值）。
+        get: func(key: state-key) -> result<option<state-value>, state-error>;
+
+        /// 写入键值（事务内暂存，commit 时原子生效）。
+        put: func(key: state-key, value: state-value) -> result<_, state-error>;
+
+        /// 删除键（事务内暂存，commit 时原子生效）。
+        delete: func(key: state-key) -> result<_, state-error>;
+
+        /// 原子提交：全部暂存操作一次性生效（§41.2 MUST
+        /// transaction/atomic update semantics）。
+        ///
+        /// 失败（conflict / over-budget / corrupt / internal）时整个事务
+        /// 无效果；`unsupported-schema-version` 不会在 commit 出现（在
+        /// `begin-transaction` 已拦截），但实现仍按确定性语义处理。
+        commit: func() -> result<_, state-error>;
+
+        /// 放弃事务：全部暂存操作不生效。无返回值；对已终止事务是 no-op。
+        abort: func();
+    }
+
+    /// 快照读取单键值（side-effect-free 的点读）。
+    ///
+    /// 绑定当前声明的 schema version：存储版本不符返回
+    /// `unsupported-schema-version`；migration 窗口返回 `not-ready`。
+    get: func(key: state-key) -> result<option<state-value>, state-error>;
+
+    /// 单键原子比较-交换（读-改-写的基础原语，§41.2 atomic update）。
+    ///
+    /// `expected: none` 表示"键不存在"，`new: none` 表示"删除"——
+    /// 四种组合（存在/不存在 × 写/删）均可表达。期望值用 `state-value`
+    /// 字节等价比较。
+    cas: func(
+        key: state-key,
+        expected: option<state-value>,
+        new-value: option<state-value>,
+    ) -> result<cas-outcome, state-error>;
+
+    /// 开启一个事务，绑定请求的 schema version。
+    ///
+    /// - 版本必须等于 store 当前 schema version，否则返回
+    ///   `unsupported-schema-version`（这是迁移前阻止混合版本写入的
+    ///   契约边界）；
+    /// - migration 进行中返回 `not-ready`；
+    /// - 每个安装实例的并发事务数受 Core 宿主侧上限约束（§7.4）。
+    begin-transaction: func(
+        schema-version: state-schema-version,
+    ) -> result<state-transaction, state-error>;
+}

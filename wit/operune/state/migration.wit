@@ -1,0 +1,59 @@
+package operune:state@0.1.0;
+
+// operune:state@0.1.0 — state migration（Component 导出，stateful upgrade 时 Core 调用）
+//
+// §20.5 明文：Migration 必须是版本化、原子、可失败并具备 rollback policy
+// 的显式操作。本 interface 是"显式 migration"的契约面：
+//
+// 升级流程（Core 执行，本契约只定义 guest 侧行为）：
+// 1. 新 ComponentVersion 激活前，Core 比较其 `state-declaration` 的
+//    schema-version 与 store 当前存储版本；不同则进入迁移路径；
+// 2. Core 创建排他的 migration 事务，调用本 interface 的 `migrate`
+//    （from = 存储版本，to = 新声明版本）；
+// 3. guest 读取旧版本数据、写入新版本形态，返回 ok → Core 原子 commit，
+//    store 存储版本更新为 to；
+// 4. guest 返回错误 / trap / 超时 / 超预算 → Core abort，store 不变，
+//    升级被阻止，旧 ComponentVersion 保持激活（rollback，§20.5）；
+// 5. 迁移期间 state 运行时操作返回 `state-error.not-ready`；
+//    崩溃恢复由 Core 基于持久化迁移日志完成（§18.5），guest 只观测
+//    到 not-ready 窗口。
+//
+// 本契约只支持单跳迁移（from → to 一次调用）。多跳迁移链
+// （V0→V1→V2）是未来 interface 演进，0.1.0 不定义。
+
+/// stateful upgrade 的显式 migration handler（Core 消费）。
+interface migration {
+    use state.{state-schema-version, state-transaction};
+
+    /// migration 的预期失败（guest 返回值空间）。
+    enum migration-error {
+        /// from/to 超出本 ComponentVersion 支持的迁移范围。
+        /// Core 以此拒绝升级并提供明确诊断，store 不变。
+        unsupported-version-range,
+        /// 旧版本数据无法读取/解析（数据损坏或与 from 版本不符）。
+        malformed-source,
+        /// 迁移超出操作数/体积预算（§7.4）。
+        over-budget,
+        /// guest 内部不可恢复错误。
+        internal,
+    }
+
+    /// 执行一次显式状态迁移（§41.2 / §20.5 MUST）。
+    ///
+    /// 契约：
+    /// - `transaction` 是 Core 创建的迁移事务：读侧看到旧版本形态数据，
+    ///   写侧写入 to 版本形态；guest 不得调用 `begin-transaction` 创建
+    ///   嵌套事务，也不得 aborted/commit 该事务本身——commit 与 abort
+    ///   由 Core 按返回值与宿主侧观测（trap/超时/超预算）决定；
+    /// - 返回 ok 即承诺迁移可提交；此后发生的一切失败（包括宿主侧
+    ///   观测）按"未提交迁移"回滚，不得产生部分迁移状态（§41.3：
+    ///   不得出现"代码版本已切换但状态 schema 不确定"）；
+    /// - 迁移必须可重试幂等地设计（崩溃恢复后 Core 可能以相同 from/to
+    ///   再次调用）——平台保证事务原子性，但 guest 的迁移逻辑本身
+    ///   应不依赖"仅调用一次"。
+    migrate: func(
+        from: state-schema-version,
+        to: state-schema-version,
+        transaction: state-transaction,
+    ) -> result<_, migration-error>;
+}

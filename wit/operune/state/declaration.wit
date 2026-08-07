@@ -1,0 +1,49 @@
+package operune:state@0.1.0;
+
+// operune:state@0.1.0 — state declaration（Component 导出，安装/激活期声明）
+//
+// Component 导出本 interface，向 Core 声明其 state 契约。
+// 调用时机与约束遵循 §19.3 descriptor 阶段精神（由 Core 执行）：
+// - side-effect-free、bounded、可重复（同一 ContentDigest + 同一
+//   contract version 返回同一 canonical declaration）；
+// - 不依赖当前时间、随机数、外部网络或宿主可变文件；
+// - Core 对返回值体积、执行 deadline、memory/table/instance/host-buffer
+//   预算施加与正常运行相同或更严格的宿主侧硬上限（§7.4/§7.5）。
+//
+// declaration 是安装/激活期元数据，不是运行时事实源：
+// 运行时兼容判断仍只依赖二进制中真实可观察的 contract surface（§6.7）。
+
+/// Component 的 state 契约声明（安装/激活期，Core 消费）。
+interface declaration {
+    use state.{state-schema-version};
+
+    /// 作者声明的 state 契约（§41.2 / §20.5）。
+    ///
+    /// `schema-version` 是本 ComponentVersion 激活后读取/写入的
+    /// state schema 版本。Core 用它与 store 的当前存储版本比较，
+    /// 决定是否需要在升级时调用 `migration` interface。
+    record state-declaration {
+        /// 可选的展示性名称（注册表/UI 展示，非身份事实，不参与
+        /// 兼容判断，§19.4）。
+        name: option<string>,
+        /// 本 ComponentVersion 的 state schema 版本。
+        schema-version: state-schema-version,
+    }
+
+    /// declaration 阶段的预期失败（§6.3 result 表达预期失败）。
+    ///
+    /// trap、超时、超预算由 Core 在宿主侧观察（epoch interruption /
+    /// StoreLimits，§7.4/§7.5），不进入返回值空间；candidate 保持
+    /// quarantine/failed（§19.3）。
+    enum state-declaration-error {
+        /// 返回的 metadata 无法解析或违反契约不变量。
+        malformed,
+        /// 未来演进：平台不再支持该 contract 版本。
+        unsupported-contract-version,
+        /// guest 内部不可恢复错误。
+        internal,
+    }
+
+    /// 读取 Component 的 state 契约声明。
+    get-state-declaration: func() -> result<state-declaration, state-declaration-error>;
+}

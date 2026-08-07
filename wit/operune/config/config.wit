@@ -1,0 +1,109 @@
+/// operune:config@0.1.0 — Component config storage/validation（规范 §41.2）
+///
+/// §41.2 对 Config / State / Secret 三分离的明确定义中，Config 是：
+///
+/// > Config 是管理员/系统提供、具有 validation 和版本语义的输入。
+///
+/// ## 只读给 guest；写侧不在本契约
+/// 配置的写入方是管理员/系统（Root Admin API / Core 系统面），写入时
+/// Core 执行 validation（见下）；guest 侧契约只有读取。本契约不存在
+/// 任何 guest 写配置的入口——Config 是输入，不是 Component 产生的状态。
+///
+/// ## 为什么是"有界字节 + 声明格式"，而不是 WIT 结构化 record
+/// 配置的结构是每个 Component 各自的业务形态，平台无法预知
+/// （P6：Core 永远不懂具体运维产品；§6.2 "配置描述"属于 Component
+/// 自己的内容）。WIT 无法表达任意 per-component 配置 schema，也没有
+/// 运行时动态类型求值可用。因此：
+/// - 契约层表达格式（json/toml/raw）、版本与有界体积；
+/// - 语义校验由 Component 自身以 `validator` interface（本 package 的
+///   export）承担——validation 是契约的一部分，不是 Core 内部实现；
+/// - 结构化 typed config read 是未来演进方向（如同 0.4 的 typed action
+///   类比，§42.2），0.1.0 以有界字节为过渡边界。
+///
+/// ## validation 与版本语义（§41.2 MUST）
+/// - 配置写入（管理员/系统）→ Core 调用激活中 ComponentVersion 的
+///   `validator` export → 通过才成为当前配置，原子切换；
+/// - 激活门禁：Component 存在 config contract 时，必须先有通过
+///   validation 的当前配置才能进入 active（§19.2 激活路径），
+///   因此运行时读取必有快照，无 `not-found`；
+/// - 升级：新 ComponentVersion 激活前，Core 用新版本的 `validator`
+///   重新校验现有配置；不通过则激活被阻止（配置需管理员重新提供），
+///   旧版本继续运行——这与 §17.3/§17.5 的 re-validation 语义一致；
+/// - 配置的"解释/迁移"由新版本自身的读取逻辑承担：Config 是输入、
+///   非 Component 产生的权威状态，不需要像 state 那样的平台级
+///   migration（与 operune:state 的本质区别）。
+///
+/// ## 与 state / secret 的区分（§41.2 三分离）
+/// - 与 state：state 是 Component 产生、guest 可写、平台管理 schema
+///   版本与迁移的权威持久业务状态；config 是外部输入、guest 只读、
+///   无平台级迁移；
+/// - 与 secret：config 不受 secret 的专门访问控制与防泄漏规则保护
+///   （§16.6）；因此**敏感值不得放进 config**——凭据/密钥属于
+///   operune:secret，config 只承载非敏感的业务输入。
+///
+/// ## 变更检测（无 push）
+/// 0.3.0 无 async push（§8.3 WASI 0.3 Gate 未通过前不引入）：guest
+/// 用轻量 `get-config-version` 检测变化，变化后重新 `get-config` 读取
+/// 新快照；快照读取是原子的（版本 + 值一致）。
+///
+/// ## 与 wasi:config 的关系（P4，论证见 wit/README.md §6）
+/// wasi:config 是 WASI 的 pre-release 提案（0.2.0-draft/rc），表达
+/// "读扁平字符串 KV 配置"这一子集；validation、版本语义、原子快照、
+/// 三分离边界均不被其表达。本 package 是仅 Operune 平台拥有的领域
+/// 契约（§6.6）。
+///
+/// ## 与 0.4 web 演进的关系（§21.4 / §42，不重复实现）
+/// 本契约是 stateful substrate 的一部分：0.4 的 Web Application Runtime
+/// 复用本契约的配置语义，不重造第二套配置系统；本 package 按自身
+/// 版本独立演进（§6.6）。
+package operune:config@0.1.0;
+
+/// 运行时 config 读取服务（Component import，只读）。
+interface config {
+    /// 配置快照版本（record wrapper，§13.5）。
+    ///
+    /// 每次被接受的配置写入递增（安装实例作用域）。用于变化检测与
+    /// 审计关联（§41.2 config audit）。注意与 `config-schema-version`
+    /// 的区别：这是"当前配置值"的修订号，不是配置契约的 schema 版本。
+    record config-version {
+        revision: u64,
+    }
+
+    /// 配置值：有界字节（格式由 `config-declaration` 声明）。
+    ///
+    /// 体积受 Core 宿主侧硬上限约束（§7.4 / §7.5）；值通过验证后才
+    /// 成为当前配置（见本文件顶部 validation 语义），运行时读取到的
+    /// 永远是已验证快照。
+    record config-value {
+        data: list<u8>,
+    }
+
+    /// 原子配置快照：版本与值一致（同一次读取内）。
+    record config-snapshot {
+        version: config-version,
+        value: config-value,
+    }
+
+    /// config 读取的预期失败（§6.3）。
+    enum config-error {
+        /// 配置存储未就绪（激活窗口/升级重校验窗口）。
+        /// guest 应稍后重试。
+        not-ready,
+        /// 存储的配置快照未通过完整性检查（损坏）。
+        /// 需要管理员重新提供配置。
+        corrupt,
+        /// guest/host 内部不可恢复错误。
+        internal,
+    }
+
+    /// 读取当前配置快照（原子：版本 + 值来自同一次快照）。
+    ///
+    /// 契约：激活后必有已校验快照（激活门禁，见本文件顶部），
+    /// 因此无 `not-found`；返回体积受宿主侧上限约束。
+    get-config: func() -> result<config-snapshot, config-error>;
+
+    /// 轻量读取当前配置版本（side-effect-free 变化检测）。
+    ///
+    /// 值大时用本调用代替 `get-config` 轮询；版本变化后再读取快照。
+    get-config-version: func() -> result<config-version, config-error>;
+}

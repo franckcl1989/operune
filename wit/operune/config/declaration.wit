@@ -1,0 +1,60 @@
+package operune:config@0.1.0;
+
+// operune:config@0.1.0 — config declaration（Component 导出，安装/激活期声明）
+//
+// Component 导出本 interface，向 Core 声明其 config 契约的形态。
+// 调用时机与约束遵循 §19.3 descriptor 阶段精神（由 Core 执行）：
+// side-effect-free、bounded、可重复；不依赖当前时间、随机数、外部网络
+// 或宿主可变文件；同一 ContentDigest + 同一 contract version 返回同一
+// canonical declaration；宿主侧预算与正常运行相同或更严格（§7.4/§7.5）。
+//
+// 配置的结构化 schema（如 JSON Schema）用于管理员 UI/表单生成属于
+// 未来演进方向，0.1.0 只声明格式与 schema 版本；语义校验由
+// `validator` interface（本 package 的 export）承担。
+
+/// Component 的 config 契约声明（安装/激活期，Core 消费）。
+interface declaration {
+    /// 配置值的声明格式（§6.3 enum 表达闭集）。
+    enum config-format {
+        /// JSON 文本。写入时 Core 先做格式解析校验（必须可解析为 JSON）。
+        json,
+        /// TOML 文本。写入时 Core 先做格式解析校验。
+        toml,
+        /// 平台不透明的原始字节。无格式解析，仅体积与预算校验。
+        raw,
+    }
+
+    /// 配置契约的 schema 版本（record wrapper，§13.5）。
+    ///
+    /// 本 ComponentVersion 期望的配置契约版本。写入配置时与激活版本
+    /// 的 schema-version 对应；升级到新声明版本时，现有配置用新版本的
+    /// `validator` 重新校验（见 config.wit 顶部 validation 语义）。
+    /// 注意与运行时 `config-version`（快照修订号）的区别。
+    record config-schema-version {
+        value: u32,
+    }
+
+    /// 作者声明的 config 契约。
+    record config-declaration {
+        /// 配置值的声明格式（Core 据此执行格式解析校验与展示）。
+        format: config-format,
+        /// 本 ComponentVersion 期望的配置契约 schema 版本。
+        schema-version: config-schema-version,
+    }
+
+    /// declaration 阶段的预期失败（§6.3）。
+    ///
+    /// trap、超时、超预算由 Core 在宿主侧观察（§7.4/§7.5），
+    /// 不进入返回值空间；candidate 保持 quarantine/failed（§19.3）。
+    enum config-declaration-error {
+        /// 返回的 metadata 无法解析或违反契约不变量。
+        malformed,
+        /// 未来演进：平台不再支持该 contract 版本。
+        unsupported-contract-version,
+        /// guest 内部不可恢复错误。
+        internal,
+    }
+
+    /// 读取 Component 的 config 契约声明。
+    get-config-declaration: func() -> result<config-declaration, config-declaration-error>;
+}

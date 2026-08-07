@@ -1,0 +1,19 @@
+package operune:config@0.1.0;
+
+// operune:config@0.1.0 — 参考 world（作者侧便利，非运行时事实源）
+//
+// 使用 config 服务的 Component 在 0.1.0 需要与 operune:config 相关的
+// 契约总览：导出 declaration（安装/激活期声明）与 validator（校验器），
+// 导入 config（运行时只读）。
+// Core 的兼容判断只依赖二进制中真实可观察的 contract surface（§6.7），
+// 不依赖 root world 名称。
+//
+// 完整 stateful Component 还导出 operune:component/descriptor@0.1.0 及
+// 按需的其它 operune 契约；各 package 的参考 world 可组合。
+
+/// 使用 Operune config 服务的 Component 参考 world。
+world operune-config-component {
+    export declaration;
+    export validator;
+    import config;
+}

@@ -1,0 +1,39 @@
+package operune:event@0.1.0;
+
+// operune:event@0.1.0 — 事件交付 handler（Component 导出，Core 投递）
+//
+// 交付语义见 event.wit 顶部"交付与 backpressure 语义"：
+// - at-most-once：无重试、无补投、无 ack；本 handler 无返回值——
+//   调用返回即已消费，trap 也视为已消费；
+// - 投递落在 bounded Instance Set 的任一实例（§7.3），guest 不得
+//   假设实例亲和；跨事件的事实放 operune:state；
+// - 订阅集合是 policy 事实（静态，§17.1/§17.3），guest 侧无法
+//   运行时改变投递范围（见 event.wit 顶部）；
+// - Core 对 handler 调用施加与正常运行相同或更严格的
+//   memory/table/instance/host-buffer/deadline 预算（§7.4/§7.5），
+//   trap/超时/超预算在宿主侧观测，不进返回值空间。
+
+/// 事件交付的 guest handler。
+interface handler {
+    use event.{topic, event-id, event-payload};
+
+    /// 一次投递的事件。
+    record event {
+        /// Core 分配的事件 id（审计关联，§41.2 audit）。
+        id: event-id,
+        /// 事件的 topic。
+        topic: topic,
+        /// 事件载荷（形态见 `event-payload`）。
+        payload: event-payload,
+        /// 自本订阅上次成功交付以来被背压丢弃的事件数
+        /// （0 表示未丢弃；投递侧背压的观测面，§41.2 MUST）。
+        dropped: u64,
+    }
+
+    /// 处理一次事件投递。
+    ///
+    /// 无返回值（交付语义由 Core 决定，见本文件顶部）；guest 的
+    /// 处理失败通过自身通道表达（状态记录/事件/日志——日志不含
+    /// 敏感值，§16.6）。
+    on-event: func(event: event);
+}

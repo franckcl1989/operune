@@ -1,0 +1,108 @@
+/// operune:event@0.1.0 — event bus 契约（规范 §41.2 / §17.3）
+///
+/// 0.3.0 MUST Scope 的 event bus，以及 scheduler/event backpressure
+/// （§41.2 MUST）。
+///
+/// ## 订阅是静态策略（grant），不是运行时 API（§17.1 两阶段含义）
+/// - WIT import（本 interface）表达"程序需要事件能力"；"订阅哪些
+///   topic"属于 Runtime Policy 的 grant scope（§17.3 "event topics"），
+///   由管理员在安装/授权时配置，与 §17.5 四层授权链一致；
+/// - 因此本契约**没有**运行时 subscribe/unsubscribe：订阅集合是
+///   确定的 policy 事实（快照语义，§17.5），动态订阅是未来演进方向；
+/// - guest 收到事件的"契约需求"由导出的 `handler` interface 表达
+///   （本 package）；授权撤销/scope 变化后，Core 以 policy 快照停止
+///   投递（guest 的 handler 可能还会收到撤销前已在途的事件——
+///   与 scheduler 的 cancel 竞态同类，事件载荷的 `id` 供审计关联）。
+///
+/// ## 发布语义
+/// - guest 向自己有发布授权的 topic 发布（发布授权同样在 grant
+///   scope，§17.3）；载荷有界（§7.4 host buffer 上限），
+///   发布速率受策略限制 → `over-budget`；
+/// - 发布投递对象：policy 授予该 topic 订阅的所有安装实例
+///   （Core 系统事件经同一总线投递；Core 保留系统 topic 命名空间，
+///   guest topic 不得使用保留前缀——策略细节，不进契约）。
+///
+/// ## 交付与 backpressure 语义（§41.2 MUST，与 operune:scheduler 同构）
+/// - 交付为 **at-most-once**：无重试、无补投、无 ack 协议；投递到
+///   订阅实例的 handler（Core-mediated 同步调用，无 async，
+///   §8.3/§42.3 边界同 scheduler）；
+/// - Core 侧每订阅的有界投递队列（§7.4 最大排队）溢出 → 事件被
+///   丢弃并计入 `dropped`，随下一次成功交付可见；
+/// - handler 调用 trap 视为已消费，不重投；投递落在 bounded
+///   Instance Set 的任一实例（§7.3），guest 不得假设实例亲和；
+/// - 事件 id 由 Core 分配（发布时），用于审计关联（§41.2 audit）
+///   与跨系统排查，不做交付去重（at-most-once 下无需去重语义）。
+///
+/// ## 与 wasi:pubsub / wasi:http 的差异（P4，论证见 wit/README.md §9）
+/// wasi:pubsub 提案仅 Phase 1（CG feature proposal 阶段），wasmtime
+/// 不支持；wasi:http 是请求/响应模型，无推送 pub/sub。topic 级 grant
+/// scope、两侧背压、Core-mediated 交付是仅 Operune 平台拥有的语义
+/// （§6.6）。
+///
+/// ## 与 0.4 web 演进的关系（§21.4 / §42，不重复实现）
+/// 本契约是 stateful substrate 的一部分：0.4 的 realtime/stream
+/// （仅在第 8.3 Gate 通过后）沿标准 `stream<T>`/`future<T>` 路径演进，
+/// 与本总线互补而非重造；本 package 按自身版本独立演进（§6.6）。
+package operune:event@0.1.0;
+
+/// event bus 的发布服务（Component import）。
+interface event {
+    /// 事件主题（record wrapper，§13.5；grant scope 的键，§17.3）。
+    ///
+    /// 不变量：非空；仅含 `[A-Za-z0-9._-]`，`.` 为命名空间分隔符；
+    /// 长度受 Core 宿主侧上限约束；不得使用 Core 保留前缀
+    /// （系统 topic 命名空间，策略细节）。Core 按字符串等价匹配。
+    record topic {
+        value: string,
+    }
+
+    /// 事件 id（Core 发布时分配；审计关联句柄）。
+    ///
+    /// 0.1.0 不做交付去重（at-most-once），id 服务于审计关联与
+    /// 跨系统排查（§41.2 audit）。
+    record event-id {
+        value: u64,
+    }
+
+    /// 事件载荷的互斥形态（variant 表达互斥形态，§6.3；
+    /// 与 operune:web/actions 的 action-payload 同构）。
+    ///
+    /// 仅两种形态：结构化文本载荷或原始字节载荷。禁止把任意动态值
+    /// 当作万能 payload（§22.4 serde_json 不得作为 Domain 万能动态值）；
+    /// 0.4.0 的 typed action/事件将提供结构化参数（§42.2），本 variant
+    /// 是 0.1.0 的过渡边界，不得作为未来动态值的后门。
+    variant event-payload {
+        /// JSON 文本载荷（结构化事件形态）。
+        json(string),
+        /// 原始字节载荷。
+        raw(list<u8>),
+    }
+
+    /// event 的预期失败（§6.3）。
+    enum event-error {
+        /// 未获该 topic 的发布授权（grant 解析/撤销，§17.1/§17.5）。
+        denied,
+        /// topic 违反本契约不变量（见 `topic`）。
+        invalid-topic,
+        /// 总线未就绪（激活窗口/恢复中）。稍后重试。
+        not-ready,
+        /// 超出预算：载荷体积或发布速率超限（§7.4 / §41.2
+        /// backpressure——发布侧背压以同步错误表达，投递侧背压以
+        /// `dropped` 计数表达）。
+        over-budget,
+        /// guest/host 内部不可恢复错误。
+        internal,
+    }
+
+    /// 向 topic 发布一个事件。
+    ///
+    /// - 发布授权在 grant scope（§17.3 event topics）；未授权 →
+    ///   `denied`；
+    /// - 载荷体积受宿主侧硬上限约束（§7.4）；同步返回（bounded
+    ///   request/response 精神，§21.3 同构），`ok` 表示事件已被
+    ///   Core 接收（投递到各订阅实例是异步的、at-most-once，
+    ///   见本文件顶部交付语义）；
+    /// - 事件载荷**不含**凭据/会话/CSRF 字段（§16.5 凭据边界：
+    ///   敏感值只能走 operune:secret）。
+    publish: func(topic: topic, payload: event-payload) -> result<_, event-error>;
+}

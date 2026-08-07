@@ -1,0 +1,43 @@
+package operune:scheduler@0.1.0;
+
+// operune:scheduler@0.1.0 — 定时任务交付 handler（Component 导出，Core 触发）
+//
+// 交付语义见 scheduler.wit 顶部"交付与 backpressure 语义"：
+// - at-most-once：无重试、无补投；本 handler 无返回值——交付是否
+//   消费由 Core 侧决定（调用返回即已消费，trap 也视为已消费）；
+// - handler 落在 bounded Instance Set 的任一实例（§7.3），guest
+//   不得假设实例亲和；跨 fire 的事实放 operune:state；
+// - Core 对 handler 调用施加与正常运行相同或更严格的
+//   memory/table/instance/host-buffer/deadline 预算（§7.4/§7.5），
+//   trap/超时/超预算在宿主侧观测，不进返回值空间（本 handler
+//   本就没有返回值）。
+
+/// 定时任务交付的 guest handler。
+interface handler {
+    use scheduler.{scheduled-task-id, datetime};
+
+    /// 一次 fire 的交付载荷。
+    record trigger-payload {
+        /// 触发来源的任务标识。
+        task-id: scheduled-task-id,
+        /// 本任务的第 N 次 fire（从 1 递增，周期性任务持续递增）。
+        /// guest 用它做幂等（cancel 竞态下已投递序号不重投，见
+        /// scheduler.wit 交付语义）。
+        sequence: u64,
+        /// 本次 fire 的名义计划时刻（UTC）。实际交付可能晚于该时刻，
+        /// guest 可用 wasi:clocks 对比计算延迟；0.1.0 不承诺交付
+        /// 延迟上界（backpressure 窗口的延迟属正常现象）。
+        scheduled-at: datetime,
+        /// 自上次成功交付以来因背压/停机错过的 fire 数
+        /// （0 表示未错过；一次性任务该字段只可能是 0 或 1，
+        /// 全错过的观测走 scheduler.get-task-status）。
+        missed-fires: u64,
+    }
+
+    /// 处理一次定时任务触发。
+    ///
+    /// 无返回值（交付语义由 Core 决定，见本文件顶部）；guest 的
+    /// 处理失败通过自身通道表达（状态记录/事件/日志——日志不含
+    /// 敏感值，§16.6）。
+    on-trigger: func(payload: trigger-payload);
+}
