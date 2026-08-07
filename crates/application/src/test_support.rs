@@ -9,8 +9,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use operune_domain::{
-    CapabilityId, ComponentId, ComponentLifecycleState, ComponentVersion, ConsumerRecord,
-    ContentDigest, InstallationId, ProviderRecord,
+    CapabilityId, ComponentId, ComponentLifecycleState, ComponentVersion, ConfigFormat,
+    ConfigRevision, ConfigSchemaVersion, ConfigSnapshot, ConfigValue, ConsumerRecord,
+    ContentDigest, InstallationId, ProviderRecord, SecretMetadata, SecretName, SecretVersion,
+    StateKey, StateSchemaVersion, StateTransactionId, StateValue,
 };
 
 use crate::active::ActiveRuntimeRegistry;
@@ -24,8 +26,11 @@ use crate::model::{
     WebManifestData,
 };
 use crate::ports::{
-    AuditEvent, AuditPort, ComponentRegistryPort, ConfigPort, GrantError, GrantStorePort,
-    GraphRecords, GraphStoreError, InProcessActionPolicy, ProviderGraphPort, RegistryError,
+    AuditError, AuditEvent, AuditPort, ComponentConfigStorePort, ComponentRegistryPort, ConfigPort,
+    ConfigStoreError, GrantError, GrantStorePort, GraphRecords, GraphStoreError,
+    InProcessActionPolicy, ProviderGraphPort, RegistryError, SecretCiphertextRecord,
+    SecretGrantPort, SecretStoreError, SecretStorePort, StateStoreError, StateStorePort,
+    StatefulAuditEvent, StatefulAuditPort,
 };
 use crate::runtime::{ActiveRuntime, CompiledWasm, PreparedRuntime, RuntimePlan, WasmRuntime};
 use crate::upgrade::UpgradeService;
@@ -52,6 +57,15 @@ pub(crate) fn some<T>(option: Option<T>, what: &str) -> T {
     match option {
         Some(value) => value,
         None => test_failure(format_args!("{what} is None")),
+    }
+}
+
+/// 断言 `Result` 为 `Err` 并取出错误；否则中止测试（替代 unwrap_err，
+/// workspace lints deny，§26.1）。
+pub(crate) fn err<T, E: std::fmt::Display>(result: Result<T, E>, what: &str) -> E {
+    match result {
+        Err(error) => error,
+        Ok(_) => test_failure(format_args!("{what} succeeded unexpectedly")),
     }
 }
 
@@ -1000,5 +1014,569 @@ impl Harness {
             active_graph,
             composition,
         }
+    }
+}
+// ---------------------------------------------------------------------------
+// 0.3.0 Stateful Runtime（§41.2）：Fake state/config/secret 存储与审计
+// （内存实现，语义对齐 storage-sqlite executor 的 0.3 命令；供用例级
+// 测试注入，§24.2 端口注入）。
+// ---------------------------------------------------------------------------
+
+/// 确定性测试安装实例（seed → uuid，与 composition 测试同模式）。
+pub(crate) fn installation(seed: u64) -> InstallationId {
+    InstallationId::from_uuid(uuid::Uuid::from_u128(u128::from(seed)))
+}
+
+/// FakeStateStore（内存实现，语义对齐 storage executor 0.3 state 命令：
+/// 版本校验、单连接串行 ⇒ 同一时刻至多一个进行中事务、commit 时推进
+/// schema marker）。
+pub(crate) struct FakeStateStore {
+    inner: Mutex<FakeStateInner>,
+}
+
+#[derive(Debug, Default)]
+struct FakeStateInner {
+    stores: HashMap<InstallationId, FakeStoreData>,
+    active_tx: Option<FakeActiveTx>,
+    next_tx_handle: u64,
+}
+
+#[derive(Debug, Default)]
+struct FakeStoreData {
+    version: Option<StateSchemaVersion>,
+    rows: HashMap<StateKey, StateValue>,
+}
+
+#[derive(Debug, Clone)]
+struct FakeActiveTx {
+    handle: u64,
+    installation: InstallationId,
+    schema_version: StateSchemaVersion,
+    pending: HashMap<StateKey, FakePendingOp>,
+}
+
+#[derive(Debug, Clone)]
+enum FakePendingOp {
+    Write(StateValue),
+    Delete,
+}
+
+impl FakeStateStore {
+    pub(crate) fn new() -> Self {
+        Self {
+            inner: Mutex::new(FakeStateInner::default()),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, FakeStateInner> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// 测试辅助：读取安装实例 state store 的当前版本（断言用）。
+    pub(crate) fn version_of(&self, installation: InstallationId) -> Option<StateSchemaVersion> {
+        self.lock()
+            .stores
+            .get(&installation)
+            .and_then(|store| store.version)
+    }
+
+    /// 测试辅助：读取单键当前值（断言用）。
+    pub(crate) fn value_of(
+        &self,
+        installation: InstallationId,
+        key: &StateKey,
+    ) -> Option<StateValue> {
+        self.lock()
+            .stores
+            .get(&installation)
+            .and_then(|store| store.rows.get(key).cloned())
+    }
+
+    /// 测试辅助：模拟进程崩溃——进行中事务被丢弃（SQLite 原子性语义：
+    /// 未提交事务自然回滚，store 不变，§18.5）。
+    pub(crate) fn simulate_crash(&self) {
+        self.lock().active_tx = None;
+    }
+
+    fn tx_id(handle: u64) -> StateTransactionId {
+        StateTransactionId::from_u64(handle)
+    }
+
+    fn active_tx(&self, tx: StateTransactionId) -> Result<FakeActiveTx, StateStoreError> {
+        let inner = self.lock();
+        match &inner.active_tx {
+            Some(active) if active.handle == tx.as_u64() => Ok(active.clone()),
+            _ => Err(StateStoreError::TransactionConflict(
+                "commit or operation on a state transaction that is not in progress".into(),
+            )),
+        }
+    }
+}
+
+impl StateStorePort for FakeStateStore {
+    fn get(
+        &self,
+        installation: InstallationId,
+        key: &StateKey,
+    ) -> Result<Option<StateValue>, StateStoreError> {
+        Ok(self
+            .lock()
+            .stores
+            .get(&installation)
+            .and_then(|store| store.rows.get(key).cloned()))
+    }
+
+    fn put(
+        &self,
+        installation: InstallationId,
+        key: &StateKey,
+        schema_version: StateSchemaVersion,
+        value: &StateValue,
+    ) -> Result<(), StateStoreError> {
+        let mut inner = self.lock();
+        let store = inner.stores.entry(installation).or_default();
+        if let Some(current) = store.version
+            && current != schema_version
+        {
+            return Err(StateStoreError::SchemaVersionMismatch {
+                installation,
+                current: store.version,
+                requested: schema_version,
+            });
+        }
+        // 空 store 首次写入建立版本（存储语义：同一事务内 upsert marker）。
+        store.version = Some(schema_version);
+        store.rows.insert(key.clone(), value.clone());
+        Ok(())
+    }
+
+    fn delete(&self, installation: InstallationId, key: &StateKey) -> Result<(), StateStoreError> {
+        let mut inner = self.lock();
+        let Some(store) = inner.stores.get_mut(&installation) else {
+            return Err(StateStoreError::NotFound(format!(
+                "state key {key} for installation {installation}"
+            )));
+        };
+        if store.rows.remove(key).is_none() {
+            return Err(StateStoreError::NotFound(format!(
+                "state key {key} for installation {installation}"
+            )));
+        }
+        Ok(())
+    }
+
+    fn schema_version(
+        &self,
+        installation: InstallationId,
+    ) -> Result<Option<StateSchemaVersion>, StateStoreError> {
+        Ok(self
+            .lock()
+            .stores
+            .get(&installation)
+            .and_then(|store| store.version))
+    }
+
+    fn begin_transaction(
+        &self,
+        installation: InstallationId,
+        schema_version: StateSchemaVersion,
+    ) -> Result<StateTransactionId, StateStoreError> {
+        let mut inner = self.lock();
+        if inner.active_tx.is_some() {
+            return Err(StateStoreError::TransactionConflict(
+                "a state transaction is already in progress".into(),
+            ));
+        }
+        let current = inner.stores.get(&installation).and_then(|s| s.version);
+        if let Some(current) = current
+            && current != schema_version
+        {
+            return Err(StateStoreError::SchemaVersionMismatch {
+                installation,
+                current: Some(current),
+                requested: schema_version,
+            });
+        }
+        inner.next_tx_handle = inner.next_tx_handle.saturating_add(1);
+        let handle = inner.next_tx_handle;
+        inner.active_tx = Some(FakeActiveTx {
+            handle,
+            installation,
+            schema_version,
+            pending: HashMap::new(),
+        });
+        Ok(Self::tx_id(handle))
+    }
+
+    fn begin_migration_transaction(
+        &self,
+        installation: InstallationId,
+        to_version: StateSchemaVersion,
+    ) -> Result<StateTransactionId, StateStoreError> {
+        let mut inner = self.lock();
+        if inner.active_tx.is_some() {
+            return Err(StateStoreError::TransactionConflict(
+                "a state transaction is already in progress".into(),
+            ));
+        }
+        let current = inner.stores.get(&installation).and_then(|s| s.version);
+        let Some(current) = current else {
+            return Err(StateStoreError::InvalidArgument(
+                "cannot migrate an empty state store (no schema version established)".into(),
+            ));
+        };
+        if to_version <= current {
+            return Err(StateStoreError::SchemaVersionMismatch {
+                installation,
+                current: Some(current),
+                requested: to_version,
+            });
+        }
+        inner.next_tx_handle = inner.next_tx_handle.saturating_add(1);
+        let handle = inner.next_tx_handle;
+        inner.active_tx = Some(FakeActiveTx {
+            handle,
+            installation,
+            schema_version: to_version,
+            pending: HashMap::new(),
+        });
+        Ok(Self::tx_id(handle))
+    }
+
+    fn tx_get(
+        &self,
+        tx: StateTransactionId,
+        installation: InstallationId,
+        key: &StateKey,
+    ) -> Result<Option<StateValue>, StateStoreError> {
+        let active = self.active_tx(tx)?;
+        let inner = self.lock();
+        match active.pending.get(key) {
+            Some(FakePendingOp::Write(value)) => Ok(Some(value.clone())),
+            Some(FakePendingOp::Delete) => Ok(None),
+            None => Ok(inner
+                .stores
+                .get(&installation)
+                .and_then(|store| store.rows.get(key).cloned())),
+        }
+    }
+
+    fn tx_put(
+        &self,
+        tx: StateTransactionId,
+        _installation: InstallationId,
+        key: &StateKey,
+        value: &StateValue,
+    ) -> Result<(), StateStoreError> {
+        let mut inner = self.lock();
+        let Some(active) = inner.active_tx.as_mut() else {
+            return Err(StateStoreError::TransactionConflict(
+                "operation on a state transaction that is not in progress".into(),
+            ));
+        };
+        if active.handle != tx.as_u64() {
+            return Err(StateStoreError::TransactionConflict(
+                "operation on a state transaction that is not in progress".into(),
+            ));
+        }
+        active
+            .pending
+            .insert(key.clone(), FakePendingOp::Write(value.clone()));
+        Ok(())
+    }
+
+    fn tx_delete(
+        &self,
+        tx: StateTransactionId,
+        installation: InstallationId,
+        key: &StateKey,
+    ) -> Result<(), StateStoreError> {
+        // 存储语义：键必须存在（store 行或本事务已写入），否则 NotFound
+        //（存在性检查先于可变借用，避免锁内借用冲突）。
+        let exists_in_store = self
+            .lock()
+            .stores
+            .get(&installation)
+            .map(|store| store.rows.contains_key(key))
+            .unwrap_or(false);
+        let mut inner = self.lock();
+        let Some(active) = inner.active_tx.as_mut() else {
+            return Err(StateStoreError::TransactionConflict(
+                "operation on a state transaction that is not in progress".into(),
+            ));
+        };
+        if active.handle != tx.as_u64() {
+            return Err(StateStoreError::TransactionConflict(
+                "operation on a state transaction that is not in progress".into(),
+            ));
+        }
+        let pending_writes = matches!(active.pending.get(key), Some(FakePendingOp::Write(_)));
+        if !exists_in_store && !pending_writes {
+            return Err(StateStoreError::NotFound(format!(
+                "state key {key} for installation {installation}"
+            )));
+        }
+        active.pending.insert(key.clone(), FakePendingOp::Delete);
+        Ok(())
+    }
+
+    fn commit(&self, tx: StateTransactionId) -> Result<(), StateStoreError> {
+        let active = self.active_tx(tx)?;
+        let mut inner = self.lock();
+        // 应用暂存操作 + 推进 schema marker（同一"事务"内，§41.3）。
+        let store = inner.stores.entry(active.installation).or_default();
+        for (key, op) in &active.pending {
+            match op {
+                FakePendingOp::Write(value) => {
+                    store.rows.insert(key.clone(), value.clone());
+                }
+                FakePendingOp::Delete => {
+                    store.rows.remove(key);
+                }
+            }
+        }
+        store.version = Some(active.schema_version);
+        inner.active_tx = None;
+        Ok(())
+    }
+
+    fn abort(&self, tx: StateTransactionId) -> Result<(), StateStoreError> {
+        let mut inner = self.lock();
+        // WIT：abort 对已终止事务是 no-op。
+        match &inner.active_tx {
+            Some(active) if active.handle == tx.as_u64() => {
+                inner.active_tx = None;
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+/// 存储行：轮换版本 + 不透明密文 BLOB + 非敏感元数据（§16.6：本 fake 与
+/// 真实存储一样只接触密文，不含明文）。
+type FakeSecretRow = (u64, Vec<u8>, String);
+
+/// 安装实例 → 名称 → 行。
+type FakeSecretData = HashMap<InstallationId, HashMap<SecretName, FakeSecretRow>>;
+
+/// FakeSecretStore（内存实现，语义对齐 storage executor 0.3 secret 命令：
+/// 密文 BLOB 原样存取、insert or replace 版本递增；**不含明文**）。
+pub(crate) struct FakeSecretStore {
+    inner: Mutex<FakeSecretData>,
+}
+
+impl FakeSecretStore {
+    pub(crate) fn new() -> Self {
+        Self {
+            inner: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, FakeSecretData> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+impl SecretStorePort for FakeSecretStore {
+    fn put(
+        &self,
+        installation: InstallationId,
+        name: &SecretName,
+        ciphertext: Vec<u8>,
+        metadata: &str,
+    ) -> Result<SecretVersion, SecretStoreError> {
+        let mut inner = self.lock();
+        let names = inner.entry(installation).or_default();
+        let (version, _, _) = names
+            .get(name)
+            .cloned()
+            .unwrap_or((0, Vec::new(), String::new()));
+        let new_version = version.saturating_add(1);
+        names.insert(name.clone(), (new_version, ciphertext, metadata.to_owned()));
+        Ok(SecretVersion::from_u64(new_version))
+    }
+
+    fn ciphertext(
+        &self,
+        installation: InstallationId,
+        name: &SecretName,
+    ) -> Result<Option<SecretCiphertextRecord>, SecretStoreError> {
+        let inner = self.lock();
+        Ok(inner
+            .get(&installation)
+            .and_then(|names| names.get(name))
+            .map(|(version, ciphertext, _)| SecretCiphertextRecord {
+                name: name.clone(),
+                version: SecretVersion::from_u64(*version),
+                ciphertext: ciphertext.clone(),
+            }))
+    }
+
+    fn list(&self, installation: InstallationId) -> Result<Vec<SecretMetadata>, SecretStoreError> {
+        let inner = self.lock();
+        let mut metadata: Vec<SecretMetadata> = inner
+            .get(&installation)
+            .map(|names| {
+                names
+                    .iter()
+                    .map(|(name, (version, _, _))| {
+                        SecretMetadata::new(name.clone(), SecretVersion::from_u64(*version))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        // 名称排序（确定性列表；domain SecretMetadata 无 Ord）。
+        metadata.sort_by(|a, b| a.name().as_str().cmp(b.name().as_str()));
+        Ok(metadata)
+    }
+
+    fn delete(
+        &self,
+        installation: InstallationId,
+        name: &SecretName,
+    ) -> Result<(), SecretStoreError> {
+        let mut inner = self.lock();
+        let removed = inner
+            .get_mut(&installation)
+            .map(|names| names.remove(name).is_some())
+            .unwrap_or(false);
+        if !removed {
+            return Err(SecretStoreError::NotFound(format!(
+                "secret {name} for installation {installation}"
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// FakeSecretGrants（内存实现；grant 集按安装实例配置，§17.3）。
+pub(crate) struct FakeSecretGrants {
+    grants: Mutex<HashMap<InstallationId, Vec<SecretName>>>,
+}
+
+impl FakeSecretGrants {
+    pub(crate) fn new() -> Self {
+        Self {
+            grants: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// 配置安装实例的 secret grant 集。
+    pub(crate) fn set_granted(&self, installation: InstallationId, names: Vec<SecretName>) {
+        let mut grants = self
+            .grants
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        grants.insert(installation, names);
+    }
+}
+
+impl SecretGrantPort for FakeSecretGrants {
+    fn granted_names(&self, installation: InstallationId) -> Result<Vec<SecretName>, GrantError> {
+        let grants = self
+            .grants
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Ok(grants.get(&installation).cloned().unwrap_or_default())
+    }
+}
+
+/// FakeConfigStore（内存实现，语义对齐 storage executor 0.3 config 命令：
+/// 单行快照、revision 单调 +1）。
+pub(crate) struct FakeConfigStore {
+    inner: Mutex<HashMap<InstallationId, (u64, ConfigFormat, ConfigSchemaVersion, ConfigValue)>>,
+}
+
+impl FakeConfigStore {
+    pub(crate) fn new() -> Self {
+        Self {
+            inner: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn lock(
+        &self,
+    ) -> std::sync::MutexGuard<
+        '_,
+        HashMap<InstallationId, (u64, ConfigFormat, ConfigSchemaVersion, ConfigValue)>,
+    > {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+impl ComponentConfigStorePort for FakeConfigStore {
+    fn snapshot(
+        &self,
+        installation: InstallationId,
+    ) -> Result<Option<ConfigSnapshot>, ConfigStoreError> {
+        let inner = self.lock();
+        Ok(inner.get(&installation).map(|(revision, _, _, value)| {
+            ConfigSnapshot::new(ConfigRevision::from_u64(*revision), value.clone())
+        }))
+    }
+
+    fn put(
+        &self,
+        installation: InstallationId,
+        _format: ConfigFormat,
+        _schema_version: ConfigSchemaVersion,
+        value: &ConfigValue,
+    ) -> Result<ConfigRevision, ConfigStoreError> {
+        let mut inner = self.lock();
+        let (revision, format, schema_version, _) = inner.get(&installation).cloned().unwrap_or((
+            0,
+            ConfigFormat::Raw,
+            ConfigSchemaVersion::from_u32(0),
+            ConfigValue::new(Vec::new())
+                .map_err(|_| ConfigStoreError::InvalidArgument("empty value".into()))?,
+        ));
+        let new_revision = revision.saturating_add(1);
+        inner.insert(
+            installation,
+            (new_revision, format, schema_version, value.clone()),
+        );
+        Ok(ConfigRevision::from_u64(new_revision))
+    }
+}
+
+/// FakeStatefulAudit（0.3 state/config/secret 审计的内存实现）。
+pub(crate) struct FakeStatefulAudit {
+    events: Mutex<Vec<StatefulAuditEvent>>,
+}
+
+impl FakeStatefulAudit {
+    pub(crate) fn new() -> Self {
+        Self {
+            events: Mutex::new(Vec::new()),
+        }
+    }
+
+    pub(crate) fn events(&self) -> Vec<StatefulAuditEvent> {
+        match self.events.lock() {
+            Ok(guard) => guard.clone(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    pub(crate) fn contains(&self, predicate: impl Fn(&StatefulAuditEvent) -> bool) -> bool {
+        self.events().iter().any(predicate)
+    }
+}
+
+impl StatefulAuditPort for FakeStatefulAudit {
+    fn append(&self, event: StatefulAuditEvent) -> Result<(), AuditError> {
+        let mut events = self
+            .events
+            .lock()
+            .map_err(|_| AuditError::Storage(Box::new(std::io::Error::other("lock poisoned"))))?;
+        events.push(event);
+        Ok(())
     }
 }

@@ -55,12 +55,16 @@
 
 pub mod active;
 pub mod composition;
+pub mod config;
 pub mod contract;
 pub mod error;
 pub mod install;
+pub mod migration;
 pub mod model;
 pub mod ports;
 pub mod runtime;
+pub mod secret;
+pub mod state;
 pub mod upgrade;
 pub mod web;
 pub mod wit_bindings;
@@ -69,12 +73,17 @@ pub mod wit_bindings;
 mod test_support;
 
 pub use active::ActiveRuntimeRegistry;
+// 注：0.3 component config 服务的 `ConfigService` 在根重导出，但其错误
+// `crate::config::ConfigError` 只在模块路径可见（根 `ConfigError` 已被
+// 0.1 Core config port 的错误占用——`operune_application::ConfigError`）。
 pub use composition::{
     ActiveGraph, CompositionService, ContractRecords, GraphPolicy, GraphPolicyError, InterfaceKey,
     records_from_surface,
 };
+pub use config::ConfigService;
 pub use error::{ApplicationError, RuntimeExecutionError};
 pub use install::InstallService;
+pub use migration::{MigrationError, MigrationGuestError, MigrationOutcome, StateMigrationService};
 pub use model::{
     ActionDenied, ActionName, CandidateRecord, ContractSurface, DigestVersionBinding,
     GrantApproval, GrantScope, GrantSnapshot, ImportClass, InstallOutcome, InstallRequest,
@@ -82,12 +91,16 @@ pub use model::{
     UpgradeOutcome, UpgradeRequest, WebAssetEntry, WebAssetPath, WebManifestData,
 };
 pub use ports::{
-    ActionContext, ActionPolicyPort, AuditError, AuditEvent, AuditPort, ComponentRegistryPort,
-    ConfigError, ConfigPort, GrantError, GrantStorePort, GraphRecords, GraphStoreError,
-    InProcessActionPolicy, ProviderGraphPort, RegistryError,
+    ActionContext, ActionPolicyPort, AuditError, AuditEvent, AuditPort, ComponentConfigStorePort,
+    ComponentRegistryPort, ConfigError, ConfigPort, ConfigStoreError, GrantError, GrantStorePort,
+    GraphRecords, GraphStoreError, InProcessActionPolicy, ProviderGraphPort, RegistryError,
+    SecretCiphertextRecord, SecretGrantPort, SecretStoreError, SecretStorePort, StateStoreError,
+    StateStorePort, StatefulAuditEvent, StatefulAuditPort,
 };
 pub use runtime::{
     ActiveRuntime, CompiledWasm, PreparedRuntime, RuntimePlan, WasmRuntime, WasmtimeRuntime,
 };
+pub use secret::{SecretError, SecretService};
+pub use state::{CasOutcome, MigrationGate, StateError, StateService};
 pub use upgrade::UpgradeService;
 pub use web::{AssetCache, AssetResponse, WebBridge};

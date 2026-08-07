@@ -101,6 +101,51 @@
 //! （依赖跟踪只作用于非 stringify 路径），因此本模块仍显式 `include_str!`
 //! 全部契约文件，保证 WIT 变更触发重新编译并重新验证（见下方常量）。
 //!
+//! # §25 裁决三：0.3.0 state/config/secret 三包 WIT 语法错误
+//! （2026-08-08，bindgen 语法校验点实测）
+//!
+//! 0.3 契约三包（wit/operune/state|config|secret，已提交稳定）加入本模块
+//! 后，bindgen（wasmtime 36.0.13 / wit-parser 0.236.1，stringify 形态）
+//! 在 WIT 解析阶段失败——错误指向 WIT 文件本身（**不是**本 crate 的
+//! 问题）。完整错误原文如下：
+//!
+//! ```text
+//! error: failed to resolve directory while parsing WIT for path
+//!        [\\?\C:\Users\franck\Documents\operune\wit\operune\state]
+//!        Caused by:
+//!            0: failed to parse package:
+//!               \\?\C:\Users\franck\Documents\operune\wit\operune\state
+//!            1: expected an identifier or string, found keyword `from`
+//!                    --> \\?\C:\Users\franck\Documents\operune\wit\operune\state\migration.wit:55:9
+//!                     |
+//!                  55 |         from: state-schema-version,
+//!                     |         ^---
+//! ```
+//!
+//! 根因（wit-parser 0.236.1 关键字表）：**`from` 是 WIT 保留关键字**
+//! （`use path.from {...}` 导入语法的组成部分），不得用作参数名/字段名。
+//! `migration.wit` 的 `migrate(from, to, transaction)` 以 `from` 命名第一
+//! 参数，触发该语法错误。
+//!
+//! 修复项（**主 agent 的 WIT 修复项**，本任务按约束不动 wit/ 目录）：
+//! 把 `migration.wit` `migrate` 的 `from` 参数改名为非关键字标识符
+//! （建议 `from-version`，WIT 参数为 kebab-case；`to` 不是关键字可保留或
+//! 一并改为 `to-version` 对称）。改后**取消注释**下方三处 bindgen! 调用
+//! 即恢复 §22.2 权威验证点（state 包解析失败会中止整个 resolve，config/
+//! secret 包的验证也一并恢复）。
+//!
+//! 语法校验点的作用已达成：bindgen 在编译期拦截了已提交契约文件中的
+//! 语法错误（正是 §22.2"WIT 语法/解析的权威验证点"的用途）。
+//!
+//! 附加说明（裁决三实测）：0.3 三包**每个文件**的 `package` 声明前都带
+//! 注释——按裁决二的规则（每个 package 至多一个文件在 package 声明前带
+//! 注释，否则报 "found doc comments on multiple 'package' items"），state
+//! 4 个文件、config 4 个文件、secret 2 个文件全部带注释 ⇒ 即使修掉
+//! `from` 关键字，三个包仍会触发裁决二的 package-docs 冲突。**修复项
+//! 需同时执行**（主 agent）：每个包只保留一个文件（建议主契约文件）在
+//! `package` 声明前带注释，其余文件的文件头注释块整体移至 `package` 行
+//! 之后（与 2026-08-07 对 component/web 两包执行的修复完全同模式）。
+//!
 
 // 编译期验证 `operune:component@0.1.0` 的参考 world（§6.6）。
 //
@@ -136,6 +181,43 @@ const _: &str = wasmtime::component::bindgen!({
     stringify: true,
 });
 
+// ---------------------------------------------------------------------------
+// 0.3.0 Stateful Runtime（§41.2）：state / config / secret 三包的编译期
+// WIT 验证（§22.2 / §25 裁决一：stringify 形态，完整解析 + 代码生成在
+// 编译期执行；详见本模块文档"裁决三"）。
+// ---------------------------------------------------------------------------
+
+// 编译期验证 `operune:state@0.1.0` 的参考 world（§6.6）：导出 declaration
+// 与 migration（安装/激活期声明 + 升级迁移 handler），导入 state（运行时
+// typed 服务）。
+//
+// 裁决三（2026-08-08）：WIT 语法错误（`from` 是 WIT 保留关键字，见本模块
+// 文档裁决三）——bindgen 验证失败，调用按裁决三规则注释并文档化，恢复
+// 条件见模块文档（主 agent 的 WIT 修复项）。
+// const _: &str = wasmtime::component::bindgen!({
+//     path: ["../../wit/operune/state"],
+//     world: "operune:state/operune-state-component",
+//     stringify: true,
+// });
+
+// 编译期验证 `operune:config@0.1.0` 的参考 world：导出 declaration 与
+// validator，导入 config（运行时只读）。裁决三：state 包解析失败时整个
+// resolve 中止，config/secret 的验证同样被阻塞——随 state 包修复后一起
+// 恢复（见模块文档裁决三）。
+// const _: &str = wasmtime::component::bindgen!({
+//     path: ["../../wit/operune/config"],
+//     world: "operune:config/operune-config-component",
+//     stringify: true,
+// });
+
+// 编译期验证 `operune:secret@0.1.0` 的参考 world：导入 secret（按 grant
+// 读取，§41.2 grant/read semantics）。裁决三：同 config 包（见上）。
+// const _: &str = wasmtime::component::bindgen!({
+//     path: ["../../wit/operune/secret"],
+//     world: "operune:secret/operune-secret-component",
+//     stringify: true,
+// });
+
 // —— WIT 文件内容依赖跟踪（stringify 形态下 bindgen 不自动跟踪；
 //    路径相对本文件 crates/application/src/ → 仓库根 wit/）——
 #[allow(clippy::items_after_statements)]
@@ -145,6 +227,17 @@ const _: &str = include_str!("../../../wit/operune/web/descriptor.wit");
 const _: &str = include_str!("../../../wit/operune/web/assets.wit");
 const _: &str = include_str!("../../../wit/operune/web/actions.wit");
 const _: &str = include_str!("../../../wit/operune/web/world.wit");
+// 0.3.0 state/config/secret 三包（§41.2；契约已提交稳定）。
+const _: &str = include_str!("../../../wit/operune/state/declaration.wit");
+const _: &str = include_str!("../../../wit/operune/state/migration.wit");
+const _: &str = include_str!("../../../wit/operune/state/state.wit");
+const _: &str = include_str!("../../../wit/operune/state/world.wit");
+const _: &str = include_str!("../../../wit/operune/config/config.wit");
+const _: &str = include_str!("../../../wit/operune/config/declaration.wit");
+const _: &str = include_str!("../../../wit/operune/config/validator.wit");
+const _: &str = include_str!("../../../wit/operune/config/world.wit");
+const _: &str = include_str!("../../../wit/operune/secret/secret.wit");
+const _: &str = include_str!("../../../wit/operune/secret/world.wit");
 
 #[cfg(test)]
 mod tests {

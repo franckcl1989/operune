@@ -14,6 +14,11 @@ description = "Operune application layer: use-case orchestration and ports (spec
 operune-domain = { path = "../domain" }
 operune-runtime-wasm = { path = "../runtime-wasm" }
 operune-runtime-wasi-p2 = { path = "../runtime-wasi-p2" }
+# 0.3.0 SecretService（§41.2 / §16.6 / ADR-0001）：security 是底层能力库
+# （SecretCipher / SecretBytes / 密文 envelope），不依赖 application，
+# 依赖方向 application → security 合理（§24.3）。SecretStore port 本身
+# 不含明文——加解密永远经 security 层。
+operune-security = { path = "../security" }
 
 # §22.2 Wasmtime 36.x LTS（同一 release line）。
 # 最小 production feature 集（§22.2）：component-model（Component API 与
@@ -43,6 +48,17 @@ serde_json = { workspace = true }
 # §22.5：0.2.0 composition 测试的确定性 InstallationId（seed → uuid，
 # 与 domain 测试同模式；从既有 workspace 基线取值，不新增依赖）。
 uuid = { workspace = true }
+# 0.3.0 storage 接线端到端测试（§41.2 port 契约与真实 executor 的形态
+# 对齐验证）：storage-sqlite 实现 application 的 port traits（dev 依赖
+# 方向与 §24.3 生产依赖方向相反，仅测试目标使用，不进入生产构建图）。
+# tokio 经 storage-sqlite 的既有 feature（rt/sync/macros/time）统一启用；
+# tempfile 提供真实 executor 的隔离 data root（§22.8 冻结清单已有）。
+operune-storage-sqlite = { path = "../storage-sqlite" }
+tokio = { workspace = true }
+tempfile = { workspace = true }
+# §22.8 / §16.6：secret 测试断言需要 ExposeSecret（明文比较入口；security
+# 的 SecretBytes 的 expose_secret 由 secrecy trait 提供）。
+secrecy = { workspace = true }
 
 [lints]
 workspace = true

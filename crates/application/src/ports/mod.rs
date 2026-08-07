@@ -19,17 +19,44 @@
 //!   auth / RBAC / grant / body / rate / concurrency 检查点用 port 表达，
 //!   HTTP 层在 web-admin 实现完整链；本 crate 提供默认实现
 //!   [`InProcessActionPolicy`]）。
+//!
+//! # 0.3.0 Stateful Runtime（§41.2）——state/config/secret 端口
+//!
+//! - [`StateStorePort`]：typed state 存储面（快照点读、原子 upsert、事务
+//!   begin/commit/abort、schema 版本查询、显式 migration 事务 begin）。
+//!   CAS 的 get→compare→put 编排在 [`crate::state::StateService`]
+//!   （executor 单连接串行 ⇒ 无交错）。
+//! - [`ComponentConfigStorePort`]：管理员输入配置的存储面（原子快照读、
+//!   带 revision 单调递增的写；guest 只读语义，config.wit）。
+//! - [`SecretStorePort`]：**不含明文**的密文 BLOB 存储面（put/delete/
+//!   list/ciphertext）；加解密永远经 security 层
+//!   （[`crate::secret::SecretService`]），storage 不解密。
+//! - [`SecretGrantPort`]：安装实例被授予的 secret 名称集（§17.3
+//!   "secret names" scope 维度；§17.5 第三层 Grant）。与既有
+//!   `GrantStorePort` 分开定义：既有 grant scope 变体集是跨 crate 闭集，
+//!   名称级 scope 以独立 port 面演进。
+//! - [`StatefulAuditPort`]：0.3 state/config/secret 审计（§41.2 audit
+//!   MUST；metadata-only，值绝不进入审计，§16.6）。与 [`AuditPort`]
+//!   分开定义：既有 [`AuditEvent`] 变体集被 storage-sqlite 穷尽映射。
 
 mod audit;
+mod component_config;
 mod config;
 mod grants;
 mod graph;
 mod policy;
 mod registry;
+mod secret;
+mod state;
 
-pub use audit::{AuditError, AuditEvent, AuditPort, RejectReason};
+pub use audit::{
+    AuditError, AuditEvent, AuditPort, RejectReason, StatefulAuditEvent, StatefulAuditPort,
+};
+pub use component_config::{ComponentConfigStorePort, ConfigStoreError};
 pub use config::{ConfigError, ConfigPort};
 pub use grants::{GrantError, GrantStorePort};
 pub use graph::{GraphRecords, GraphStoreError, ProviderGraphPort};
 pub use policy::{ActionContext, ActionPolicyPort, InProcessActionPolicy};
 pub use registry::{ComponentRegistryPort, RegistryError};
+pub use secret::{SecretCiphertextRecord, SecretGrantPort, SecretStoreError, SecretStorePort};
+pub use state::{StateStoreError, StateStorePort};
