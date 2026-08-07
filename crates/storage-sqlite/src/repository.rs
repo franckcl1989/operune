@@ -49,11 +49,14 @@
 //! （回滚），命令返回 [`StorageError::Cancelled`]。已提交事务不受取消影响
 //! （提交点之前的检查已通过）——绝不产生半事务状态。
 
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use operune_application::ports::GraphRecords;
 use operune_domain::{
     CapabilityId, ComponentId, ComponentLifecycleEvent, ComponentLifecycleState, ComponentVersion,
-    ContentDigest, InstallationId,
+    ConsumerRecord, ContentDigest, InstallationId, InterfaceId, InterfaceRequirement,
+    ProviderRecord,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -1408,6 +1411,202 @@ impl<'a> Repository<'a> {
             });
         }
         Ok(grants)
+    }
+
+    // ------------------------------------------------------------------
+    // 0.2.0 provider graph records（§40.2 graph persistence/recovery；
+    // §18.6：graph 记录是节点本地权威状态，与其余 Core 元数据同事务语义）
+    // ------------------------------------------------------------------
+
+    /// `replace_graph_records`：原子替换某安装实例的全部 graph 记录
+    /// （§40.2/§40.3：记录是不可变字节事实；升级 = 新提供面/需求面整组
+    /// 替换；激活失败清理 / 停用 = provider 与 consumer 均为 `None` 的全删）。
+    ///
+    /// 原子语义（§18.5 / §18.4 事务化）：删除旧记录与写入新记录在**同一
+    /// SQLite 事务**内完成——任何中间观（新旧并存、半条记录）都不可能
+    /// 被观察到；任一步骤失败整体回滚。audit 由 application 层在调用
+    /// 前经 [`AuditPort`](operune_application::ports::AuditPort) 写入，
+    /// 本方法不额外写 audit（与 grants 的存储侧 audit 不同源）。
+    ///
+    /// 前置校验（fail closed）：
+    /// - 安装实例必须存在（§17.5：graph 记录锚定安装实例，与 `grants`
+    ///   同约束；外键在 INSERT 时同样强制，此处给出 typed `NotFound`）；
+    /// - 传入记录的 `installation()` 必须与替换键一致（§40.2 身份可追溯，
+    ///   不一致 = 调用方契约违反，`InvalidArgument`）。
+    pub(crate) fn replace_graph_records(
+        &mut self,
+        installation_id: InstallationId,
+        provider: Option<&ProviderRecord>,
+        consumer: Option<&ConsumerRecord>,
+        cancel: &AtomicBool,
+    ) -> Result<(), StorageError> {
+        check_cancel(cancel)?;
+        if self.read_installation(installation_id)?.is_none() {
+            return Err(StorageError::NotFound(format!(
+                "installation {installation_id}"
+            )));
+        }
+        if let Some(record) = provider
+            && record.installation() != installation_id
+        {
+            return Err(StorageError::InvalidArgument(format!(
+                "provider record installation {} does not match replacement key {installation_id}",
+                record.installation()
+            )));
+        }
+        if let Some(record) = consumer
+            && record.installation() != installation_id
+        {
+            return Err(StorageError::InvalidArgument(format!(
+                "consumer record installation {} does not match replacement key {installation_id}",
+                record.installation()
+            )));
+        }
+        let provider_json = match provider {
+            Some(record) => Some(Self::provided_to_json(record.provided())?),
+            None => None,
+        };
+        let consumer_json = match consumer {
+            Some(record) => Some(Self::required_to_json(record.required())?),
+            None => None,
+        };
+        let now = self.sql_now()?;
+        self.run_tx("begin replace graph records transaction", |tx| {
+            // 单次原子替换边界：先删除该安装的全部记录，再写入新记录。
+            tx.execute(
+                "DELETE FROM graph_provider_records WHERE installation_id = ?1",
+                [installation_id.to_string()],
+            )
+            .map_err(|e| StorageError::sqlite("delete graph provider records", e))?;
+            tx.execute(
+                "DELETE FROM graph_consumer_records WHERE installation_id = ?1",
+                [installation_id.to_string()],
+            )
+            .map_err(|e| StorageError::sqlite("delete graph consumer records", e))?;
+            if let Some(json) = &provider_json {
+                tx.execute(
+                    "INSERT INTO graph_provider_records (installation_id, provided, updated_at)
+                     VALUES (?1, ?2, ?3)",
+                    params![installation_id.to_string(), json, now],
+                )
+                .map_err(|e| StorageError::sqlite("insert graph provider record", e))?;
+            }
+            if let Some(json) = &consumer_json {
+                tx.execute(
+                    "INSERT INTO graph_consumer_records (installation_id, required, updated_at)
+                     VALUES (?1, ?2, ?3)",
+                    params![installation_id.to_string(), json, now],
+                )
+                .map_err(|e| StorageError::sqlite("insert graph consumer record", e))?;
+            }
+            Ok(())
+        })
+    }
+
+    /// `load_graph_records`：加载全部 graph 记录（§40.2 恢复输入；application
+    /// 层随后 `try_build` 重校验全部图不变量）。
+    ///
+    /// - 缺失（无行）→ 空集（全新数据库 / 无参与组件）；
+    /// - 损坏（非法 JSON / provider 空提供面 / 非法 interface 标识）→
+    ///   [`StorageError::CorruptState`] **fail closed**，绝不静默跳过、
+    ///   猜测或放宽校验（与 `scope_from_storage` 同模式）；
+    /// - 顺序按 `installation_id` 稳定排序（§40.4 确定性；顺序本身无
+    ///   语义，`try_build` 对输入顺序无关）。
+    pub(crate) fn load_graph_records(&self) -> Result<GraphRecords, StorageError> {
+        let mut providers = Vec::new();
+        {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "SELECT installation_id, provided FROM graph_provider_records
+                     ORDER BY installation_id",
+                )
+                .map_err(|e| StorageError::sqlite("prepare load graph providers", e))?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(|e| StorageError::sqlite("query graph providers", e))?;
+            for row in rows {
+                let (id_str, json) =
+                    row.map_err(|e| StorageError::sqlite("read graph provider row", e))?;
+                let installation = Self::parse_installation_id(&id_str)?;
+                let provided = Self::provided_from_json(&json)?;
+                providers.push(ProviderRecord::new(installation, provided).map_err(|_| {
+                    StorageError::CorruptState(format!(
+                        "provider record for installation {installation} violates \
+                             domain invariants"
+                    ))
+                })?);
+            }
+        }
+        let mut consumers = Vec::new();
+        {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "SELECT installation_id, required FROM graph_consumer_records
+                     ORDER BY installation_id",
+                )
+                .map_err(|e| StorageError::sqlite("prepare load graph consumers", e))?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(|e| StorageError::sqlite("query graph consumers", e))?;
+            for row in rows {
+                let (id_str, json) =
+                    row.map_err(|e| StorageError::sqlite("read graph consumer row", e))?;
+                let installation = Self::parse_installation_id(&id_str)?;
+                let required = Self::required_from_json(&json)?;
+                consumers.push(ConsumerRecord::new(installation, required));
+            }
+        }
+        Ok(GraphRecords {
+            providers,
+            consumers,
+        })
+    }
+
+    /// InterfaceId 集合 → JSON 规范化数组（§13.3 边界解析一次；domain 的
+    /// `Serialize` 即规范字符串形态——`namespace:package/interface@x.y.z`；
+    /// `BTreeSet` 迭代顺序确定，序列化结果确定）。
+    fn provided_to_json(provided: &BTreeSet<InterfaceId>) -> Result<String, StorageError> {
+        serde_json::to_string(provided).map_err(|error| {
+            StorageError::InvalidArgument(format!("provider record serialization failed: {error}"))
+        })
+    }
+
+    /// InterfaceRequirement 集合 → JSON 规范化数组（每条目为
+    /// `namespace:package/interface@<version-req>`；`normalized` 在 domain
+    /// 构造时固化，如 `1.2.3` → `^1.2.3`，跨持久化保持相等语义）。
+    fn required_to_json(required: &BTreeSet<InterfaceRequirement>) -> Result<String, StorageError> {
+        serde_json::to_string(required).map_err(|error| {
+            StorageError::InvalidArgument(format!("consumer record serialization failed: {error}"))
+        })
+    }
+
+    /// JSON 规范化数组 → InterfaceId 集合（解析失败 / 空提供面 = 持久化
+    /// 损坏，fail closed——provider 的定义是至少提供一个 interface，
+    /// §13.4 不合法状态不可表示）。
+    fn provided_from_json(json: &str) -> Result<BTreeSet<InterfaceId>, StorageError> {
+        let provided: BTreeSet<InterfaceId> = serde_json::from_str(json).map_err(|error| {
+            StorageError::CorruptState(format!("invalid provider record JSON in database: {error}"))
+        })?;
+        if provided.is_empty() {
+            return Err(StorageError::CorruptState(
+                "provider record in database has an empty provided set".into(),
+            ));
+        }
+        Ok(provided)
+    }
+
+    /// JSON 规范化数组 → InterfaceRequirement 集合（解析失败 = 持久化
+    /// 损坏，fail closed；consumer 需求可为空集，§40.3）。
+    fn required_from_json(json: &str) -> Result<BTreeSet<InterfaceRequirement>, StorageError> {
+        serde_json::from_str(json).map_err(|error| {
+            StorageError::CorruptState(format!("invalid consumer record JSON in database: {error}"))
+        })
     }
 
     // ------------------------------------------------------------------

@@ -1,10 +1,11 @@
 //! application port traits 的实现（§24.2：storage-sqlite 是 application 的
 //! 持久化适配层）。
 //!
-//! 本模块实现 [`operune_application::ports`] 的四个 port：
+//! 本模块实现 [`operune_application::ports`] 的五个 port：
 //! [`ComponentRegistryPort`]、[`GrantStorePort`]、[`AuditPort`]、
-//! [`ConfigPort`]。全部方法把 application 的用例级类型经 Storage Executor
-//! 的 typed 命令持久化（§18.2 / §18.1：SQL 细节不泄漏）。
+//! [`ConfigPort`]、[`ProviderGraphPort`]（0.2.0，§40.2 graph
+//! persistence/recovery）。全部方法把 application 的用例级类型经 Storage
+//! Executor 的 typed 命令持久化（§18.2 / §18.1：SQL 细节不泄漏）。
 //!
 //! # 同步桥接（§18.2）
 //!
@@ -36,6 +37,14 @@
 //!   Serialize）↔ 存储侧 `runtime_config` 表（key/value 字符串，§18.0）。
 //!   本模块以单 key + 显式 JSON 文档承载（键名见 [`RUNTIME_CONFIG_KEY`]；
 //!   逐字段解析，缺失 / 非法 = fail closed）。
+//! - **graph 记录**（0.2.0，§40.2）：application 的 [`ProviderRecord`] /
+//!   [`ConsumerRecord`]（domain typed）直接作为命令载荷（无存储侧中间
+//!   模型——记录形状与 port 契约一致）；repository 在 SQL 边界把 interface
+//!   集合序列化为 **JSON 规范化数组**（单 TEXT 列；schema.rs 的 `DDL_V3`
+//!   文档记录设计理由：记录 = 不可变字节事实、单行即整条记录、domain
+//!   `Serialize` 即规范形态），读取解析失败一律
+//!   [`StorageError::CorruptState`] fail closed（与 grant scope 的 JSON
+//!   规范化同模式）。
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -46,10 +55,11 @@ use operune_application::model::{
 };
 use operune_application::ports::{
     AuditError, AuditEvent, AuditPort, ComponentRegistryPort, ConfigError, ConfigPort, GrantError,
-    GrantStorePort, RegistryError,
+    GrantStorePort, GraphRecords, GraphStoreError, ProviderGraphPort, RegistryError,
 };
 use operune_domain::{
-    ByteSize, ComponentId, ComponentLifecycleState, ComponentVersion, ContentDigest, InstallationId,
+    ByteSize, ComponentId, ComponentLifecycleState, ComponentVersion, ConsumerRecord,
+    ContentDigest, InstallationId, ProviderRecord,
 };
 use operune_runtime_wasm::{
     BackgroundTaskLimit, CallDeadline, HostBufferLimit, HttpBodyLimit, InstanceCountLimit,
@@ -716,6 +726,40 @@ impl GrantStorePort for StoragePorts {
 }
 
 // ---------------------------------------------------------------------------
+// ProviderGraphPort（§40.2 graph persistence/recovery；§18.6：0.2 graph
+// 是节点本地权威状态——记录与其余 Core 元数据同库同事务语义）
+// ---------------------------------------------------------------------------
+
+impl ProviderGraphPort for StoragePorts {
+    fn replace_records(
+        &self,
+        installation: InstallationId,
+        provider: Option<&ProviderRecord>,
+        consumer: Option<&ConsumerRecord>,
+    ) -> Result<(), GraphStoreError> {
+        // 单次原子替换边界（§40.2）：provider/consumer 均为 None = 全删；
+        // 原子性与损坏 fail-closed 语义在 repository（单事务）承担。
+        match self.submit(Command::ReplaceGraphRecords {
+            installation_id: installation,
+            provider: provider.cloned(),
+            consumer: consumer.cloned(),
+        }) {
+            Ok(Response::GraphRecordsReplaced) => Ok(()),
+            Ok(_) => Err(graph_error(unexpected("ReplaceGraphRecords"))),
+            Err(error) => Err(graph_error(error)),
+        }
+    }
+
+    fn load_records(&self) -> Result<GraphRecords, GraphStoreError> {
+        match self.submit(Command::LoadGraphRecords) {
+            Ok(Response::GraphRecords(records)) => Ok(records),
+            Ok(_) => Err(graph_error(unexpected("LoadGraphRecords"))),
+            Err(error) => Err(graph_error(error)),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // AuditPort（§16.6 / §18.7：durable audit，写入失败 fail closed）
 // ---------------------------------------------------------------------------
 
@@ -1189,11 +1233,22 @@ fn unexpected(expected: &str) -> StorageError {
     ))
 }
 
+/// graph 存储错误映射（§14.1：类型擦除的可诊断 source，封闭 typed 错误
+/// 由 application 的 [`GraphStoreError`] 承载）。
+fn graph_error(error: StorageError) -> GraphStoreError {
+    GraphStoreError::Storage(Box::new(error))
+}
+
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::*;
     use crate::testutil::{audit, component_id, data_root, ok, some, tempdir};
-    use operune_domain::{CapabilityId, ComponentId, ComponentLifecycleEvent, ComponentVersion};
+    use operune_domain::{
+        CapabilityId, ComponentId, ComponentLifecycleEvent, ComponentVersion, InterfaceId,
+        InterfaceName, InterfaceRequirement, PackageName,
+    };
 
     fn config(dir: &std::path::Path) -> crate::executor::ExecutorConfig {
         ok(
@@ -1597,6 +1652,503 @@ mod tests {
         let listed = ok(ports.list_installations(), "list after reopen");
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].state, ComponentLifecycleState::Active);
+        shutdown_ports(ports).await;
+    }
+
+    // ------------------------------------------------------------------
+    // ProviderGraphPort（§40.2 graph persistence/recovery）
+    // ------------------------------------------------------------------
+
+    fn iface(package: &str, interface: &str, major: u32, minor: u32, patch: u32) -> InterfaceId {
+        InterfaceId::new(
+            ok(PackageName::new(package), "package"),
+            ok(InterfaceName::new(interface), "interface"),
+            ComponentVersion::from_parts(major, minor, patch),
+        )
+    }
+
+    fn requirement(package: &str, interface: &str, req: &str) -> InterfaceRequirement {
+        ok(
+            format!("{package}/{interface}@{req}").parse::<InterfaceRequirement>(),
+            "requirement",
+        )
+    }
+
+    fn provider_record(installation: InstallationId, provided: &[InterfaceId]) -> ProviderRecord {
+        ok(
+            ProviderRecord::new(installation, provided.iter().cloned().collect()),
+            "provider record",
+        )
+    }
+
+    fn consumer_record(
+        installation: InstallationId,
+        required: &[InterfaceRequirement],
+    ) -> ConsumerRecord {
+        ConsumerRecord::new(installation, required.iter().cloned().collect())
+    }
+
+    /// 注册组件（§19.2 两阶段安装前置：component 必须先有 committed
+    /// candidate 才能创建安装实例；幂等，重复调用同 digest 合法）。
+    async fn register_component(ports: &StoragePorts, component: &ComponentId) {
+        let bytes = b"graph component bytes".to_vec();
+        let digest = ContentDigest::from_bytes(&bytes);
+        ok(ports.persist_artifact(digest, &bytes), "persist artifact");
+        ok(
+            ports.upsert_candidate(&CandidateRecord {
+                digest,
+                state: ComponentLifecycleState::initial(),
+                byte_len: ByteSize::from_bytes(u64::try_from(bytes.len()).unwrap_or(u64::MAX)),
+            }),
+            "upsert candidate",
+        );
+        ok(
+            ports.bind_version(&DigestVersionBinding {
+                component_id: component.clone(),
+                version: ComponentVersion::from_parts(1, 0, 0),
+                digest,
+            }),
+            "bind version",
+        );
+    }
+
+    /// 经 executor 创建安装实例（graph 记录锚定安装实例，§17.5）。
+    async fn create_installation(ports: &StoragePorts, component: &ComponentId) -> InstallationId {
+        register_component(ports, component).await;
+        let id = InstallationId::new();
+        ok(
+            ports
+                .executor
+                .create_installation_with_id(id, component.clone(), audit("create installation"))
+                .await,
+            "create installation",
+        );
+        id
+    }
+
+    #[tokio::test]
+    async fn graph_records_replace_and_load_roundtrip() {
+        // 多 provider + 多 consumer + provider/consumer 同安装（依赖链中间
+        // 节点，§40.3）：replace 后 load 精确回读（typed records，§40.2
+        // 恢复输入）。
+        let dir = tempdir();
+        let ports = open_ports(dir.path()).await;
+        let component = component_id("graph-demo");
+        let a = create_installation(&ports, &component).await;
+        let b = create_installation(&ports, &component).await;
+        let c = create_installation(&ports, &component).await;
+
+        let provider_a = provider_record(
+            a,
+            &[
+                iface("acme:svc", "checkout", 1, 0, 0),
+                iface("acme:svc", "analytics", 0, 2, 0),
+            ],
+        );
+        let provider_b = provider_record(b, &[iface("acme:svc", "analytics", 0, 3, 0)]);
+        let consumer_b = consumer_record(
+            b,
+            &[
+                requirement("acme:svc", "checkout", "^1.0.0"),
+                requirement("acme:svc", "payments", "*"),
+            ],
+        );
+        let consumer_c = consumer_record(c, &[requirement("acme:svc", "analytics", "^0.2.0")]);
+        ok(
+            ports.replace_records(a, Some(&provider_a), None),
+            "replace a (provider only)",
+        );
+        ok(
+            ports.replace_records(b, Some(&provider_b), Some(&consumer_b)),
+            "replace b (provider + consumer)",
+        );
+        ok(
+            ports.replace_records(c, None, Some(&consumer_c)),
+            "replace c (consumer only)",
+        );
+
+        let stored = ok(ports.load_records(), "load records");
+        assert_eq!(stored.providers.len(), 2);
+        assert_eq!(stored.consumers.len(), 2);
+        let stored_a = some(
+            stored.providers.iter().find(|r| r.installation() == a),
+            "provider a",
+        );
+        assert_eq!(stored_a.provided(), provider_a.provided());
+        let stored_b = some(
+            stored.providers.iter().find(|r| r.installation() == b),
+            "provider b",
+        );
+        assert_eq!(stored_b.provided(), provider_b.provided());
+        let stored_b_consumer = some(
+            stored.consumers.iter().find(|r| r.installation() == b),
+            "consumer b",
+        );
+        assert_eq!(stored_b_consumer.required(), consumer_b.required());
+        let stored_c = some(
+            stored.consumers.iter().find(|r| r.installation() == c),
+            "consumer c",
+        );
+        assert_eq!(stored_c.required(), consumer_c.required());
+
+        // 升级 = 整组替换（§40.2：不得与新面叠加）——b 的提供面替换后
+        // 只含新 interface，consumer 记录保持不变。
+        let upgraded_b = provider_record(b, &[iface("acme:svc", "checkout", 1, 2, 0)]);
+        ok(
+            ports.replace_records(b, Some(&upgraded_b), Some(&consumer_b)),
+            "replace b surface",
+        );
+        let stored = ok(ports.load_records(), "load after upgrade");
+        assert_eq!(stored.providers.len(), 2, "replace must not merge surfaces");
+        let stored_b = some(
+            stored.providers.iter().find(|r| r.installation() == b),
+            "provider b after upgrade",
+        );
+        assert_eq!(
+            stored_b.provided(),
+            &BTreeSet::from([iface("acme:svc", "checkout", 1, 2, 0)])
+        );
+        assert_eq!(stored.consumers.len(), 2);
+        shutdown_ports(ports).await;
+    }
+
+    #[tokio::test]
+    async fn graph_replace_with_empty_records_removes_installation() {
+        // §40.2：provider/consumer 均为 None = 全删（deactivation /
+        // 激活失败清理）；空集替换不影响其它安装的记录。
+        let dir = tempdir();
+        let ports = open_ports(dir.path()).await;
+        let component = component_id("graph-empty");
+        let a = create_installation(&ports, &component).await;
+        let b = create_installation(&ports, &component).await;
+        ok(
+            ports.replace_records(
+                a,
+                Some(&provider_record(
+                    a,
+                    &[iface("acme:svc", "checkout", 1, 0, 0)],
+                )),
+                None,
+            ),
+            "replace a",
+        );
+        ok(
+            ports.replace_records(
+                b,
+                None,
+                Some(&consumer_record(
+                    b,
+                    &[requirement("acme:svc", "checkout", "^1.0.0")],
+                )),
+            ),
+            "replace b",
+        );
+        ok(ports.replace_records(a, None, None), "clear a");
+        let stored = ok(ports.load_records(), "load after clearing a");
+        assert!(stored.providers.is_empty());
+        assert_eq!(stored.consumers.len(), 1);
+        assert_eq!(stored.consumers[0].installation(), b);
+        ok(ports.replace_records(b, None, None), "clear b");
+        let stored = ok(ports.load_records(), "load after clearing b");
+        assert!(stored.providers.is_empty());
+        assert!(stored.consumers.is_empty());
+        shutdown_ports(ports).await;
+    }
+
+    #[tokio::test]
+    async fn graph_load_returns_empty_on_fresh_database() {
+        // §40.2 恢复输入：缺失（无记录）→ 空集，不报错。
+        let dir = tempdir();
+        let ports = open_ports(dir.path()).await;
+        let stored = ok(ports.load_records(), "load on fresh db");
+        assert!(stored.providers.is_empty());
+        assert!(stored.consumers.is_empty());
+        shutdown_ports(ports).await;
+    }
+
+    #[tokio::test]
+    async fn graph_replace_is_atomic_when_mid_transaction_fails() {
+        // §18.5 fault-injection：触发器确定性构造 replace 事务**中途**失败
+        //（DELETE 已执行、INSERT 被 RAISE(ABORT) 打断）——事务整体回滚，
+        // 不存在"半条记录 / 新旧并存"的中间观。
+        let dir = tempdir();
+        let db_path = data_root(dir.path()).db_path();
+        {
+            let conn = ok(
+                crate::migration::open_authoritative_db(&db_path),
+                "raw open (test setup)",
+            );
+            ok(
+                conn.execute_batch(
+                    "CREATE TRIGGER graph_fail_inject
+                     BEFORE INSERT ON graph_provider_records
+                     WHEN NEW.provided LIKE '%graph-fail%'
+                     BEGIN
+                         SELECT RAISE(ABORT, 'injected graph failure');
+                     END;",
+                ),
+                "create fault injection trigger",
+            );
+        }
+        let ports = open_ports(dir.path()).await;
+        let component = component_id("graph-atomic");
+        let a = create_installation(&ports, &component).await;
+        let original = provider_record(a, &[iface("acme:svc", "checkout", 1, 0, 0)]);
+        let consumer = consumer_record(a, &[requirement("acme:svc", "checkout", "^1.0.0")]);
+        ok(
+            ports.replace_records(a, Some(&original), Some(&consumer)),
+            "seed records",
+        );
+        // 触发失败：provider 面含 marker interface（触发器命中）。
+        let failing = provider_record(a, &[iface("acme:svc", "graph-fail", 9, 0, 0)]);
+        let result = ports.replace_records(a, Some(&failing), None);
+        assert!(
+            matches!(result, Err(GraphStoreError::Storage(_))),
+            "injected mid-transaction failure must surface: {result:?}"
+        );
+        // 无半状态：provider 仍是 original、consumer 仍在（整体回滚）。
+        let stored = ok(ports.load_records(), "load after failed replace");
+        assert_eq!(stored.providers.len(), 1);
+        assert_eq!(stored.providers[0].provided(), original.provided());
+        assert_eq!(stored.consumers.len(), 1);
+        assert_eq!(stored.consumers[0].required(), consumer.required());
+        shutdown_ports(ports).await;
+    }
+
+    #[tokio::test]
+    async fn graph_load_fails_closed_on_corrupt_provider_json() {
+        // 损坏（非法 JSON）→ CorruptState fail closed，绝不静默跳过
+        //（与 scope_from_storage 同模式）。
+        let dir = tempdir();
+        let ports = open_ports(dir.path()).await;
+        let component = component_id("graph-corrupt");
+        let a = create_installation(&ports, &component).await;
+        ok(
+            ports.replace_records(
+                a,
+                Some(&provider_record(
+                    a,
+                    &[iface("acme:svc", "checkout", 1, 0, 0)],
+                )),
+                None,
+            ),
+            "seed provider",
+        );
+        {
+            let conn = ok(
+                crate::migration::open_authoritative_db(&data_root(dir.path()).db_path()),
+                "raw open (test setup)",
+            );
+            ok(
+                conn.execute(
+                    "UPDATE graph_provider_records SET provided = '{not-json'
+                     WHERE installation_id = ?1",
+                    [a.to_string()],
+                ),
+                "corrupt provided",
+            );
+        }
+        let error = match ports.load_records() {
+            Ok(_) => unreachable!("corrupt provider JSON must fail closed"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(error, GraphStoreError::Storage(ref source)
+                if source.to_string().contains("corrupt")),
+            "corruption must surface as GraphStoreError::Storage(CorruptState): {error:?}"
+        );
+        shutdown_ports(ports).await;
+    }
+
+    #[tokio::test]
+    async fn graph_load_fails_closed_on_empty_provider_set() {
+        // provider 的定义是至少提供一个 interface（§13.4 不合法状态不可
+        // 表示）：数据库中出现空提供面 = 损坏。
+        let dir = tempdir();
+        let ports = open_ports(dir.path()).await;
+        let component = component_id("graph-corrupt");
+        let a = create_installation(&ports, &component).await;
+        ok(
+            ports.replace_records(
+                a,
+                Some(&provider_record(
+                    a,
+                    &[iface("acme:svc", "checkout", 1, 0, 0)],
+                )),
+                None,
+            ),
+            "seed provider",
+        );
+        {
+            let conn = ok(
+                crate::migration::open_authoritative_db(&data_root(dir.path()).db_path()),
+                "raw open (test setup)",
+            );
+            ok(
+                conn.execute(
+                    "UPDATE graph_provider_records SET provided = '[]'
+                     WHERE installation_id = ?1",
+                    [a.to_string()],
+                ),
+                "corrupt provided to empty set",
+            );
+        }
+        let error = match ports.load_records() {
+            Ok(_) => unreachable!("empty provider set must fail closed"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(error, GraphStoreError::Storage(ref source)
+                if source.to_string().contains("corrupt")),
+            "empty provider set must surface as CorruptState: {error:?}"
+        );
+        shutdown_ports(ports).await;
+    }
+
+    #[tokio::test]
+    async fn graph_load_fails_closed_on_unparseable_interface_identifier() {
+        // 合法 JSON 但条目无法解析为 InterfaceId（domain 边界解析，
+        // §13.3）→ 损坏 fail closed。
+        let dir = tempdir();
+        let ports = open_ports(dir.path()).await;
+        let component = component_id("graph-corrupt");
+        let a = create_installation(&ports, &component).await;
+        ok(
+            ports.replace_records(
+                a,
+                Some(&provider_record(
+                    a,
+                    &[iface("acme:svc", "checkout", 1, 0, 0)],
+                )),
+                None,
+            ),
+            "seed provider",
+        );
+        {
+            let conn = ok(
+                crate::migration::open_authoritative_db(&data_root(dir.path()).db_path()),
+                "raw open (test setup)",
+            );
+            ok(
+                conn.execute(
+                    "UPDATE graph_provider_records SET provided = '[\"bogus\"]'
+                     WHERE installation_id = ?1",
+                    [a.to_string()],
+                ),
+                "corrupt provided with unparseable identifier",
+            );
+        }
+        let error = match ports.load_records() {
+            Ok(_) => unreachable!("unparseable interface identifier must fail closed"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(error, GraphStoreError::Storage(ref source)
+                if source.to_string().contains("corrupt")),
+            "unparseable identifier must surface as CorruptState: {error:?}"
+        );
+        shutdown_ports(ports).await;
+    }
+
+    #[tokio::test]
+    async fn graph_records_survive_reopen() {
+        // §18.5：已提交事务崩溃后仍然存在（WAL + synchronous FULL）——
+        // 关闭后重新打开，记录精确回读（恢复输入，§40.2）。
+        let dir = tempdir();
+        let component = component_id("graph-durable");
+        let (a, b) = {
+            let ports = open_ports(dir.path()).await;
+            let a = create_installation(&ports, &component).await;
+            let b = create_installation(&ports, &component).await;
+            ok(
+                ports.replace_records(
+                    a,
+                    Some(&provider_record(
+                        a,
+                        &[iface("acme:svc", "checkout", 1, 0, 0)],
+                    )),
+                    None,
+                ),
+                "replace a",
+            );
+            ok(
+                ports.replace_records(
+                    b,
+                    None,
+                    Some(&consumer_record(
+                        b,
+                        &[requirement("acme:svc", "checkout", "^1.0.0")],
+                    )),
+                ),
+                "replace b",
+            );
+            shutdown_ports(ports).await;
+            (a, b)
+        };
+        let ports = open_ports(dir.path()).await;
+        let stored = ok(ports.load_records(), "load after reopen");
+        assert_eq!(stored.providers.len(), 1);
+        assert_eq!(stored.providers[0].installation(), a);
+        assert_eq!(
+            stored.providers[0].provided(),
+            &BTreeSet::from([iface("acme:svc", "checkout", 1, 0, 0)])
+        );
+        assert_eq!(stored.consumers.len(), 1);
+        assert_eq!(stored.consumers[0].installation(), b);
+        assert_eq!(
+            stored.consumers[0].required(),
+            &BTreeSet::from([requirement("acme:svc", "checkout", "^1.0.0")])
+        );
+        shutdown_ports(ports).await;
+    }
+
+    #[tokio::test]
+    async fn graph_replace_rejects_unknown_installation() {
+        // §17.5：graph 记录锚定安装实例（与 grants 同约束）——安装不存在
+        // → typed NotFound，且不产生任何写入。
+        let dir = tempdir();
+        let ports = open_ports(dir.path()).await;
+        let ghost = InstallationId::new();
+        let record = provider_record(ghost, &[iface("acme:svc", "checkout", 1, 0, 0)]);
+        let error = match ports.replace_records(ghost, Some(&record), None) {
+            Ok(_) => unreachable!("unknown installation must be rejected"),
+            Err(error) => error,
+        };
+        match error {
+            GraphStoreError::Storage(source) => {
+                assert!(source.to_string().contains("not found"));
+            }
+        }
+        let stored = ok(ports.load_records(), "load");
+        assert!(stored.providers.is_empty());
+        shutdown_ports(ports).await;
+    }
+
+    #[tokio::test]
+    async fn graph_replace_rejects_record_installation_mismatch() {
+        // §40.2 身份可追溯：传入记录的 installation 与替换键不一致 =
+        // 调用方契约违反（InvalidArgument，fail closed）。
+        let dir = tempdir();
+        let ports = open_ports(dir.path()).await;
+        let component = component_id("graph-mismatch");
+        let a = create_installation(&ports, &component).await;
+        let other = InstallationId::new();
+        let record = provider_record(other, &[iface("acme:svc", "checkout", 1, 0, 0)]);
+        let error = match ports.replace_records(a, Some(&record), None) {
+            Ok(_) => unreachable!("mismatched record must be rejected"),
+            Err(error) => error,
+        };
+        match error {
+            GraphStoreError::Storage(source) => {
+                assert!(
+                    source
+                        .to_string()
+                        .contains("does not match replacement key")
+                );
+            }
+        }
+        let stored = ok(ports.load_records(), "load");
+        assert!(stored.providers.is_empty());
         shutdown_ports(ports).await;
     }
 }

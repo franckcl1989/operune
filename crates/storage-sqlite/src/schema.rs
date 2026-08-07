@@ -172,6 +172,48 @@ CREATE TABLE runtime_config (
 );
 ";
 
+/// Migration v3：0.2.0 provider graph records（§40.2 graph
+/// persistence/recovery；§18.6：0.2 graph 是**节点本地权威**状态——本表与
+/// 其余 Core 元数据同属单节点权威事实源，不涉及 cluster 一致性）。
+///
+/// 表设计（记录 = 安装实例 + 角色 的不可变字节事实，§40.2/§40.3）：
+///
+/// - **`graph_provider_records`** / **`graph_consumer_records`** 两张表，
+///   `installation_id` 为主键（§17.5：graph 记录锚定安装实例；每安装
+///   实例至多一条 provider 记录、一条 consumer 记录——同一安装可同时
+///   是 provider 与 consumer，依赖链中间节点，§40.3）；
+/// - 记录标识 = `installation_id` + 表角色（provider/consumer），不另设
+///   序号：port 的 `replace_records` 是"某安装的全部记录"单次原子替换
+///   边界，记录本身没有独立于安装的身份；
+/// - `provided` / `required` = interface 集合的 **JSON 规范化数组**（每条
+///   目为 domain 类型的规范字符串形态，见 schema 模块 doc 的序列化选择）：
+///   - `provided`：`["namespace:package/interface@x.y.z", ...]`
+///     （[`InterfaceId`](operune_domain::InterfaceId) 的 Display 规范形态）；
+///   - `required`：`["namespace:package/interface@<version-req>", ...]`
+///     （[`InterfaceRequirement`](operune_domain::InterfaceRequirement) 的
+///     Display 规范形态，`VersionReq` 已规范化，如 `1.2.3` → `^1.2.3`）；
+///   - 解析失败 / provider 空集 = 持久化损坏，读取时
+///     `crate::StorageError::CorruptState` fail closed（repository.rs）；
+/// - 外键到 `installations(installation_id)`：graph 记录锚定安装实例
+///   （与 `grants` 同约束），对不存在的安装拒绝写入；
+/// - 0.x 无历史数据：v2 → v3 时本表为空即可，无需回填（migration.rs）。
+pub(crate) const DDL_V3: &str = "
+-- §40.2 / §40.3：provider 记录（提供面 = WIT exports + Runtime Policy
+-- 过滤后的输入形态；每安装实例至多一行，PK 即记录标识）。
+CREATE TABLE graph_provider_records (
+    installation_id TEXT PRIMARY KEY REFERENCES installations(installation_id),
+    provided        TEXT NOT NULL CHECK (length(provided) BETWEEN 1 AND 65536),
+    updated_at      INTEGER NOT NULL
+);
+
+-- §40.2 / §40.3：consumer 记录（需求面 = WIT imports；每安装实例至多一行）。
+CREATE TABLE graph_consumer_records (
+    installation_id TEXT PRIMARY KEY REFERENCES installations(installation_id),
+    required        TEXT NOT NULL CHECK (length(required) BETWEEN 1 AND 65536),
+    updated_at      INTEGER NOT NULL
+);
+";
+
 /// 打开后校验 Core 必备表存在（fail closed，§18.4：不得以半升级 schema 继续）。
 /// 在 migration 成功之后调用；缺失即持久化状态损坏。
 pub(crate) fn verify_core_tables(conn: &rusqlite::Connection) -> Result<(), crate::StorageError> {
@@ -190,6 +232,8 @@ pub(crate) fn verify_core_tables(conn: &rusqlite::Connection) -> Result<(), crat
         "sessions",
         "audit_events",
         "runtime_config",
+        "graph_provider_records",
+        "graph_consumer_records",
     ] {
         let found: Option<String> = conn
             .query_row(

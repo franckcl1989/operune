@@ -33,9 +33,10 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use operune_application::ports::GraphRecords;
 use operune_domain::{
     ByteSize, CapabilityId, ComponentId, ComponentLifecycleEvent, ComponentLifecycleState,
-    ComponentVersion, ContentDigest, InstallationId,
+    ComponentVersion, ConsumerRecord, ContentDigest, InstallationId, ProviderRecord,
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -409,6 +410,19 @@ pub(crate) enum Command {
         /// audit 事件（同事务，§18.7）。
         audit: AuditEvent,
     },
+    /// 原子替换某安装实例的全部 graph 记录（§40.2 graph
+    /// persistence/recovery；application 的 `ProviderGraphPort` 面；
+    /// 单事务语义见 repository 文档）。
+    ReplaceGraphRecords {
+        /// 安装实例（记录键，§17.5）。
+        installation_id: InstallationId,
+        /// 新的 provider 记录（`None` = 该安装不再提供任何 interface）。
+        provider: Option<ProviderRecord>,
+        /// 新的 consumer 记录（`None` = 该安装不再导入任何 interface）。
+        consumer: Option<ConsumerRecord>,
+    },
+    /// 加载全部 graph 记录（§40.2 恢复输入）。
+    LoadGraphRecords,
     /// 测试专用 gate（仅 cfg(test)：阻塞 worker 以验证有界队列 / 取消 /
     /// shutdown 排空语义，§29）。
     #[cfg(test)]
@@ -511,6 +525,10 @@ pub(crate) enum Response {
     ArtifactBytes(Option<Vec<u8>>),
     /// 授权集已整体替换。
     GrantsReplaced,
+    /// graph 记录已整体替换（§40.2）。
+    GraphRecordsReplaced,
+    /// 全部 graph 记录（§40.2 恢复输入）。
+    GraphRecords(GraphRecords),
 }
 
 /// 单个请求（命令 + 取消探针 + 单答复）。
@@ -1366,6 +1384,37 @@ impl StorageExecutor {
             _ => Err(unexpected_response("ReplaceGrants")),
         }
     }
+
+    /// 原子替换某安装实例的全部 graph 记录（§40.2 graph
+    /// persistence/recovery；单事务，§18.5：任何中间观不可观察）。
+    pub async fn replace_graph_records(
+        &self,
+        installation_id: InstallationId,
+        provider: Option<ProviderRecord>,
+        consumer: Option<ConsumerRecord>,
+    ) -> Result<(), StorageError> {
+        let response = self
+            .submit(Command::ReplaceGraphRecords {
+                installation_id,
+                provider,
+                consumer,
+            })
+            .await?;
+        match response {
+            Response::GraphRecordsReplaced => Ok(()),
+            _ => Err(unexpected_response("ReplaceGraphRecords")),
+        }
+    }
+
+    /// 加载全部 graph 记录（§40.2 恢复输入；缺失 → 空集，损坏 → fail
+    /// closed）。
+    pub async fn load_graph_records(&self) -> Result<GraphRecords, StorageError> {
+        let response = self.submit(Command::LoadGraphRecords).await?;
+        match response {
+            Response::GraphRecords(records) => Ok(records),
+            _ => Err(unexpected_response("LoadGraphRecords")),
+        }
+    }
 }
 
 impl Drop for StorageExecutor {
@@ -1658,6 +1707,21 @@ fn worker_main(
             } => Repository::new(&mut conn, &store)
                 .replace_grants(installation_id, &grants, &audit, &request.cancel)
                 .map(|()| Response::GrantsReplaced),
+            Command::ReplaceGraphRecords {
+                installation_id,
+                provider,
+                consumer,
+            } => Repository::new(&mut conn, &store)
+                .replace_graph_records(
+                    installation_id,
+                    provider.as_ref(),
+                    consumer.as_ref(),
+                    &request.cancel,
+                )
+                .map(|()| Response::GraphRecordsReplaced),
+            Command::LoadGraphRecords => Repository::new(&mut conn, &store)
+                .load_graph_records()
+                .map(Response::GraphRecords),
             #[cfg(test)]
             Command::TestGate { entered, release } => {
                 let _ = entered.send(());
@@ -2147,7 +2211,7 @@ mod tests {
             "reopen with newer schema",
         );
         assert!(
-            matches!(error, StorageError::SchemaTooNew { db: 99, current: 2 }),
+            matches!(error, StorageError::SchemaTooNew { db: 99, current: 3 }),
             "expected SchemaTooNew, got {error:?}"
         );
     }

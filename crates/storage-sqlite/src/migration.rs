@@ -38,7 +38,7 @@ use rusqlite::Connection;
 
 use crate::error::StorageError;
 use crate::model::Timestamp;
-use crate::schema::{DDL_V1, verify_core_tables};
+use crate::schema::{DDL_V1, DDL_V3, verify_core_tables};
 
 /// 单个版本化 migration。`apply` 在 runner 开启的事务内执行；
 /// 版本号由 runner 在同一事务内推进。
@@ -72,6 +72,7 @@ impl Migration {
 pub const PRODUCTION_MIGRATIONS: &[Migration] = &[
     Migration::new(1, "core-schema-v1", apply_v1),
     Migration::new(2, "candidate-lifecycle-v2", apply_v2),
+    Migration::new(3, "graph-records-v3", apply_v3),
 ];
 
 /// 本构建支持的当前 schema 版本（= 最后一个 production migration 版本）。
@@ -252,6 +253,17 @@ fn apply_v2(tx: &rusqlite::Transaction<'_>) -> Result<(), StorageError> {
     .map_err(|e| StorageError::sqlite("apply candidate lifecycle v2", e))
 }
 
+/// Migration v3：0.2.0 provider graph 记录表（§40.2 graph
+/// persistence/recovery；§18.6：graph 记录是节点本地权威状态）。
+///
+/// 表设计与序列化选择见 schema.rs 的 [`DDL_V3`] 文档。0.x 无历史数据：
+/// v2 → v3 时 graph 表为空即可，无需回填。DDL 与版本推进在**同一事务**
+/// 内（§18.4：失败整体回滚，schema 停留在 v2）。
+fn apply_v3(tx: &rusqlite::Transaction<'_>) -> Result<(), StorageError> {
+    tx.execute_batch(DDL_V3)
+        .map_err(|e| StorageError::sqlite("apply graph records v3", e))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -270,7 +282,7 @@ mod tests {
             ok(read_schema_version(&conn), "version"),
             current_schema_version()
         );
-        assert_eq!(current_schema_version(), 2);
+        assert_eq!(current_schema_version(), 3);
     }
 
     #[test]
@@ -299,7 +311,7 @@ mod tests {
         }
         let error = err(open_authoritative_db(&path), "reopen newer db");
         assert!(
-            matches!(error, StorageError::SchemaTooNew { db: 99, current: 2 }),
+            matches!(error, StorageError::SchemaTooNew { db: 99, current: 3 }),
             "expected SchemaTooNew, got {error:?}"
         );
     }
@@ -456,5 +468,84 @@ mod tests {
             prev = m.version;
         }
         assert_eq!(prev, current_schema_version());
+    }
+
+    #[test]
+    fn forward_migration_v2_to_v3_preserves_data_and_graph_tables_empty() {
+        // §18.4 release contract 的 old-version → new-version migration test：
+        // v2 → v3 前进路径。0.x 无 graph 历史数据：v3 只建表、不回填
+        //（graph 表必须为空）；既有 v1/v2 数据必须保留。
+        let dir = tempdir();
+        let mut conn = ok(
+            Connection::open(db_path(dir.path())),
+            "open raw connection (test setup)",
+        );
+        ok(configure_connection(&conn), "configure");
+
+        // old-version 数据库：停在 v2，并写入一个安装实例。
+        ok(
+            apply_migrations_to(&mut conn, PRODUCTION_MIGRATIONS, Some(2)),
+            "init at v2",
+        );
+        assert_eq!(ok(read_schema_version(&conn), "version"), 2);
+        ok(
+            conn.execute_batch(
+                "INSERT INTO components (component_id) VALUES ('acme:demo');
+                 INSERT INTO installations
+                     (installation_id, component_id, enabled, lifecycle_state,
+                      created_at, updated_at)
+                 VALUES ('00000000-0000-0000-0000-000000000001', 'acme:demo', 0,
+                         'installed', 1, 1);",
+            ),
+            "seed v2 data",
+        );
+
+        // 前进路径：v2 → v3。
+        ok(
+            apply_migrations_to(&mut conn, PRODUCTION_MIGRATIONS, None),
+            "migrate to v3",
+        );
+        assert_eq!(ok(read_schema_version(&conn), "version"), 3);
+        // graph 表存在且为空（0.x 无历史数据，无需回填）。
+        for table in ["graph_provider_records", "graph_consumer_records"] {
+            let count: i64 = ok(
+                conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                }),
+                "count graph rows",
+            );
+            assert_eq!(count, 0, "{table} must be empty after v2 -> v3");
+        }
+        // 既有数据保留。
+        let kept: Option<String> = ok(
+            conn.query_row(
+                "SELECT installation_id FROM installations
+                 WHERE installation_id = '00000000-0000-0000-0000-000000000001'",
+                [],
+                |row| row.get(0),
+            )
+            .optional(),
+            "read kept installation",
+        );
+        assert_eq!(
+            kept.as_deref(),
+            Some("00000000-0000-0000-0000-000000000001")
+        );
+    }
+
+    #[test]
+    fn fresh_db_has_empty_graph_tables() {
+        // v3 之后的全新数据库：graph 表存在且为空（恢复输入 = 空集）。
+        let dir = tempdir();
+        let conn = ok(open_authoritative_db(&db_path(dir.path())), "open");
+        for table in ["graph_provider_records", "graph_consumer_records"] {
+            let count: i64 = ok(
+                conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                }),
+                "count graph rows",
+            );
+            assert_eq!(count, 0, "{table} must start empty");
+        }
     }
 }

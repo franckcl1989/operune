@@ -29,8 +29,8 @@
 //! - [`executor`]：Storage Executor（§18.2）：专用线程 + 有界队列 +
 //!   typed request/response + 提交前取消语义 + shutdown 等待；
 //! - [`ports`]：application port traits 的实现（§24.2：ComponentRegistry /
-//!   GrantStore / Audit / Config），同步桥接到 executor 并做用例级类型
-//!   与存储侧记录之间的转换（§13.3）。
+//!   GrantStore / Audit / Config / ProviderGraph），同步桥接到 executor 并做
+//!   用例级类型与存储侧记录之间的转换（§13.3）。
 //!
 //! # 权威性边界（§18.1）
 //!
