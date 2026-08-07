@@ -14,7 +14,7 @@ use crate::error::{DomainError, ValueKind};
 pub(crate) const MAX_IDENTIFIER_LEN: usize = 255;
 
 /// 标识符共用的结构性校验（validate-on-construct，§13.3）。
-fn validate_identifier(value: &str, kind: ValueKind) -> Result<(), DomainError> {
+pub(crate) fn validate_identifier(value: &str, kind: ValueKind) -> Result<(), DomainError> {
     if value.is_empty() {
         return Err(DomainError::invalid_value(kind, "must not be empty"));
     }

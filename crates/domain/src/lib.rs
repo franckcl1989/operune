@@ -28,6 +28,27 @@
 //! - 封闭 typed error（§14.1）：[`DomainError`]，禁止 anyhow / eyre /
 //!   `Box<dyn Error>` / String error。
 //!
+//! # 0.2.0 公开面（§40 Capability Composition 中的 domain 部分）
+//!
+//! - Capability Provider identity（§40.2）：[`ProviderId`]——"提供某能力的
+//!   Component 安装实例"的身份，从 [`InstallationId`] 确定性派生（§17.5：
+//!   Grant 的 durable owner 是 InstallationId；provider 身份可追溯到
+//!   安装实例但不能与它混淆，无 ProviderId → InstallationId 转换）。
+//! - 契约面类型（§40.2 / §40.3，事实源 = WIT imports/exports + Runtime
+//!   Policy）：[`PackageName`] / [`InterfaceName`] / [`InterfaceId`]
+//!   （provider 导出的 interface 标识）、[`InterfaceRequirement`]（consumer
+//!   导入的需求，semver `VersionReq` 语义）与兼容判断
+//!   [`interface_compatible`]。
+//! - Provider graph（§40.2 dependency graph / §40.4 确定性）：
+//!   [`ProviderGraph`]（不可变快照）、[`ProviderRecord`] / [`ConsumerRecord`]
+//!   （构建输入）、[`ProviderNode`] / [`ResolvedEdge`]（节点与边）、
+//!   [`ProviderGraphError`]（封闭 typed error：CycleDetected /
+//!   AmbiguousProvider / MissingProvider / IncompatibleVersion 等）、
+//!   激活顺序 [`ProviderGraph::topological_order`]。
+//! - Provider upgrade 兼容分析（§40.2）：[`UpgradeCompatibilityReport`] /
+//!   [`ConsumerUpgradeImpact`] / [`UpgradeImpact`] /
+//!   [`UpgradeIncompatibility`]。
+//!
 //! # 设计约束
 //!
 //! - 全部值类型 validate-on-construct（§13.3 边界解析一次，内部保持强类型，
@@ -41,18 +62,33 @@ mod test_support;
 
 mod digest;
 mod error;
+mod graph;
 mod id;
+mod interface;
 mod lifecycle;
 mod path;
+mod provider;
 mod size;
 mod time;
+mod upgrade;
 mod version;
 
 pub use digest::ContentDigest;
 pub use error::{DomainError, ValueKind};
+pub use graph::{
+    ConsumerRecord, InterfaceCandidate, ProviderGraph, ProviderGraphError, ProviderNode,
+    ProviderRecord, ResolvedEdge,
+};
 pub use id::{CapabilityId, ComponentId, InstallationId};
+pub use interface::{
+    InterfaceId, InterfaceName, InterfaceRequirement, PackageName, interface_compatible,
+};
 pub use lifecycle::{ComponentLifecycleEvent, ComponentLifecycleState};
 pub use path::ArtifactPath;
+pub use provider::ProviderId;
 pub use size::ByteSize;
 pub use time::{Deadline, Duration};
+pub use upgrade::{
+    ConsumerUpgradeImpact, UpgradeCompatibilityReport, UpgradeImpact, UpgradeIncompatibility,
+};
 pub use version::ComponentVersion;

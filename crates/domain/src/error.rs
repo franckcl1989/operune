@@ -72,6 +72,16 @@ pub enum ValueKind {
     LifecycleState,
     /// [`ComponentLifecycleEvent`](crate::ComponentLifecycleEvent) 字符串解析。
     LifecycleEvent,
+    /// [`ProviderId`](crate::ProviderId)（0.2.0 provider graph，§40.2）。
+    ProviderId,
+    /// [`PackageName`](crate::PackageName)（0.2.0 契约面，§40.2）。
+    PackageName,
+    /// [`InterfaceName`](crate::InterfaceName)（0.2.0 契约面，§40.2）。
+    InterfaceName,
+    /// [`InterfaceId`](crate::InterfaceId)（0.2.0 契约面，§40.2）。
+    InterfaceId,
+    /// [`InterfaceRequirement`](crate::InterfaceRequirement)（0.2.0 契约面，§40.2）。
+    InterfaceRequirement,
 }
 
 impl fmt::Display for ValueKind {
@@ -88,6 +98,11 @@ impl fmt::Display for ValueKind {
             Self::ArtifactPath => "artifact-path",
             Self::LifecycleState => "lifecycle-state",
             Self::LifecycleEvent => "lifecycle-event",
+            Self::ProviderId => "provider-id",
+            Self::PackageName => "package-name",
+            Self::InterfaceName => "interface-name",
+            Self::InterfaceId => "interface-id",
+            Self::InterfaceRequirement => "interface-requirement",
         };
         f.write_str(s)
     }
