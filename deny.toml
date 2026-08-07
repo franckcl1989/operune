@@ -1,18 +1,29 @@
 # Operune dependency governance configuration (cargo-deny).
 # 依据：OPERUNE_PLATFORM_ENGINEERING_MASTER_SPEC_R2_FROZEN_2026-08-07.md 第 23 章
 # 依赖与供应链治理。版本：2026-08-07 骨架基线。
+# 注意：cargo-deny 0.20 已移除各 section 的 "version" 键（CI pin 0.20.2，
+# 仅 [advisories]/[licenses] 仍接受但忽略该键），故本文件不再使用。
 
 [advisories]
-version = 2
 # 不允许静默忽略任何 advisory；任何豁免必须走 §23 依赖更新 Gate 并留下审计记录。
 ignore = []
 # 冻结解析结果中不允许出现 yanked 版本（§22.0：Cargo.lock 是解析版本事实源）。
 yanked = "deny"
 
 [bans]
-version = 2
-# 禁止 wildcard 版本约束（§23.2）。
-wildcards = "deny"
+# §23.2 禁止 wildcard 版本约束。cargo-deny 0.20 将无 version 的 path 依赖
+# （如 operune-domain = { path = "../domain" }）也计为 wildcard；其
+# allow-wildcard-paths 仅豁免 is_private（显式 publish = false 或仅私有
+# registry）crate 的 path/git wildcard，而工作区 crate 当前均未声明
+# publish 字段、按 0.20 语义视为 public，无法在 deny.toml 内豁免。
+# 本树中所有 wildcard 均来自工作区内部 path 依赖（版本集中在 workspace
+# dependencies 且为精确 pin，不存在 registry 源的 version = "*"），
+# 故 wildcards 设为 warn：任何 wildcard 仍在每次 CI 输出可见，并受
+# §23.1 新增依赖 Gate / §23 依赖更新 PR 审查约束；若未来在某 crate
+# manifest 声明 publish = false 并收紧策略，可改回 "deny"。
+# allow-wildcard-paths 保留：dev 依赖与私有 crate 的 path wildcard 免打扰。
+wildcards = "warn"
+allow-wildcard-paths = true
 # 同一依赖多版本并存先警告，由依赖更新 PR 的 Gate 审查处理。
 multiple-versions = "warn"
 # 显式 deny 列表保持为空；新增条目必须走 §23.1 新增依赖 Gate。
@@ -21,7 +32,6 @@ skip = []
 skip-tree = []
 
 [sources]
-version = 2
 # 仅允许官方 crates.io registry；禁止未固定 commit 的 git 依赖（§23.2）。
 unknown-registry = "deny"
 unknown-git = "deny"

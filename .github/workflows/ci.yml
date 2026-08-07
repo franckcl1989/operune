@@ -29,6 +29,12 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
+    # ubuntu runner 曾因 crates.io 依赖下载超时/限速导致 job 失败（cargo 默认
+    # http.timeout=30s、net.retry=2，见 Cargo Book environment variables）；
+    # 放宽超时并提高重试次数以增强网络稳健性，不改动任何 cargo 命令语义。
+    env:
+      CARGO_HTTP_TIMEOUT: 120
+      CARGO_NET_RETRY: 10
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.97.1
