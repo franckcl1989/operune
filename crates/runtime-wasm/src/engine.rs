@@ -86,12 +86,44 @@ impl EngineHandle {
         &self.config
     }
 
-    pub(crate) fn engine(&self) -> &wasmtime::Engine {
+    /// 受控泄漏点：底层 Wasmtime Engine 的只读借用（§22.2）。
+    ///
+    /// 语义：返回本 handle 内部唯一 Wasmtime Engine 的不可变借用；`EngineHandle`
+    /// 与该 Engine 一一对应，所有经本 handle 创建的 Component/Store 与该借用
+    /// 同源（同一致）；与 [`Self::clone_engine`] 不同，本方法不增加引用计数
+    /// （§7.1：每个 Core Runtime 进程共享同一个 Engine）。
+    ///
+    /// 受控泄漏的边界：本方法的返回值 `&wasmtime::Engine` 是本 crate 唯一把
+    /// Wasmtime 具体类型暴露给上层的接口——WIT bindgen / `Linker::new` 的签名
+    /// 强制要求传入 `&Engine`，故无法用 typed port 包装（§8.2 只约束 domain 层
+    /// 与更上层不得依赖 Wasmtime 类型；§22.2 host bindgen 集成在此取用）。
+    /// 调用方（application 集成层）必须把它当作实现细节：不得再向更高层
+    /// 传播或持久化该借用。
+    ///
+    /// 所有权/借用：只读借用（`&self.engine`），不转移所有权，不产生新 owner；
+    /// 借用期由借用检查器约束，与 `self` 的存活期绑定。
+    ///
+    /// 并发：`wasmtime::Engine` 是 `Sync` 的，可被任意线程安全地只读共享
+    /// （ticker 后台线程即经 [`Self::clone_engine`] 持有强引用）；本借用可安全
+    /// 跨线程传递。但 Store 仍须遵守单执行约束（§7.3：任一实例槽位同时只执行
+    /// 一个调用）——Engine 的线程共享与 Store 的单执行是两个独立的并发维度。
+    ///
+    /// 安全含义：从本借用构造的 Linker/Module/Component 继承本 Engine 的配置
+    /// （epoch interruption、栈上限、OnDemand 分配策略等，见 [`EngineConfig`]），
+    /// 实例的能力面由该配置决定；调用方不得修改 Engine（配置创建后不可变，
+    /// §7.1），不得绕过 [`EngineConfig`] 施加的约束，也不得在本 crate 之外
+    /// 对 Engine 配置做任何变更性调用。
+    pub fn engine(&self) -> &wasmtime::Engine {
         &self.engine
     }
 
     /// 内部共享：ticker 等后台线程持有 Engine 强引用（§7.1 进程级共享 Engine）。
-    pub(crate) fn clone_engine(&self) -> wasmtime::Engine {
+    ///
+    /// 语义：返回 `wasmtime::Engine` 的克隆；克隆共享同一底层 Engine 数据
+    /// （只增加引用计数，不复制编译产物），与 [`Self::engine`] 的借用同源。
+    /// 用于需要独立拥有引用（移入 `'static` 线程）的场合；借用检查器不允许
+    /// 把 `&Engine` 移入线程时使用。
+    pub fn clone_engine(&self) -> wasmtime::Engine {
         self.engine.clone()
     }
 }

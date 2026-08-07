@@ -28,10 +28,27 @@ impl ComponentHandle {
         Ok(Self { component })
     }
 
-    /// 内部编译产物访问（0.1.0 由测试与实例化扩展缝消费；lib-only 构建下
-    /// 允许 dead_code）。
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn component(&self) -> &wasmtime::component::Component {
+    /// 访问已编译的 Wasmtime Component（实例化扩展缝：`Linker::instantiate`
+    /// 与 WIT bindgen 生成的接口以 `&wasmtime::component::Component` 为参数）。
+    ///
+    /// 类型泄漏说明（§8.2）：本签名必须暴露 wasmtime 具体类型——
+    /// `wasmtime::component::Linker::instantiate` 与 bindgen 生成代码的签名
+    /// 直接使用 `&Component`，typed invoke 必须持有编译产物；runtime-wasm
+    /// 自身不提供 Component Model 的 invoke（属 application/集成阶段，需要
+    /// WIT bindgen 与 WASI linker）。本方法是隔离层向集成层的受控泄漏点，
+    /// 调用方不得把返回引用再暴露到领域层公共 API（§8.2 只约束领域层）。
+    ///
+    /// 所有权：只读借用，不转移所有权；返回引用的存活期受 `&self` 借用期
+    /// 约束（编译产物生命周期与 `self` 相同）。
+    /// 不变量：返回的 Component 只与创建它的 Engine（[`ComponentHandle::new`]
+    /// 的 engine 参数所对应的 EngineHandle）兼容——跨 Engine 实例化会失败；
+    /// 每次实例化必须使用同一 Engine 下创建的 Store。
+    /// 错误：无（只读访问，无运行时可失败路径）。
+    /// 并发：`&self` 只读借用，可被多线程共享只读访问（wasmtime Component
+    /// 编译产物只读线程安全）；实例化本身仍须经 Store 的单一执行模型（§7.3）。
+    /// 安全/权限：编译产物本身不携带任何能力（§7.6）；能力只经 Store 构建
+    /// 时的 WASI policy 显式授予（[`crate::store::StoreFactory::with_wasi`]）。
+    pub fn component(&self) -> &wasmtime::component::Component {
         &self.component
     }
 }

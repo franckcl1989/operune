@@ -165,26 +165,67 @@ impl StoreHandle {
         Ok(())
     }
 
-    /// 开始一次不可信执行：清除资源拒绝记录（错误分类前置步骤，
-    /// [`crate::error::classify_wasm_error`] 依赖执行前清除避免陈旧记录）。
+    /// 开始一次不可信执行：清除资源拒绝记录（错误分类前置步骤）。
     ///
-    /// 0.1.0 阶段由测试与未来的 invoke 扩展缝（application/集成阶段）消费；
-    /// lib-only 构建下允许 dead_code（见 PR 报告衔接点）。
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn begin_execution(&mut self) {
+    /// 语义：清空上一次执行期间 Wasmtime 记录在本 Store 上的资源超限拒绝
+    /// 类别，使 [`crate::error::classify_wasm_error`] 在本次执行失败时只读到
+    /// 本次的记录（§7.4/§14.1）。必须与 [`StoreHandle::take_rejection`]
+    /// 配对使用，且每次不可信执行**开始前**调用；不调用时分类器可能读到
+    /// 陈旧记录（把上一次的拒绝误报为本次执行的结果）。
+    ///
+    /// 不变量：本方法不执行 guest 代码，不触发任何 Wasmtime 回调，不可失败。
+    /// 错误：无（`&mut self` 的独占性由类型层保证，无可运行失败路径）。
+    /// 并发：`&mut self` 独占本 Store（§7.3 单一执行模型；Store 不跨线程
+    /// 共享）；返回前清空记录，调用后到下一次调用之间 `take_rejection`
+    /// 返回 `None`。
+    /// 安全/权限：只清空本 Store 的资源记账状态，不授予或撤销任何 guest
+    /// 能力（§7.6 无 ambient authority）。
+    pub fn begin_execution(&mut self) {
         let _ = self.store.data().limiter.take_rejection();
     }
 
-    /// 读取并清除最近一次资源拒绝类别（错误分类器使用）。
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn take_rejection(&mut self) -> Option<ResourceLimitKind> {
+    /// 读取并清除最近一次资源超限拒绝类别（§7.4）。
+    ///
+    /// 语义：返回自上次清除以来最近一次被 Wasmtime 资源限制器拒绝的资源
+    /// 类别，并清空记录（一次性读取）。`None` 只表示“当前无记录”——可能
+    /// 没有发生拒绝，也可能记录已被 [`StoreHandle::begin_execution`] 清除；
+    /// 调用方不得把 `None` 解读为“本次执行确定未超限”（§7.4：实例/table/
+    /// memory 数量类上限由 wasmtime 内部计数强制，不经过拒绝记录，超限
+    /// 表现为实例化/创建失败而非记录）。
+    ///
+    /// 所有权：不转移任何状态，仅借出返回值（`Option<ResourceLimitKind>`，
+    /// 值类型，无借用问题）。
+    /// 错误：无（只读本 Store 状态，不可失败）。
+    /// 并发：`&mut self` 独占（§7.3 单一执行模型）。
+    /// 安全/权限：只读资源记账信息（资源类别枚举，不含长度/地址等细节），
+    /// 不触及 guest 数据，无权限含义。
+    pub fn take_rejection(&mut self) -> Option<ResourceLimitKind> {
         self.store.data().limiter.take_rejection()
     }
 
-    /// 内部 wasmtime Store 访问（0.1.0 由测试与 invoke 扩展缝消费；
-    /// lib-only 构建下允许 dead_code）。
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn store_mut(&mut self) -> &mut wasmtime::Store<StoreHostState> {
+    /// 独占访问底层 wasmtime Store（invoke 扩展缝：WIT bindgen 生成的接口、
+    /// [`wasmtime::component::Linker`] 绑定与实例化入口以
+    /// `&mut wasmtime::Store<StoreHostState>` 为参数）。
+    ///
+    /// 类型泄漏说明（§8.2）：本签名必须暴露 wasmtime 具体类型——typed
+    /// invoke 与 `Linker::instantiate` 的签名以 `&mut wasmtime::Store<T>`
+    /// 为参数，不存在经项目自有类型间接的等价面。本方法是隔离层向
+    /// 集成层（application）的受控泄漏点：调用方不得把返回的 Store 再
+    /// 暴露到领域层（domain/application 的公共 API 不 import wasmtime 类型，
+    /// §8.2 只约束领域层）。
+    ///
+    /// 所有权：返回可变借用，不转移所有权；借用期间本句柄不可再被借用，
+    /// 返回引用的存活期受调用方作用域约束。
+    /// 不变量：epoch 启用时每次不可信执行前必须经
+    /// [`StoreHandle::set_deadline`] 设置 deadline（§7.5）——未设置时默认
+    /// deadline 为 0（已过期），执行立即以 [`WasmFailure::EpochDeadlineExceeded`]
+    /// trap；见 [`StoreHandle`] 文档。
+    /// 错误：无（纯借用获取，无运行时可失败路径）。
+    /// 并发：`&mut self` 独占（§7.3 单一执行模型）；返回的 Store 非 `Sync`，
+    /// 不得跨线程使用。
+    /// 安全/权限：返回的 Store 默认无任何宿主能力（§7.6）；WASI 能力只经
+    /// [`StoreFactory::with_wasi`] 在构建时显式附加。
+    pub fn store_mut(&mut self) -> &mut wasmtime::Store<StoreHostState> {
         &mut self.store
     }
 }

@@ -157,10 +157,12 @@ enum Outcome {
 /// anyhow::Error 包装类型本身不实现 `std::error::Error`，只 Deref 到它），
 /// 再传入本函数。
 ///
-/// 0.1.0 阶段由测试与未来的 invoke 扩展缝（application/集成阶段）消费；
-/// lib-only 构建下允许 dead_code（见 PR 报告衔接点）。
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn classify_wasm_error(
+/// 所有权：不转移 Store 所有权，仅按 `&mut` 借用（读取并清除拒绝记录）；
+/// `err` 按值装箱为本错误结果的 source（错误链持有 `err` 的可诊断上下文）。
+/// 错误：本函数无失败返回路径（始终返回 `RuntimeError`，映射本身不可失败）。
+/// 并发：`&mut` 独占借用（§7.3 单一执行模型；不得跨线程共享 Store）。
+/// 安全/权限：只做错误分类，不执行 guest 代码，不授予或撤销任何能力（§7.6）。
+pub fn classify_wasm_error(
     store: &mut crate::store::StoreHandle,
     err: ErrorSource,
 ) -> RuntimeError {
