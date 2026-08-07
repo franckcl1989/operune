@@ -109,7 +109,7 @@ pub use composition::{
 pub use config::ConfigService;
 pub use error::{ApplicationError, RuntimeExecutionError};
 pub use event::{DeliveredEvent, EventError, EventLimits, EventService};
-pub use install::InstallService;
+pub use install::{InstallService, StateMigrationRunner, StateWiring};
 pub use lifecycle::{LifecycleController, LifecycleError};
 pub use migration::{MigrationError, MigrationGuestError, MigrationOutcome, StateMigrationService};
 pub use model::{

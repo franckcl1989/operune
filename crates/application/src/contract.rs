@@ -236,6 +236,107 @@ pub(crate) fn parse_descriptor_error_val(
 }
 
 // ---------------------------------------------------------------------------
+// operune:state/declaration 镜像类型（§41.2 声明面 / §20.5 迁移触发事实）
+// ---------------------------------------------------------------------------
+
+/// `state-declaration` 镜像（§41.2 声明面：Component 激活前向 Core 声明的
+/// state 契约；upgrade 管线以 `schema-version` 与 store 当前版本比较，
+/// 决定是否触发显式迁移，§20.5）。
+///
+/// 字段与 WIT `state-declaration` record 一一对应（name、schema-version）；
+/// 解析边界执行体积上限（§19.3 精神，declaration.wit 明文）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuestStateDeclaration {
+    /// `name`（option；展示性名称，非身份事实，不参与兼容判断，§19.4）。
+    pub(crate) name: Option<String>,
+    /// `schema-version.value`（本 ComponentVersion 激活后读取/写入的
+    /// state schema 版本；迁移触发事实，§20.5）。
+    pub(crate) schema_version: u32,
+}
+
+/// `state-declaration-error` 镜像（guest 返回值空间的预期失败，§6.3）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuestStateDeclarationError {
+    /// `malformed`。
+    Malformed,
+    /// `unsupported-contract-version`。
+    UnsupportedContractVersion,
+    /// `internal`。
+    Internal,
+}
+
+/// 解析 `get-state-declaration` 的返回 `Val` 为镜像类型（§13.3 边界解析
+/// 一次；record 字段顺序对齐 WIT：name、schema-version）。
+pub(crate) fn parse_state_declaration_val(
+    val: &Val,
+) -> Result<GuestStateDeclaration, ContractValueError> {
+    let inner = as_result_ok(val, "get-state-declaration")?;
+    let fields = as_record(inner, "state-declaration")?;
+    let name = match option_field(fields, 0, "name")? {
+        None => None,
+        Some(value) => {
+            let text = as_string(&value, "state-declaration.name")?;
+            if text.len() > MAX_DISPLAY_TEXT_LEN {
+                return Err(ContractValueError::ValueTooLarge {
+                    field: "name",
+                    limit: MAX_DISPLAY_TEXT_LEN,
+                });
+            }
+            Some(text.to_owned())
+        }
+    };
+    let schema_version = as_record(field(fields, 1, "schema-version")?, "state-schema-version")?;
+    let value = u32_field(schema_version, 0, "value")?;
+    Ok(GuestStateDeclaration {
+        name,
+        schema_version: value,
+    })
+}
+
+/// 把 `state-declaration` 编成 guest 返回值空间的 `Val`（测试用）。
+#[cfg(test)]
+pub(crate) fn build_state_declaration_val(declaration: &GuestStateDeclaration) -> Val {
+    Val::Result(Ok(Some(Box::new(Val::Record(vec![
+        ("name".to_owned(), opt_string(&declaration.name)),
+        (
+            "schema-version".to_owned(),
+            Val::Record(vec![(
+                "value".to_owned(),
+                Val::U32(declaration.schema_version),
+            )]),
+        ),
+    ])))))
+}
+
+/// 把 `state-declaration-error` 编成 guest 返回值空间的 `Val`（测试用）。
+#[cfg(test)]
+pub(crate) fn build_state_declaration_error_val(error: GuestStateDeclarationError) -> Val {
+    let name = match error {
+        GuestStateDeclarationError::Malformed => "malformed",
+        GuestStateDeclarationError::UnsupportedContractVersion => "unsupported-contract-version",
+        GuestStateDeclarationError::Internal => "internal",
+    };
+    Val::Result(Err(Some(Box::new(Val::Enum(name.to_owned())))))
+}
+
+/// 解析 `state-declaration-error` 载荷（result 的 Err 侧）。
+#[cfg(test)]
+pub(crate) fn parse_state_declaration_error_val(
+    val: &Val,
+) -> Result<GuestStateDeclarationError, ContractValueError> {
+    let payload = as_result_err(val, "get-state-declaration")?;
+    let name = as_enum(payload, "state-declaration-error")?;
+    match name {
+        "malformed" => Ok(GuestStateDeclarationError::Malformed),
+        "unsupported-contract-version" => {
+            Ok(GuestStateDeclarationError::UnsupportedContractVersion)
+        }
+        "internal" => Ok(GuestStateDeclarationError::Internal),
+        other => Err(ContractValueError::InvalidVariant(other.to_owned())),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // operune:web/descriptor 镜像类型
 // ---------------------------------------------------------------------------
 
@@ -683,6 +784,73 @@ mod tests {
         let val = build_descriptor_error_val(GuestDescriptorError::Malformed);
         match parse_descriptor_error_val(&val) {
             Ok(GuestDescriptorError::Malformed) => {}
+            Ok(other) => test_failure(format_args!("unexpected error: {other:?}")),
+            Err(e) => test_failure(format_args!("parse failed: {e}")),
+        }
+    }
+
+    #[test]
+    fn state_declaration_val_roundtrip() {
+        let original = GuestStateDeclaration {
+            name: Some("Demo State".to_owned()),
+            schema_version: 2,
+        };
+        let val = build_state_declaration_val(&original);
+        let parsed = match parse_state_declaration_val(&val) {
+            Ok(parsed) => parsed,
+            Err(e) => test_failure(format_args!("parse failed: {e}")),
+        };
+        assert_eq!(parsed, original);
+    }
+
+    #[test]
+    fn state_declaration_unnamed_roundtrip() {
+        // `name` 是 option：None 形态（无展示名的声明合法，declaration.wit）。
+        let original = GuestStateDeclaration {
+            name: None,
+            schema_version: 0,
+        };
+        let val = build_state_declaration_val(&original);
+        let parsed = match parse_state_declaration_val(&val) {
+            Ok(parsed) => parsed,
+            Err(e) => test_failure(format_args!("parse failed: {e}")),
+        };
+        assert_eq!(parsed, original);
+    }
+
+    #[test]
+    fn state_declaration_rejects_missing_schema_version() {
+        // 位置 1（schema-version）缺失 → contract violation。
+        let val = Val::Result(Ok(Some(Box::new(Val::Record(vec![(
+            "name".to_owned(),
+            Val::Option(None),
+        )])))));
+        assert!(parse_state_declaration_val(&val).is_err());
+    }
+
+    #[test]
+    fn state_declaration_rejects_oversized_name() {
+        let val = build_state_declaration_val(&GuestStateDeclaration {
+            name: Some("x".repeat(MAX_DISPLAY_TEXT_LEN + 1)),
+            schema_version: 1,
+        });
+        let result = parse_state_declaration_val(&val);
+        assert!(
+            matches!(
+                result,
+                Err(ContractValueError::ValueTooLarge { field: "name", .. })
+            ),
+            "oversized declaration name must be rejected"
+        );
+    }
+
+    #[test]
+    fn state_declaration_error_val_parses() {
+        let val = build_state_declaration_error_val(
+            GuestStateDeclarationError::UnsupportedContractVersion,
+        );
+        match parse_state_declaration_error_val(&val) {
+            Ok(GuestStateDeclarationError::UnsupportedContractVersion) => {}
             Ok(other) => test_failure(format_args!("unexpected error: {other:?}")),
             Err(e) => test_failure(format_args!("parse failed: {e}")),
         }

@@ -18,10 +18,11 @@ use operune_domain::{
 use crate::active::ActiveRuntimeRegistry;
 use crate::clock::{Clock, ClockError};
 use crate::composition::{ActiveGraph, CompositionService, GraphPolicy};
-use crate::contract::{GuestActionRequest, GuestComponentDescriptor};
+use crate::contract::{GuestActionRequest, GuestComponentDescriptor, GuestStateDeclaration};
 use crate::error::RuntimeExecutionError;
 use crate::event::DeliveredEvent;
-use crate::install::InstallService;
+use crate::install::{InstallService, StateMigrationRunner, StateWiring};
+use crate::migration::{MigrationGuestError, StateMigrationService};
 use crate::model::{
     CandidateRecord, ContractSurface, DigestVersionBinding, GrantApproval, GrantSnapshot,
     InstallRequest, InstallationGrant, InstallationRecord, RuntimeConfig, WebAssetPath,
@@ -36,6 +37,7 @@ use crate::ports::{
     StatefulAuditPort,
 };
 use crate::runtime::{ActiveRuntime, CompiledWasm, PreparedRuntime, RuntimePlan, WasmRuntime};
+use crate::state::MigrationGate;
 use crate::upgrade::UpgradeService;
 use crate::web::{AssetCache, WebBridge};
 use operune_domain::{TriggerPayload, UtcInstant};
@@ -494,6 +496,13 @@ pub(crate) struct FakeState {
     pub(crate) descriptor_index: usize,
     /// 按字节内容定制的 descriptor（升级/回滚测试：v1/v2 不同身份）。
     pub(crate) descriptors_by_bytes: HashMap<Vec<u8>, GuestComponentDescriptor>,
+    /// 脚本化 state-declaration 序列（按调用次序；§19.3 确定性比对测试用；
+    /// `None` = 注入失败）。
+    pub(crate) declarations: Vec<Option<GuestStateDeclaration>>,
+    pub(crate) declaration_index: usize,
+    /// 按字节内容定制的 state-declaration（0.3.0 stateful 升级测试：
+    /// v1/v2 不同声明版本）。
+    pub(crate) declarations_by_bytes: HashMap<Vec<u8>, GuestStateDeclaration>,
     /// 最近一次 compile 的字节（read_descriptor 的按键依据）。
     pub(crate) last_compiled_bytes: Vec<u8>,
     /// prepare 注入失败标志。
@@ -508,6 +517,7 @@ pub(crate) struct FakeState {
     pub(crate) action_result_ok: Option<Vec<u8>>,
     pub(crate) compile_calls: usize,
     pub(crate) descriptor_calls: usize,
+    pub(crate) declaration_calls: usize,
     pub(crate) prepare_calls: usize,
     pub(crate) instantiate_calls: usize,
     pub(crate) asset_reads: usize,
@@ -524,6 +534,9 @@ impl Default for FakeState {
             descriptors: Vec::new(),
             descriptor_index: 0,
             descriptors_by_bytes: HashMap::new(),
+            declarations: Vec::new(),
+            declaration_index: 0,
+            declarations_by_bytes: HashMap::new(),
             last_compiled_bytes: Vec::new(),
             prepare_failure: false,
             instantiate_failure: false,
@@ -533,6 +546,7 @@ impl Default for FakeState {
             action_result_ok: Some(vec![1, 2, 3]),
             compile_calls: 0,
             descriptor_calls: 0,
+            declaration_calls: 0,
             prepare_calls: 0,
             instantiate_calls: 0,
             asset_reads: 0,
@@ -563,6 +577,13 @@ impl FakeRuntime {
     pub(crate) fn descriptor_calls(&self) -> usize {
         match self.state.lock() {
             Ok(guard) => guard.descriptor_calls,
+            Err(_) => test_failure("fake runtime state lock poisoned"),
+        }
+    }
+
+    pub(crate) fn declaration_calls(&self) -> usize {
+        match self.state.lock() {
+            Ok(guard) => guard.declaration_calls,
             Err(_) => test_failure("fake runtime state lock poisoned"),
         }
     }
@@ -646,6 +667,27 @@ impl FakeRuntime {
         state
             .descriptors_by_bytes
             .insert(bytes.to_vec(), descriptor);
+    }
+
+    /// 脚本化：第 i 次 declaration 读取返回第 i 个结果（§19.3 确定性比对）。
+    pub(crate) fn with_declarations(&self, declarations: Vec<GuestStateDeclaration>) {
+        let mut state = match self.state.lock() {
+            Ok(guard) => guard,
+            Err(_) => test_failure("fake runtime state lock poisoned"),
+        };
+        state.declarations = declarations.into_iter().map(Some).collect();
+    }
+
+    /// 按字节内容定制 state-declaration（0.3.0 stateful 升级测试：
+    /// v1/v2 不同声明版本）。
+    pub(crate) fn with_declaration_for(&self, bytes: &[u8], declaration: GuestStateDeclaration) {
+        let mut state = match self.state.lock() {
+            Ok(guard) => guard,
+            Err(_) => test_failure("fake runtime state lock poisoned"),
+        };
+        state
+            .declarations_by_bytes
+            .insert(bytes.to_vec(), declaration);
     }
 
     pub(crate) fn with_compile_failure(&self) {
@@ -762,6 +804,30 @@ impl WasmRuntime for FakeRuntime {
             };
         }
         Ok(default_descriptor())
+    }
+
+    fn read_state_declaration(
+        &self,
+        _component: &Arc<dyn CompiledWasm>,
+    ) -> Result<Option<GuestStateDeclaration>, RuntimeExecutionError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| RuntimeExecutionError::Internal("fake state poisoned"))?;
+        state.declaration_calls += 1;
+        if let Some(declaration) = state.declarations_by_bytes.get(&state.last_compiled_bytes) {
+            return Ok(Some(declaration.clone()));
+        }
+        if state.declaration_index < state.declarations.len() {
+            let result = state.declarations[state.declaration_index].clone();
+            state.declaration_index += 1;
+            return match result {
+                Some(declaration) => Ok(Some(declaration)),
+                None => Err(compile_error("injected state declaration failure")),
+            };
+        }
+        // 默认：无 declaration 导出 = 无状态组件（0.1 语义保持）。
+        Ok(None)
     }
 
     fn prepare(
@@ -929,6 +995,12 @@ pub(crate) struct Harness {
     pub(crate) active_graph: Arc<ActiveGraph>,
     /// 0.2.0 composition 服务（未接线为 `None`——0.1.0 语义）。
     pub(crate) composition: Option<Arc<CompositionService>>,
+    /// 0.3.0 state schema wiring（§41.2/§20.5）：fake state store + 审计 +
+    /// 脚本化 guest migration runner（upgrade 管线触发迁移的组合编排
+    /// 测试；migration 服务与 gate 在 wiring 内部，经可观测效果断言）。
+    pub(crate) state_store: Arc<FakeStateStore>,
+    pub(crate) state_audit: Arc<FakeStatefulAudit>,
+    pub(crate) migration_runner: Arc<FakeStateMigrationRunner>,
 }
 
 impl Harness {
@@ -1008,6 +1080,32 @@ impl Harness {
         } else {
             None
         };
+        // 0.3.0 state schema 接线（§20.5/§41.2）：fake store + 审计 +
+        // migration 服务 + 脚本化 guest runner 注入 install / upgrade 两条
+        // 用例路径。默认接线：无 declaration 导出的组件（fake 默认返回
+        // Ok(None)）走无状态路径，既有测试语义不受影响。
+        let state_store = Arc::new(FakeStateStore::new());
+        let state_audit = Arc::new(FakeStatefulAudit::new());
+        let migration_gate = Arc::new(MigrationGate::new());
+        let state_migration = Arc::new(StateMigrationService::new(
+            Arc::clone(&state_store) as Arc<dyn StateStorePort>,
+            Arc::clone(&state_audit) as Arc<dyn StatefulAuditPort>,
+            Arc::clone(&migration_gate),
+        ));
+        let migration_runner = Arc::new(FakeStateMigrationRunner::new());
+        let state_wiring = Arc::new(StateWiring::new(
+            Arc::clone(&state_store) as Arc<dyn StateStorePort>,
+            Arc::clone(&state_migration),
+            Arc::clone(&migration_runner) as Arc<dyn StateMigrationRunner>,
+        ));
+        match install.set_state(Arc::clone(&state_wiring)) {
+            Ok(()) => {}
+            Err(_) => test_failure("state wiring failed"),
+        }
+        match upgrade.set_state(Arc::clone(&state_wiring)) {
+            Ok(()) => {}
+            Err(_) => test_failure("state wiring failed"),
+        }
         Self {
             registry,
             grants,
@@ -1021,6 +1119,9 @@ impl Harness {
             graph_store,
             active_graph,
             composition,
+            state_store,
+            state_audit,
+            migration_runner,
         }
     }
 }
@@ -1033,6 +1134,67 @@ impl Harness {
 /// 确定性测试安装实例（seed → uuid，与 composition 测试同模式）。
 pub(crate) fn installation(seed: u64) -> InstallationId {
     InstallationId::from_uuid(uuid::Uuid::from_u128(u128::from(seed)))
+}
+
+/// 脚本化 guest `migrate` 调用（[`StateMigrationRunner`] 的 fake 注入面；
+/// 默认结果 `Ok(())` = guest 迁移返回 ok——调用即成功提交）。
+pub(crate) struct FakeStateMigrationRunner {
+    /// 脚本化 guest 结果（`Err` = guest 失败 → 回滚语义，§20.5）。
+    result: Mutex<Option<Result<(), MigrationGuestError>>>,
+    /// 全部迁移调用记录：(from, to)（断言用）。
+    calls: Mutex<Vec<(StateSchemaVersion, StateSchemaVersion)>>,
+}
+
+impl FakeStateMigrationRunner {
+    pub(crate) fn new() -> Self {
+        Self {
+            result: Mutex::new(None),
+            calls: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// 全部迁移调用记录：(from, to)（断言用）。
+    pub(crate) fn calls(&self) -> Vec<(StateSchemaVersion, StateSchemaVersion)> {
+        match self.calls.lock() {
+            Ok(guard) => guard.clone(),
+            Err(_) => test_failure("fake migration runner calls lock poisoned"),
+        }
+    }
+
+    /// 脚本化 guest 结果（`Err` = guest 失败 → abort 回滚，store 不变，
+    /// 升级被阻止，§20.5 rollback policy）。
+    pub(crate) fn with_guest_result(&self, result: Result<(), MigrationGuestError>) {
+        match self.result.lock() {
+            Ok(mut guard) => {
+                *guard = Some(result);
+            }
+            Err(_) => test_failure("fake migration runner result lock poisoned"),
+        }
+    }
+}
+
+impl StateMigrationRunner for FakeStateMigrationRunner {
+    fn run(
+        &self,
+        _component: &Arc<dyn CompiledWasm>,
+        from: StateSchemaVersion,
+        to: StateSchemaVersion,
+        _tx: StateTransactionId,
+    ) -> Result<(), MigrationGuestError> {
+        match self.calls.lock() {
+            Ok(mut calls) => calls.push((from, to)),
+            Err(_) => return Err(MigrationGuestError::Host("fake runner calls lock poisoned")),
+        }
+        match self.result.lock() {
+            Ok(guard) => match *guard {
+                Some(result) => result,
+                None => Ok(()),
+            },
+            Err(_) => Err(MigrationGuestError::Host(
+                "fake runner result lock poisoned",
+            )),
+        }
+    }
 }
 
 /// FakeStateStore（内存实现，语义对齐 storage executor 0.3 state 命令：

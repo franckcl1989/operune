@@ -85,6 +85,17 @@ impl UpgradeService {
         self.install.set_composition(composition)
     }
 
+    /// 接线 0.3.0 state schema（§20.5 / §41.2）：升级 / 回滚激活前读取
+    /// guest 的 `state-declaration.schema-version`，与 store 当前版本比较
+    /// 并触发显式迁移（经共享管线执行，[`InstallService::set_state`]）。
+    /// 与 install 侧同一接线事实；composition root 在启动装配期调用一次。
+    pub fn set_state(
+        &self,
+        state: Arc<crate::install::StateWiring>,
+    ) -> Result<(), ApplicationError> {
+        self.install.set_state(state)
+    }
+
     /// 热升级（§20.1）：v1 保持可用直到 v2 验证通过并原子切换。
     pub fn upgrade(&self, request: UpgradeRequest) -> Result<UpgradeOutcome, ApplicationError> {
         let current = self.require_active(request.installation)?;

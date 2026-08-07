@@ -72,9 +72,10 @@ use wasmtime::component::{ComponentExportIndex, Func, Instance, InstancePre, Lin
 
 use crate::contract::{
     ContractValueError, GuestActionError, GuestActionRequest, GuestAssetMetadata,
-    GuestComponentDescriptor, GuestDescriptorError, GuestWebDescriptor, build_action_request_val,
+    GuestComponentDescriptor, GuestDescriptorError, GuestStateDeclaration,
+    GuestStateDeclarationError, GuestWebDescriptor, build_action_request_val,
     parse_action_result_val, parse_asset_list_val, parse_component_descriptor_val,
-    parse_web_descriptor_val,
+    parse_state_declaration_val, parse_web_descriptor_val,
 };
 use crate::error::{ErrorSource, RuntimeExecutionError};
 use crate::event::DeliveredEvent;
@@ -165,6 +166,24 @@ pub trait WasmRuntime: Send + Sync {
         &self,
         component: &Arc<dyn CompiledWasm>,
     ) -> Result<GuestComponentDescriptor, RuntimeExecutionError>;
+
+    /// 0.3.0（§41.2 / §20.5）：在 descriptor-only Store（declaration.wit
+    /// 明文：调用时机与约束遵循 §19.3 descriptor 阶段精神）中读取一次
+    /// `operune:state/declaration` 的 `get-state-declaration`。
+    ///
+    /// 组件不导出声明接口 = 无状态组件（`Ok(None)`，0.1 语义保持）。
+    /// 编排层按 §19.3 惯例对同一 digest 重复调用并比对 canonical 结果
+    ///（不一致 = contract violation，candidate 保持 quarantine/failed）。
+    ///
+    /// 默认实现返回 `Ok(None)`（组件视为不导出声明接口）——沿用该默认的
+    /// 实现（如 web-admin / server 的不可用 runtime 桩）在编译必然失败的
+    /// 组件上运行，声明读取不可达；生产与 fake 实现按语义覆写。
+    fn read_state_declaration(
+        &self,
+        _component: &Arc<dyn CompiledWasm>,
+    ) -> Result<Option<GuestStateDeclaration>, RuntimeExecutionError> {
+        Ok(None)
+    }
 
     /// 解析 import 图（deny-by-default，§17.2 / §19.5）：在目标
     /// grant/resource 快照下检查该组件能否被实例化。失败 = resolution
@@ -463,6 +482,60 @@ impl WasmRuntime for WasmtimeRuntime {
             _ => Err(RuntimeExecutionError::MalformedGuestData(
                 ContractValueError::ShapeMismatch {
                     field: "get-descriptor",
+                    expected: "result",
+                },
+            )),
+        }
+    }
+
+    fn read_state_declaration(
+        &self,
+        component: &Arc<dyn CompiledWasm>,
+    ) -> Result<Option<GuestStateDeclaration>, RuntimeExecutionError> {
+        let real = self.real_component(component.as_ref())?;
+        let config = self.config_snapshot()?;
+        // §19.3 精神（declaration.wit 明文）：descriptor-only Store +
+        // 独立 deadline / 预算读取声明。
+        let mut store = StoreFactory::new(&self.engine)
+            .new_store(&config.descriptor_budget)
+            .map_err(RuntimeExecutionError::Runtime)?;
+        let instance = self.instantiate_descriptor_store(
+            real.inner.component(),
+            &mut store,
+            config.descriptor_deadline,
+        )?;
+        let Some(func) = Self::optional_interface_func(
+            &mut store,
+            &instance,
+            &["declaration", "operune:state/declaration@0.1.0"],
+            "get-state-declaration",
+        )?
+        else {
+            // 无 declaration 导出 = 无状态组件（0.1 语义保持）。
+            return Ok(None);
+        };
+        prepare_store_call(&mut store, config.descriptor_deadline)?;
+        let mut results = [Val::Result(Ok(None))];
+        func.call(store.store_mut(), &[], &mut results)
+            .map_err(|error| {
+                RuntimeExecutionError::from_classified(&mut store, ErrorSource::from(error))
+            })?;
+        func.post_return(store.store_mut()).map_err(|error| {
+            RuntimeExecutionError::from_classified(&mut store, ErrorSource::from(error))
+        })?;
+        match &results[0] {
+            Val::Result(Ok(_)) => parse_state_declaration_val(&results[0])
+                .map(Some)
+                .map_err(RuntimeExecutionError::MalformedGuestData),
+            Val::Result(Err(_)) => {
+                let guest_error = parse_state_declaration_error(&results[0])?;
+                Err(RuntimeExecutionError::GuestStateDeclarationError(
+                    guest_error,
+                ))
+            }
+            _ => Err(RuntimeExecutionError::MalformedGuestData(
+                ContractValueError::ShapeMismatch {
+                    field: "get-state-declaration",
                     expected: "result",
                 },
             )),
@@ -1072,6 +1145,38 @@ fn parse_asset_bytes_val(val: &Val) -> Result<Vec<u8>, ContractValueError> {
             field: "read-asset",
             expected: "result with list<u8>",
         }),
+    }
+}
+
+/// 解析 `state-declaration-error` 载荷（result 的 Err 侧）。
+fn parse_state_declaration_error(
+    val: &Val,
+) -> Result<GuestStateDeclarationError, RuntimeExecutionError> {
+    match val {
+        Val::Result(Err(Some(inner))) => match inner.as_ref() {
+            Val::Enum(name) => match name.as_str() {
+                "malformed" => Ok(GuestStateDeclarationError::Malformed),
+                "unsupported-contract-version" => {
+                    Ok(GuestStateDeclarationError::UnsupportedContractVersion)
+                }
+                "internal" => Ok(GuestStateDeclarationError::Internal),
+                other => Err(RuntimeExecutionError::MalformedGuestData(
+                    ContractValueError::InvalidVariant(other.to_owned()),
+                )),
+            },
+            _ => Err(RuntimeExecutionError::MalformedGuestData(
+                ContractValueError::ShapeMismatch {
+                    field: "state-declaration-error",
+                    expected: "enum payload",
+                },
+            )),
+        },
+        _ => Err(RuntimeExecutionError::MalformedGuestData(
+            ContractValueError::ShapeMismatch {
+                field: "state-declaration-error",
+                expected: "result Err payload",
+            },
+        )),
     }
 }
 

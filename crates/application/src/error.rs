@@ -7,7 +7,7 @@ use std::error::Error as StdError;
 
 use operune_domain::{
     ByteSize, CapabilityId, ComponentId, ComponentVersion, ContentDigest, DomainError,
-    InstallationId, ProviderGraphError, UpgradeCompatibilityReport,
+    InstallationId, ProviderGraphError, StateSchemaVersion, UpgradeCompatibilityReport,
 };
 
 /// 可诊断错误源：第三方错误装箱（§14.1 适配层转换后保留 source；§16.6
@@ -188,6 +188,46 @@ pub enum ApplicationError {
     #[error("provider graph store failure: {0}")]
     GraphStore(#[source] crate::ports::GraphStoreError),
 
+    /// 0.3.0：声明版本低于存储版本——forward-only 拒绝（WIT：0.1.0 不定义
+    /// 已提交迁移后的降级，§20.5；升级 / 回滚被阻止，store 不变）。
+    #[error(
+        "state schema downgrade rejected for installation {installation}: declared {declared} is below stored {stored} (forward-only, §20.5)"
+    )]
+    StateSchemaDowngrade {
+        /// 安装实例。
+        installation: InstallationId,
+        /// store 当前版本。
+        stored: StateSchemaVersion,
+        /// 新 ComponentVersion 声明版本。
+        declared: StateSchemaVersion,
+    },
+
+    /// 0.3.0：guest state 迁移失败（§41.3）——迁移已 abort 回滚，store
+    /// 保持旧版本；升级被阻止，旧 ComponentVersion 保持激活（§20.5
+    /// rollback policy）。
+    #[error(
+        "state migration rejected for installation {installation} (from {from} to {to}): {reason}"
+    )]
+    StateMigrationRejected {
+        /// 安装实例。
+        installation: InstallationId,
+        /// 迁移源版本。
+        from: StateSchemaVersion,
+        /// 迁移目标版本。
+        to: StateSchemaVersion,
+        /// guest 失败原因（kebab-case 静态标签；不含数据，§16.6 精神）。
+        reason: &'static str,
+    },
+
+    /// 0.3.0：state 迁移编排失败（存储 / 审计 / 窗口冲突，§20.5）——升级
+    /// 被阻止，store 不变（尽力 abort）。
+    #[error("state migration orchestration failed: {0}")]
+    StateMigration(#[from] crate::migration::MigrationError),
+
+    /// 0.3.0：state store 读取失败（§41.2 存储面）。
+    #[error("state store failure: {0}")]
+    StateStore(#[source] crate::ports::StateStoreError),
+
     /// 内部不变量破坏（视为系统故障，fail-stop 语义，§14.3）。
     #[error("application internal invariant violated: {0}")]
     Internal(&'static str),
@@ -217,6 +257,11 @@ pub enum RuntimeExecutionError {
     /// descriptor 调用返回 guest 错误（§19.3：返回非法 metadata 视为失败）。
     #[error("guest returned descriptor error: {0:?}")]
     GuestDescriptorError(crate::contract::GuestDescriptorError),
+
+    /// state-declaration 调用返回 guest 错误（§41.2 声明面：返回非法
+    /// metadata 视为失败，declaration.wit）。
+    #[error("guest returned state declaration error: {0:?}")]
+    GuestStateDeclarationError(crate::contract::GuestStateDeclarationError),
 
     /// web descriptor / assets / actions 调用返回 guest 错误。
     #[error("guest returned web bridge error: {0}")]

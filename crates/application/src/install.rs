@@ -41,7 +41,7 @@ use std::sync::{Arc, OnceLock};
 
 use operune_domain::{
     ByteSize, CapabilityId, ComponentId, ComponentLifecycleEvent, ComponentLifecycleState,
-    ComponentVersion, ContentDigest, InstallationId,
+    ComponentVersion, ContentDigest, InstallationId, StateSchemaVersion, StateTransactionId,
 };
 use operune_runtime_wasi_p2::capability::{
     EnvVarSpec, FsPerms, GuestPath, PreopenDirSpec, WasiCapabilities,
@@ -49,8 +49,9 @@ use operune_runtime_wasi_p2::capability::{
 
 use crate::active::{ActiveEntry, ActiveInstallation, ActiveRuntimeRegistry};
 use crate::composition::{CompositionService, records_from_surface};
-use crate::contract::GuestComponentDescriptor;
+use crate::contract::{GuestComponentDescriptor, GuestStateDeclaration};
 use crate::error::ApplicationError;
+use crate::migration::{MigrationGuestError, MigrationOutcome, StateMigrationService};
 use crate::model::{
     CandidateRecord, ContractSurface, DigestVersionBinding, GrantApproval, GrantScope,
     GrantSnapshot, ImportClass, InstallOutcome, InstallRequest, InstallationGrant,
@@ -58,9 +59,9 @@ use crate::model::{
 };
 use crate::ports::{
     AuditEvent, AuditPort, ComponentRegistryPort, ConfigPort, GrantStorePort, RegistryError,
-    RejectReason,
+    RejectReason, StateStorePort,
 };
-use crate::runtime::{ActiveRuntime, RuntimePlan, WasmRuntime};
+use crate::runtime::{ActiveRuntime, CompiledWasm, RuntimePlan, WasmRuntime};
 use crate::web::AssetCache;
 
 /// 展示性文本上限（§19.3 宿主侧体积上限；对齐 descriptor 契约的
@@ -125,6 +126,19 @@ impl InstallService {
             .map_err(|_| ApplicationError::Internal("composition is already wired"))
     }
 
+    /// 接线 0.3.0 state schema（§20.5 / §41.2）：激活前读取 guest 的
+    /// `state-declaration.schema-version`，与 store 当前版本比较——不匹配
+    /// → 触发显式迁移（[`StateMigrationService`]）；匹配 / 空 store /
+    /// 无声明 → 直接激活。composition root 在启动装配期调用一次；重复
+    /// 接线 → typed 拒绝（§12.4 无全局可变状态，wiring 是一次性事实）。
+    /// 未接线（默认）= 0.1.0 语义：管线不读取声明、不触发迁移。
+    pub fn set_state(&self, state: Arc<StateWiring>) -> Result<(), ApplicationError> {
+        self.pipeline
+            .state
+            .set(state)
+            .map_err(|_| ApplicationError::Internal("state wiring is already wired"))
+    }
+
     /// 两阶段安装（§19.2）：成功返回激活结果；失败返回 typed error，
     /// 当前 Active 不受污染。
     pub fn install(&self, request: InstallRequest) -> Result<InstallOutcome, ApplicationError> {
@@ -150,6 +164,60 @@ impl InstallService {
     }
 }
 
+/// guest `migrate` 调用注入面（WIT `migration` interface 的 Core 侧调用点，
+/// §20.5 / §41.2）。
+///
+/// 实现方（runtime 接线面）把 Core 侧事务身份（domain
+/// [`StateTransactionId`]）映射为 WIT `state-transaction` resource 句柄后
+/// 调用 guest 导出 `migrate`（from-version / to 透传）；返回
+/// [`MigrationGuestError`] = guest 失败或宿主侧观测失败（trap / deadline /
+/// 超预算），由 [`StateMigrationService`] 按回滚语义处理（§20.5 rollback
+/// policy）。
+///
+/// 0.3.0 生产接线在 state-transaction resource 注册后提供（
+/// `stateful_imports` 模块文档"明确未闭环"）；本 trait 是管线侧注入缝。
+pub trait StateMigrationRunner: Send + Sync {
+    /// 调用一次 guest 迁移（from-version → to）。
+    fn run(
+        &self,
+        component: &Arc<dyn CompiledWasm>,
+        from: StateSchemaVersion,
+        to: StateSchemaVersion,
+        tx: StateTransactionId,
+    ) -> Result<(), MigrationGuestError>;
+}
+
+/// 0.3.0 state schema wiring（§20.5 / §41.2）：upgrade/install 管线激活前
+/// 读取 guest `state-declaration`、与存储版本比较并触发显式迁移的注入面。
+///
+/// 构造（composition root）：`store` + `migration` + `guest` 全部由
+/// composition root 注入（§24.2 端口注入）；`migration` 与
+/// [`crate::state::StateService`] 共享同一 [`crate::state::MigrationGate`]
+///（迁移窗口期间运行时操作返回 not-ready，§41.2）。
+pub struct StateWiring {
+    /// 存储面（存储版本读取）。
+    pub(crate) store: Arc<dyn StateStorePort>,
+    /// 显式迁移编排服务（协议 1–6 步，§20.5/§41.2）。
+    pub(crate) migration: Arc<StateMigrationService>,
+    /// guest `migrate` 调用注入点（runtime 接线面实现）。
+    pub(crate) guest: Arc<dyn StateMigrationRunner>,
+}
+
+impl StateWiring {
+    /// 构造（store + migration 服务 + guest 调用注入点）。
+    pub fn new(
+        store: Arc<dyn StateStorePort>,
+        migration: Arc<StateMigrationService>,
+        guest: Arc<dyn StateMigrationRunner>,
+    ) -> Self {
+        Self {
+            store,
+            migration,
+            guest,
+        }
+    }
+}
+
 /// 共享安装管线（§19.2 / §20.1：安装、升级、回滚共用）。
 pub(crate) struct Pipeline {
     registry: Arc<dyn ComponentRegistryPort>,
@@ -162,6 +230,10 @@ pub(crate) struct Pipeline {
     /// 0.2.0 Capability Composition 接线（§40；`None` = 0.1.0 语义）。
     /// `OnceLock`：composition root 装配期一次性设置，运行期只读。
     composition: OnceLock<Arc<CompositionService>>,
+    /// 0.3.0 state schema 接线（§20.5/§41.2；`None` = 0.1.0 语义：管线
+    /// 不读取 state-declaration、不触发迁移）。`OnceLock`：composition
+    /// root 装配期一次性设置，运行期只读。
+    state: OnceLock<Arc<StateWiring>>,
 }
 
 impl Pipeline {
@@ -183,6 +255,7 @@ impl Pipeline {
             active,
             assets,
             composition: OnceLock::new(),
+            state: OnceLock::new(),
         }
     }
 
@@ -531,6 +604,15 @@ impl Pipeline {
             )
         })?;
 
+        // —— 阶段二b-2：0.3.0 state schema 阶段（§20.5 / §41.2）——
+        // 激活前读取 guest 的 state-declaration.schema-version，与 store
+        // 当前版本比较：不匹配 → 触发显式迁移（StateMigrationService，
+        // §20.5/§41.2 协议 1–6 步）；迁移成功 → 继续激活；guest 失败 /
+        // 编排失败 → candidate Failed，store 不变（§20.5 rollback policy），
+        // 当前 Active 不受污染（§19.2）。置于 grants/prepare 之后：
+        // RequiresApproval（§17.5）路径不触发迁移——未获批准不迁移 store。
+        self.run_state_schema_phase(digest, installation_id, &component)?;
+
         // —— 阶段二c：激活（§19.2 顺序 12–15 / §19.3 / §20.3）——
 
         self.audit_ok(AuditEvent::ActivationStarted {
@@ -650,6 +732,151 @@ impl Pipeline {
                 }
             },
         }
+    }
+
+    /// 0.3.0 state schema 阶段（§20.5 / §41.2）：激活前读取 guest 的
+    /// `state-declaration.schema-version`，与 store 当前版本比较。
+    ///
+    /// - 未接线（composition root 未注入 [`StateWiring`]）= 0.1.0 语义：
+    ///   不读取声明、不触发迁移（无状态组件路径不变）；
+    /// - 组件无 `declaration` 导出 → 无状态组件路径（0.1 语义保持）；
+    /// - 空 store（首次安装 / 首次写入前）→ 无可迁移数据，激活继续
+    ///   （§41.3：版本由首次写入建立）；
+    /// - 声明版本 == 存储版本 → 直接激活；
+    /// - 声明版本 > 存储版本 → 触发 [`StateMigrationService`]（显式迁移
+    ///   编排，协议 1–6 步）：迁移提交 → 激活继续；guest 失败
+    ///   （[`MigrationOutcome::RolledBack`]，§41.3 回滚）或编排失败 →
+    ///   激活拒绝，store 不变，旧 ComponentVersion 保持激活（§20.5）；
+    /// - 声明版本 < 存储版本 → 拒绝（forward-only，WIT：0.1.0 不定义
+    ///   已提交迁移后的降级）。
+    ///
+    /// 声明读取遵循 §19.3 descriptor 阶段精神（declaration.wit 明文）：
+    /// 同一 digest 同一 contract version 重复调用比对 canonical 结果，
+    /// 不一致 = contract violation。全部失败路径 → candidate Failed
+    /// （Validated → Failed，§12.2），审计 reason 沿用
+    /// [`AuditEvent::DescriptorFailed`] 的 reason 标签惯例（管线既有
+    /// `upgrade-identity-mismatch` 同模式，§18.7 fail closed）。
+    fn run_state_schema_phase(
+        &self,
+        digest: ContentDigest,
+        installation_id: InstallationId,
+        component: &Arc<dyn CompiledWasm>,
+    ) -> Result<(), ApplicationError> {
+        let Some(wiring) = self.state.get() else {
+            return Ok(());
+        };
+        // §19.3 确定性比对（同 read_descriptor 的两次调用惯例）。
+        let first = self.read_state_declaration(digest, component)?;
+        let second = self.read_state_declaration(digest, component)?;
+        if first != second {
+            return Err(self.fail_state_schema(
+                digest,
+                "state-declaration-mismatch",
+                ApplicationError::DescriptorViolation(
+                    "state-declaration result is not deterministic (contract violation, §19.3/declaration.wit)",
+                ),
+            ));
+        }
+        let Some(declared) = first else {
+            // 无 declaration 导出 = 无状态组件（0.1 语义保持）。
+            return Ok(());
+        };
+        let stored = wiring
+            .store
+            .schema_version(installation_id)
+            .map_err(ApplicationError::StateStore)?;
+        let Some(stored) = stored else {
+            // 空 store：无可迁移数据（§41.3 首次写入建立版本）。
+            return Ok(());
+        };
+        let declared_version = StateSchemaVersion::from_u32(declared.schema_version);
+        if stored == declared_version {
+            return Ok(());
+        }
+        if declared_version < stored {
+            // forward-only（WIT：0.1.0 不定义已提交迁移后的降级）。
+            return Err(self.fail_state_schema(
+                digest,
+                "state-schema-downgrade",
+                ApplicationError::StateSchemaDowngrade {
+                    installation: installation_id,
+                    stored,
+                    declared: declared_version,
+                },
+            ));
+        }
+        // 声明版本 > 存储版本：触发显式迁移（§20.5/§41.2 协议 4–5 步——
+        // guest 调用经 wiring 注入的 runner，宿主侧观测由 runner 映射）。
+        let guest = |tx| wiring.guest.run(component, stored, declared_version, tx);
+        match wiring
+            .migration
+            .migrate(installation_id, stored, declared_version, guest)
+        {
+            // 迁移已原子提交（store 版本推进到声明版本，§41.3）。
+            Ok(MigrationOutcome::Migrated { .. }) => Ok(()),
+            // 幂等重试（已提交后的重复调用）与空 store 防御分支。
+            Ok(MigrationOutcome::AlreadyAtTarget { .. })
+            | Ok(MigrationOutcome::NothingToMigrate) => Ok(()),
+            // §41.3：guest 失败 → abort 回滚，store 不变 → 激活拒绝，
+            // 旧 ComponentVersion 保持激活（§20.5 rollback policy）。
+            Ok(MigrationOutcome::RolledBack { from, to, reason }) => Err(self.fail_state_schema(
+                digest,
+                "state-migration-rolled-back",
+                ApplicationError::StateMigrationRejected {
+                    installation: installation_id,
+                    from,
+                    to,
+                    reason: reason.audit_label(),
+                },
+            )),
+            // 编排失败（存储 / 审计 / 窗口冲突）→ 升级被阻止。
+            Err(error) => Err(self.fail_state_schema(
+                digest,
+                "state-migration-error",
+                ApplicationError::StateMigration(error),
+            )),
+        }
+    }
+
+    /// state-declaration 读取（descriptor-only Store，§19.3 精神）；失败
+    /// → candidate Failed（Validated → Failed）。
+    fn read_state_declaration(
+        &self,
+        digest: ContentDigest,
+        component: &Arc<dyn CompiledWasm>,
+    ) -> Result<Option<GuestStateDeclaration>, ApplicationError> {
+        self.runtime
+            .read_state_declaration(component)
+            .map_err(|error| {
+                self.fail_candidate(
+                    digest,
+                    AuditEvent::DescriptorFailed {
+                        digest,
+                        reason: "state-declaration-call",
+                    },
+                    ComponentLifecycleEvent::ResolutionFailed,
+                    ApplicationError::Runtime(error),
+                )
+            })
+    }
+
+    /// state schema 阶段的拒绝路径（§18.7 fail closed：先写审计，再按
+    /// 状态机推进到 Failed，返回原始错误）。审计 reason 沿用
+    /// [`AuditEvent::DescriptorFailed`] 的 reason 标签惯例（管线既有
+    /// `upgrade-identity-mismatch` 同模式——storage-sqlite 对 AuditEvent
+    /// 逐变体穷尽映射，不新增变体）。
+    fn fail_state_schema(
+        &self,
+        digest: ContentDigest,
+        reason: &'static str,
+        error: ApplicationError,
+    ) -> ApplicationError {
+        self.fail_candidate(
+            digest,
+            AuditEvent::DescriptorFailed { digest, reason },
+            ComponentLifecycleEvent::ResolutionFailed,
+            error,
+        )
     }
 
     /// 构建运行时能力快照（§7.6 / §17.3：grant scope → WASI 能力值；
@@ -1169,14 +1396,16 @@ pub(crate) fn classify_host_imports(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::migration::MigrationGuestError;
     use crate::model::{
         GrantScope, RollbackRequest, UpgradeOutcome, UpgradeRequest, WebAssetEntry, WebAssetPath,
         WebManifestData, WebManifestFeatures,
     };
+    use crate::ports::StatefulAuditEvent;
     use crate::test_support::{
         Harness, default_descriptor, grant, ok, plain_install_request, some, test_failure,
     };
-    use operune_domain::ComponentVersion;
+    use operune_domain::{ComponentVersion, StateKey, StateValue};
 
     fn harness() -> Harness {
         Harness::new(RuntimeConfig::default())
@@ -2163,5 +2392,365 @@ mod tests {
             stored.provided().iter().next().map(|id| id.version()),
             Some(ComponentVersion::from_parts(1, 0, 0))
         );
+    }
+
+    // ------------------------------------------------------------------
+    // 0.3.0 state schema 阶段（§20.5 / §41.2）：upgrade 管线触发显式迁移
+    // 的组合编排（§41.3 1g——state-declaration.schema-version 与存储版本
+    // 比较 → 迁移路径）。
+    // ------------------------------------------------------------------
+
+    const V1: StateSchemaVersion = StateSchemaVersion::from_u32(1);
+    const V2: StateSchemaVersion = StateSchemaVersion::from_u32(2);
+
+    fn state_key(name: &str) -> StateKey {
+        ok(StateKey::new(name), "state key")
+    }
+
+    fn state_value(bytes: &[u8]) -> StateValue {
+        ok(StateValue::new(bytes.to_vec()), "state value")
+    }
+
+    /// state-declaration 夹具（展示名 + 声明版本）。
+    fn declaration(schema_version: u32) -> crate::contract::GuestStateDeclaration {
+        crate::contract::GuestStateDeclaration {
+            name: Some("Demo State".to_owned()),
+            schema_version,
+        }
+    }
+
+    /// v2 字节（stateful 升级测试的升级目标）。
+    fn state_v2_bytes() -> Vec<u8> {
+        b"v2 state bytes".to_vec()
+    }
+
+    /// v1（demo 1.0.0，携带 state-declaration）安装并激活；返回
+    /// installation id 与 v1 digest。空 store 下声明版本不触发迁移
+    ///（§41.3：版本由首次写入建立）。
+    fn activate_v1_stateful(
+        harness: &Harness,
+        schema_version: u32,
+    ) -> (InstallationId, ContentDigest) {
+        harness
+            .runtime
+            .with_declaration_for(b"v1 bytes", declaration(schema_version));
+        let outcome = ok(
+            harness
+                .install
+                .install(plain_install_request(b"v1 bytes".to_vec())),
+            "install stateful v1",
+        );
+        let installation = match outcome {
+            InstallOutcome::Activated { installation, .. } => installation,
+        };
+        (installation, ContentDigest::from_bytes(b"v1 bytes"))
+    }
+
+    /// 把安装实例的 store 预置到指定版本（模拟 v1 运行期写入建立版本，
+    /// §41.3 首写建立语义）。
+    fn seed_store_version(
+        harness: &Harness,
+        installation: InstallationId,
+        version: StateSchemaVersion,
+    ) {
+        ok(
+            harness.state_store.put(
+                installation,
+                &state_key("state"),
+                version,
+                &state_value(b"v1-shape"),
+            ),
+            "seed store version",
+        );
+    }
+
+    #[test]
+    fn state_declaration_equal_to_store_activates_without_migration() {
+        // 声明版本 == 存储版本 → 直接激活（§20.5：不进入迁移路径）。
+        let harness = harness();
+        let (installation, v1_digest) = activate_v1_stateful(&harness, 1);
+        seed_store_version(&harness, installation, V1);
+        harness
+            .runtime
+            .with_descriptor_for(&state_v2_bytes(), provider_v2_descriptor());
+        harness
+            .runtime
+            .with_declaration_for(&state_v2_bytes(), declaration(1));
+        let outcome = ok(
+            harness.upgrade.upgrade(UpgradeRequest {
+                installation,
+                bytes: state_v2_bytes(),
+                grants: GrantApproval::ReuseExisting,
+            }),
+            "upgrade with equal declared schema version",
+        );
+        assert!(matches!(outcome, UpgradeOutcome::Swapped { .. }));
+        // 未触发迁移（runner 零调用）；store 版本不变。
+        assert!(harness.migration_runner.calls().is_empty());
+        assert_eq!(harness.state_store.version_of(installation), Some(V1));
+        // v1 正常 drain（§20.4）。
+        assert_eq!(
+            harness.registry.candidate_state(v1_digest),
+            Some(ComponentLifecycleState::Disabled)
+        );
+    }
+
+    #[test]
+    fn state_declaration_above_store_triggers_migration_then_activates() {
+        // 声明版本 > 存储版本 → 显式迁移触发（§20.5/§41.2）→ 原子提交
+        //（store 推进到声明版本，§41.3）→ 激活继续。
+        let harness = harness();
+        let (installation, v1_digest) = activate_v1_stateful(&harness, 1);
+        seed_store_version(&harness, installation, V1);
+        let v2_bytes = state_v2_bytes();
+        harness
+            .runtime
+            .with_descriptor_for(&v2_bytes, provider_v2_descriptor());
+        harness
+            .runtime
+            .with_declaration_for(&v2_bytes, declaration(2));
+        let outcome = ok(
+            harness.upgrade.upgrade(UpgradeRequest {
+                installation,
+                bytes: v2_bytes.clone(),
+                grants: GrantApproval::ReuseExisting,
+            }),
+            "upgrade with higher declared schema version",
+        );
+        assert!(matches!(outcome, UpgradeOutcome::Swapped { .. }));
+        // 迁移以 (存储版本, 声明版本) 触发一次。
+        assert_eq!(harness.migration_runner.calls(), vec![(V1, V2)]);
+        // 声明读取遵循 §19.3 双重调用惯例（v1 安装 2 次 + v2 升级 2 次，
+        // 确定性比对，declaration.wit 明文）。
+        assert_eq!(harness.runtime.declaration_calls(), 4);
+        // store 版本推进到声明版本（§41.3 同事务原子推进）。
+        assert_eq!(harness.state_store.version_of(installation), Some(V2));
+        // 迁移审计（metadata-only，§41.2 state audit）。
+        assert!(harness.state_audit.contains(|event| matches!(
+            event,
+            StatefulAuditEvent::MigrationStarted { from, to, .. }
+                if *from == V1 && *to == V2
+        )));
+        assert!(harness.state_audit.contains(|event| matches!(
+            event,
+            StatefulAuditEvent::MigrationCommitted { from, to, .. }
+                if *from == V1 && *to == V2
+        )));
+        // 激活完成：Active 快照指向 v2；v1 已 drain（§20.4）。
+        let v2_digest = ContentDigest::from_bytes(&v2_bytes);
+        let entry = some(harness.active.get(installation), "active entry");
+        assert_eq!(entry.installation.digest, v2_digest);
+        assert_eq!(
+            harness.registry.candidate_state(v1_digest),
+            Some(ComponentLifecycleState::Disabled)
+        );
+    }
+
+    #[test]
+    fn state_migration_guest_failure_rolls_back_and_rejects_activation() {
+        // §41.3：guest 迁移失败 → abort 回滚，store 不变；激活拒绝，
+        // 旧 ComponentVersion 保持激活（§20.5 rollback policy）。
+        let harness = harness();
+        let (installation, v1_digest) = activate_v1_stateful(&harness, 1);
+        seed_store_version(&harness, installation, V1);
+        harness
+            .migration_runner
+            .with_guest_result(Err(MigrationGuestError::MalformedSource));
+        let v2_bytes = state_v2_bytes();
+        harness
+            .runtime
+            .with_descriptor_for(&v2_bytes, provider_v2_descriptor());
+        harness
+            .runtime
+            .with_declaration_for(&v2_bytes, declaration(2));
+        let result = harness.upgrade.upgrade(UpgradeRequest {
+            installation,
+            bytes: v2_bytes.clone(),
+            grants: GrantApproval::ReuseExisting,
+        });
+        match result {
+            Err(ApplicationError::StateMigrationRejected {
+                from, to, reason, ..
+            }) => {
+                assert_eq!(from, V1);
+                assert_eq!(to, V2);
+                assert_eq!(reason, "malformed-source");
+            }
+            other => test_failure(format_args!(
+                "guest migration failure must reject activation: {other:?}"
+            )),
+        }
+        // store 不变（§20.5 rollback policy）。
+        assert_eq!(harness.state_store.version_of(installation), Some(V1));
+        // v1 保持激活，未被 drain（§20.2 非 destructive-in-place）。
+        let entry = some(harness.active.get(installation), "active entry");
+        assert_eq!(entry.installation.digest, v1_digest);
+        assert!(harness.runtime.drains().is_empty());
+        // v2 candidate Failed（§19.2：任何一步失败不得污染当前 Active）。
+        assert_eq!(
+            harness
+                .registry
+                .candidate_state(ContentDigest::from_bytes(&v2_bytes)),
+            Some(ComponentLifecycleState::Failed)
+        );
+        // 迁移回滚审计（stateful 面）+ 管线拒绝审计（§18.7 fail closed）。
+        assert!(harness.state_audit.contains(|event| matches!(
+            event,
+            StatefulAuditEvent::MigrationRolledBack { reason, .. }
+                if *reason == "malformed-source"
+        )));
+        assert!(harness.audit.contains(|event| {
+            matches!(
+                event,
+                AuditEvent::DescriptorFailed {
+                    reason: "state-migration-rolled-back",
+                    ..
+                }
+            )
+        }));
+    }
+
+    #[test]
+    fn state_declaration_below_store_rejected_forward_only() {
+        // 声明版本 < 存储版本 → forward-only 拒绝（WIT：0.1.0 不定义已
+        // 提交迁移后的降级）；不触发迁移，v1 保持激活。
+        let harness = harness();
+        let (installation, v1_digest) = activate_v1_stateful(&harness, 2);
+        seed_store_version(&harness, installation, V2);
+        let v2_bytes = state_v2_bytes();
+        harness
+            .runtime
+            .with_descriptor_for(&v2_bytes, provider_v2_descriptor());
+        harness
+            .runtime
+            .with_declaration_for(&v2_bytes, declaration(1));
+        let result = harness.upgrade.upgrade(UpgradeRequest {
+            installation,
+            bytes: v2_bytes.clone(),
+            grants: GrantApproval::ReuseExisting,
+        });
+        match result {
+            Err(ApplicationError::StateSchemaDowngrade {
+                stored, declared, ..
+            }) => {
+                assert_eq!(stored, V2);
+                assert_eq!(declared, V1);
+            }
+            other => test_failure(format_args!(
+                "declared-below-stored must be rejected: {other:?}"
+            )),
+        }
+        // 未触发迁移；store 不变；v1 保持激活。
+        assert!(harness.migration_runner.calls().is_empty());
+        assert_eq!(harness.state_store.version_of(installation), Some(V2));
+        let entry = some(harness.active.get(installation), "active entry");
+        assert_eq!(entry.installation.digest, v1_digest);
+        assert_eq!(
+            harness
+                .registry
+                .candidate_state(ContentDigest::from_bytes(&v2_bytes)),
+            Some(ComponentLifecycleState::Failed)
+        );
+        assert!(harness.audit.contains(|event| {
+            matches!(
+                event,
+                AuditEvent::DescriptorFailed {
+                    reason: "state-schema-downgrade",
+                    ..
+                }
+            )
+        }));
+    }
+
+    #[test]
+    fn stateful_upgrade_without_declaration_keeps_stateless_path() {
+        // 无 state-declaration 导出 = 无状态组件：0.1 语义保持（§7.3
+        // stateless 边界）——不读取声明、不触发迁移、直接激活。
+        let harness = harness();
+        let outcome = ok(
+            harness
+                .install
+                .install(plain_install_request(b"v1 bytes".to_vec())),
+            "install stateless v1",
+        );
+        let installation = match outcome {
+            InstallOutcome::Activated { installation, .. } => installation,
+        };
+        let v1_digest = ContentDigest::from_bytes(b"v1 bytes");
+        seed_store_version(&harness, installation, V1);
+        let v2_bytes = state_v2_bytes();
+        harness
+            .runtime
+            .with_descriptor_for(&v2_bytes, provider_v2_descriptor());
+        let outcome = ok(
+            harness.upgrade.upgrade(UpgradeRequest {
+                installation,
+                bytes: v2_bytes,
+                grants: GrantApproval::ReuseExisting,
+            }),
+            "upgrade without state declaration",
+        );
+        assert!(matches!(outcome, UpgradeOutcome::Swapped { .. }));
+        // 无迁移触发；store 版本不变（管线不触碰 state）；v1 正常 drain。
+        assert!(harness.migration_runner.calls().is_empty());
+        assert_eq!(harness.state_store.version_of(installation), Some(V1));
+        assert_eq!(
+            harness.registry.candidate_state(v1_digest),
+            Some(ComponentLifecycleState::Disabled)
+        );
+    }
+
+    #[test]
+    fn fresh_install_with_declaration_and_empty_store_activates_directly() {
+        // 空 store（首次安装）：无可迁移数据（§41.3 首写建立版本语义）
+        // ——声明版本不触发迁移，激活直接成功。
+        let harness = harness();
+        harness
+            .runtime
+            .with_declaration_for(b"fresh stateful", declaration(2));
+        let outcome = ok(
+            harness
+                .install
+                .install(plain_install_request(b"fresh stateful".to_vec())),
+            "fresh install with declaration",
+        );
+        let installation = match outcome {
+            InstallOutcome::Activated { installation, .. } => installation,
+        };
+        // 无迁移触发；store 保持空（版本由首次写入建立）。
+        assert!(harness.migration_runner.calls().is_empty());
+        assert_eq!(harness.state_store.version_of(installation), None);
+    }
+
+    #[test]
+    fn state_declaration_non_deterministic_reads_reject_candidate() {
+        // §19.3 确定性（declaration.wit 明文）：同一 digest 同一 contract
+        // version 的重复调用必须返回同一 canonical 结果——不一致 =
+        // contract violation，candidate 保持 quarantine/failed。
+        let harness = harness();
+        harness
+            .runtime
+            .with_declarations(vec![declaration(1), declaration(2)]);
+        let bytes = b"non-deterministic declaration".to_vec();
+        let digest = ContentDigest::from_bytes(&bytes);
+        let result = harness.install.install(plain_install_request(bytes));
+        assert!(
+            matches!(result, Err(ApplicationError::DescriptorViolation(_))),
+            "non-deterministic state-declaration must be a contract violation: {result:?}"
+        );
+        assert_eq!(
+            harness.registry.candidate_state(digest),
+            Some(ComponentLifecycleState::Failed)
+        );
+        assert!(harness.active.is_empty());
+        assert!(harness.audit.contains(|event| {
+            matches!(
+                event,
+                AuditEvent::DescriptorFailed {
+                    reason: "state-declaration-mismatch",
+                    ..
+                }
+            )
+        }));
     }
 }
