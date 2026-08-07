@@ -38,14 +38,33 @@
 //! - [`StatefulAuditPort`]：0.3 state/config/secret 审计（§41.2 audit
 //!   MUST；metadata-only，值绝不进入审计，§16.6）。与 [`AuditPort`]
 //!   分开定义：既有 [`AuditEvent`] 变体集被 storage-sqlite 穷尽映射。
+//!
+//! # 0.3.0 Stateful Runtime（§41.2）——scheduler/event/lifecycle 端口
+//!
+//! - [`SchedulerDeliveryPort`]：定时任务交付面（Core-mediated push 到
+//!   guest `handler.on-trigger`，scheduler.wit；返回即已消费，trap 视为
+//!   已消费）。
+//! - [`SchedulerGrantPort`]：scheduler 能力的静态授权查询（§17.1/§17.5；
+//!   `denied` 判定面），进程内实现 [`InProcessSchedulerGrant`]。
+//! - [`EventPolicyPort`]：event 静态策略查询（§17.3 "event topics" scope：
+//!   发布授权 + 订阅集合，订阅是 policy 事实，无运行时 subscribe），
+//!   进程内实现 [`InProcessEventPolicy`]。
+//! - [`EventDeliveryPort`]：事件投递面（Core-mediated push 到 guest
+//!   `handler.on-event`，event.wit；trap 视为已消费）。
+//! - [`CheckpointPort`]：checkpoint 编排的最小 flush 入口（§41.2
+//!   checkpoint；StateService 无独立 flush 语义，见模块文档），进程内
+//!   实现 [`InProcessCheckpoint`]。
 
 mod audit;
 mod component_config;
 mod config;
+mod event;
 mod grants;
 mod graph;
+mod lifecycle;
 mod policy;
 mod registry;
+mod scheduler;
 mod secret;
 mod state;
 
@@ -54,9 +73,14 @@ pub use audit::{
 };
 pub use component_config::{ComponentConfigStorePort, ConfigStoreError};
 pub use config::{ConfigError, ConfigPort};
+pub use event::{EventDeliveryError, EventDeliveryPort, EventPolicyPort, InProcessEventPolicy};
 pub use grants::{GrantError, GrantStorePort};
 pub use graph::{GraphRecords, GraphStoreError, ProviderGraphPort};
+pub use lifecycle::{CheckpointError, CheckpointPort, InProcessCheckpoint};
 pub use policy::{ActionContext, ActionPolicyPort, InProcessActionPolicy};
 pub use registry::{ComponentRegistryPort, RegistryError};
+pub use scheduler::{
+    InProcessSchedulerGrant, SchedulerDeliveryError, SchedulerDeliveryPort, SchedulerGrantPort,
+};
 pub use secret::{SecretCiphertextRecord, SecretGrantPort, SecretStoreError, SecretStorePort};
 pub use state::{StateStoreError, StateStorePort};

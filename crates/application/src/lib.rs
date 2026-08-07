@@ -39,6 +39,22 @@
 //! - [`wit_bindings`]：`wasmtime::component::bindgen!` 的编译期 WIT 验证
 //!   （§22.2；见该模块的 §25 裁决说明）。
 //!
+//! # 0.3.0 Stateful Runtime（§41.2）——scheduler/event/lifecycle
+//!
+//! - [`clock`]：墙上时钟抽象（scheduler 的 UTC 硬时刻语义；`Clock` /
+//!   [`clock::SystemClock`]——生产时钟，测试注入受控时钟）。
+//! - [`scheduler`]：[`SchedulerService`]——typed scheduler（注册/取消/状态
+//!   查询；UTC 硬时刻 + tokio 定时器驱动；missed-fires 计数与 at-most-once
+//!   交付；cancel 竞态；停机不补投；有界任务数与交付队列，§15.2）。
+//! - [`event`]：[`EventService`]——typed event bus（静态 grant 策略下的
+//!   发布/投递；发布侧同步背压 `over-budget`；投递侧 `dropped` 计数；
+//!   有界入队/投递队列的扇出广播，§15.2）。
+//! - [`lifecycle`]：[`LifecycleController`]——graceful lifecycle 编排
+//!   （ready/drain/stop/checkpoint，§41.2；与 domain
+//!   `ComponentLifecycleState` 衔接，§20.4 有界 drain + CancellationToken）。
+//! - [`cancel`]：最小第一方 CancellationToken（§15.3 structured
+//!   cancellation；与 server crate 同模式）。
+//!
 //! # 时序契约（Wasm 执行，§7.5 / §19.3）
 //!
 //! 每次不可信执行遵循 runtime-wasm 的时序：`begin_execution` →
@@ -54,15 +70,20 @@
 //! deny，§14.2 / §26.1）。
 
 pub mod active;
+pub mod cancel;
+pub mod clock;
 pub mod composition;
 pub mod config;
 pub mod contract;
 pub mod error;
+pub mod event;
 pub mod install;
+pub mod lifecycle;
 pub mod migration;
 pub mod model;
 pub mod ports;
 pub mod runtime;
+pub mod scheduler;
 pub mod secret;
 pub mod state;
 pub mod upgrade;
@@ -82,7 +103,9 @@ pub use composition::{
 };
 pub use config::ConfigService;
 pub use error::{ApplicationError, RuntimeExecutionError};
+pub use event::{DeliveredEvent, EventError, EventLimits, EventService};
 pub use install::InstallService;
+pub use lifecycle::{LifecycleController, LifecycleError};
 pub use migration::{MigrationError, MigrationGuestError, MigrationOutcome, StateMigrationService};
 pub use model::{
     ActionDenied, ActionName, CandidateRecord, ContractSurface, DigestVersionBinding,
@@ -100,6 +123,7 @@ pub use ports::{
 pub use runtime::{
     ActiveRuntime, CompiledWasm, PreparedRuntime, RuntimePlan, WasmRuntime, WasmtimeRuntime,
 };
+pub use scheduler::{SchedulerError, SchedulerLimits, SchedulerService};
 pub use secret::{SecretError, SecretService};
 pub use state::{CasOutcome, MigrationGate, StateError, StateService};
 pub use upgrade::UpgradeService;

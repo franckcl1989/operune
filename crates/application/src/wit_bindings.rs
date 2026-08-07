@@ -127,12 +127,11 @@
 //! `migration.wit` 的 `migrate(from, to, transaction)` 以 `from` 命名第一
 //! 参数，触发该语法错误。
 //!
-//! 修复项（**主 agent 的 WIT 修复项**，本任务按约束不动 wit/ 目录）：
+//! 修复项（**主 agent 的 WIT 修复项**，2026-08-08 已落地，7103b72）：
 //! 把 `migration.wit` `migrate` 的 `from` 参数改名为非关键字标识符
-//! （建议 `from-version`，WIT 参数为 kebab-case；`to` 不是关键字可保留或
-//! 一并改为 `to-version` 对称）。改后**取消注释**下方三处 bindgen! 调用
-//! 即恢复 §22.2 权威验证点（state 包解析失败会中止整个 resolve，config/
-//! secret 包的验证也一并恢复）。
+//! `from-version`（WIT 参数 kebab-case；`to` 保留）。改后**取消注释**
+//! 下方三处 bindgen! 调用即恢复 §22.2 权威验证点（state 包解析失败会
+//! 中止整个 resolve，config/secret 包的验证也一并恢复）。
 //!
 //! 语法校验点的作用已达成：bindgen 在编译期拦截了已提交契约文件中的
 //! 语法错误（正是 §22.2"WIT 语法/解析的权威验证点"的用途）。
@@ -145,6 +144,20 @@
 //! 需同时执行**（主 agent）：每个包只保留一个文件（建议主契约文件）在
 //! `package` 声明前带注释，其余文件的文件头注释块整体移至 `package` 行
 //! 之后（与 2026-08-07 对 component/web 两包执行的修复完全同模式）。
+//! 2026-08-08 实测：该修复已落地（state/config/secret 三包均只有主契约
+//! 文件在 `package` 声明前带注释），三处 bindgen! 已恢复；scheduler/
+//! event 两包（0.3 新增，契约已提交稳定）遵循同一规则，bindgen! 验证
+//! 一并加入。
+//!
+//! # 裁决四：0.3.0 scheduler/event 两包加入 bindgen 验证（2026-08-08）
+//!
+//! 0.3 五包（state/config/secret/scheduler/event）的参考 world 全部加入
+//! 编译期 bindgen 验证（stringify + const 承载，§25 裁决一模式）。
+//! scheduler/event 的参考 world（`operune-scheduler-component` /
+//! `operune-event-component`）位于各自包内（world.wit），package 独立
+//! resolve；两包均只有主契约文件（scheduler.wit / event.wit）在
+//! `package` 声明前带注释，其余文件（handler.wit / world.wit）该处无
+//! 注释——裁决二 package-docs 规则成立（下方源码级测试覆盖）。
 //!
 
 // 编译期验证 `operune:component@0.1.0` 的参考 world（§6.6）。
@@ -182,41 +195,60 @@ const _: &str = wasmtime::component::bindgen!({
 });
 
 // ---------------------------------------------------------------------------
-// 0.3.0 Stateful Runtime（§41.2）：state / config / secret 三包的编译期
-// WIT 验证（§22.2 / §25 裁决一：stringify 形态，完整解析 + 代码生成在
-// 编译期执行；详见本模块文档"裁决三"）。
+// 0.3.0 Stateful Runtime（§41.2）：state / config / secret / scheduler /
+// event 五包的编译期 WIT 验证（§22.2 / §25 裁决一：stringify 形态，完整
+// 解析 + 代码生成在编译期执行；详见本模块文档"裁决三"）。
 // ---------------------------------------------------------------------------
 
 // 编译期验证 `operune:state@0.1.0` 的参考 world（§6.6）：导出 declaration
 // 与 migration（安装/激活期声明 + 升级迁移 handler），导入 state（运行时
 // typed 服务）。
 //
-// 裁决三（2026-08-08）：WIT 语法错误（`from` 是 WIT 保留关键字，见本模块
-// 文档裁决三）——bindgen 验证失败，调用按裁决三规则注释并文档化，恢复
-// 条件见模块文档（主 agent 的 WIT 修复项）。
-// const _: &str = wasmtime::component::bindgen!({
-//     path: ["../../wit/operune/state"],
-//     world: "operune:state/operune-state-component",
-//     stringify: true,
-// });
+// 恢复记录（2026-08-08）：裁决三的 WIT 修复项（主 agent，7103b72）已
+// 落地——`migrate(from, ...)` 参数改名为非关键字 `from-version`（WIT
+// 保留关键字冲突），且 state/config/secret 三包每个包只保留一个文件在
+// `package` 声明前带注释（裁决二 package-docs 规则）。三处 bindgen!
+// 取消注释恢复 §22.2 权威验证点（state 包解析失败会中止整个 resolve，
+// config/secret 的验证也一并恢复）。
+const _: &str = wasmtime::component::bindgen!({
+    path: ["../../wit/operune/state"],
+    world: "operune:state/operune-state-component",
+    stringify: true,
+});
 
 // 编译期验证 `operune:config@0.1.0` 的参考 world：导出 declaration 与
-// validator，导入 config（运行时只读）。裁决三：state 包解析失败时整个
-// resolve 中止，config/secret 的验证同样被阻塞——随 state 包修复后一起
-// 恢复（见模块文档裁决三）。
-// const _: &str = wasmtime::component::bindgen!({
-//     path: ["../../wit/operune/config"],
-//     world: "operune:config/operune-config-component",
-//     stringify: true,
-// });
+// validator，导入 config（运行时只读）。恢复记录见上（裁决三修复项）。
+const _: &str = wasmtime::component::bindgen!({
+    path: ["../../wit/operune/config"],
+    world: "operune:config/operune-config-component",
+    stringify: true,
+});
 
 // 编译期验证 `operune:secret@0.1.0` 的参考 world：导入 secret（按 grant
-// 读取，§41.2 grant/read semantics）。裁决三：同 config 包（见上）。
-// const _: &str = wasmtime::component::bindgen!({
-//     path: ["../../wit/operune/secret"],
-//     world: "operune:secret/operune-secret-component",
-//     stringify: true,
-// });
+// 读取，§41.2 grant/read semantics）。恢复记录见上（裁决三修复项）。
+const _: &str = wasmtime::component::bindgen!({
+    path: ["../../wit/operune/secret"],
+    world: "operune:secret/operune-secret-component",
+    stringify: true,
+});
+
+// 编译期验证 `operune:scheduler@0.1.0` 的参考 world（§41.2 scheduler）：
+// 导入 scheduler（注册/取消/状态查询），导出 handler（Core 在 fire 时刻
+// 同步调用）。与 0.3 三包同模式（stringify 形态，§25 裁决一）。
+const _: &str = wasmtime::component::bindgen!({
+    path: ["../../wit/operune/scheduler"],
+    world: "operune:scheduler/operune-scheduler-component",
+    stringify: true,
+});
+
+// 编译期验证 `operune:event@0.1.0` 的参考 world（§41.2 event bus / §17.3）：
+// 导入 event（发布），导出 handler（投递接收；订阅集合是 policy 事实）。
+// 与 0.3 三包同模式（stringify 形态，§25 裁决一）。
+const _: &str = wasmtime::component::bindgen!({
+    path: ["../../wit/operune/event"],
+    world: "operune:event/operune-event-component",
+    stringify: true,
+});
 
 // —— WIT 文件内容依赖跟踪（stringify 形态下 bindgen 不自动跟踪；
 //    路径相对本文件 crates/application/src/ → 仓库根 wit/）——
@@ -238,6 +270,13 @@ const _: &str = include_str!("../../../wit/operune/config/validator.wit");
 const _: &str = include_str!("../../../wit/operune/config/world.wit");
 const _: &str = include_str!("../../../wit/operune/secret/secret.wit");
 const _: &str = include_str!("../../../wit/operune/secret/world.wit");
+// 0.3.0 scheduler/event 两包（§41.2 scheduler / event bus）。
+const _: &str = include_str!("../../../wit/operune/scheduler/scheduler.wit");
+const _: &str = include_str!("../../../wit/operune/scheduler/handler.wit");
+const _: &str = include_str!("../../../wit/operune/scheduler/world.wit");
+const _: &str = include_str!("../../../wit/operune/event/event.wit");
+const _: &str = include_str!("../../../wit/operune/event/handler.wit");
+const _: &str = include_str!("../../../wit/operune/event/world.wit");
 
 #[cfg(test)]
 mod tests {
@@ -269,21 +308,51 @@ mod tests {
             include_str!("../../../wit/operune/web/assets.wit"),
             include_str!("../../../wit/operune/web/actions.wit"),
         ];
+        // 0.3.0 state/config/secret/scheduler/event 五包（§41.2）。
+        let state_files = [
+            include_str!("../../../wit/operune/state/state.wit"),
+            include_str!("../../../wit/operune/state/declaration.wit"),
+            include_str!("../../../wit/operune/state/migration.wit"),
+            include_str!("../../../wit/operune/state/world.wit"),
+        ];
+        let config_files = [
+            include_str!("../../../wit/operune/config/config.wit"),
+            include_str!("../../../wit/operune/config/declaration.wit"),
+            include_str!("../../../wit/operune/config/validator.wit"),
+            include_str!("../../../wit/operune/config/world.wit"),
+        ];
+        let secret_files = [
+            include_str!("../../../wit/operune/secret/secret.wit"),
+            include_str!("../../../wit/operune/secret/world.wit"),
+        ];
+        let scheduler_files = [
+            include_str!("../../../wit/operune/scheduler/scheduler.wit"),
+            include_str!("../../../wit/operune/scheduler/handler.wit"),
+            include_str!("../../../wit/operune/scheduler/world.wit"),
+        ];
+        let event_files = [
+            include_str!("../../../wit/operune/event/event.wit"),
+            include_str!("../../../wit/operune/event/handler.wit"),
+            include_str!("../../../wit/operune/event/world.wit"),
+        ];
 
-        // 每个 package 恰好一个文件（descriptor.wit）在 package 声明前
-        // 带注释；其余文件 package 声明前不得有任何注释。
-        assert!(comments_before_package(component_files[0]) > 0);
-        assert!(
-            component_files[1..]
-                .iter()
-                .all(|f| comments_before_package(f) == 0)
-        );
-        assert!(comments_before_package(web_files[0]) > 0);
-        assert!(
-            web_files[1..]
-                .iter()
-                .all(|f| comments_before_package(f) == 0)
-        );
+        // 每个 package 恰好一个文件（主契约文件）在 package 声明前
+        // 带注释；其余文件 package 声明前不得有任何注释（裁决二规则）。
+        for files in [
+            component_files.as_slice(),
+            web_files.as_slice(),
+            state_files.as_slice(),
+            config_files.as_slice(),
+            secret_files.as_slice(),
+            scheduler_files.as_slice(),
+            event_files.as_slice(),
+        ] {
+            assert!(comments_before_package(files[0]) > 0);
+            assert!(
+                files[1..].iter().all(|f| comments_before_package(f) == 0),
+                "every package must have exactly one file with comments before `package`"
+            );
+        }
     }
 
     #[test]
@@ -294,5 +363,17 @@ mod tests {
         assert!(descriptor.contains("get-descriptor"));
         let web_world = include_str!("../../../wit/operune/web/world.wit");
         assert!(web_world.contains("operune-web-component"));
+        // 0.3.0 五包（§41.2）：契约文本存在性（bindgen 的编译期解析已
+        // 覆盖语法；此处覆盖 include_str! 依赖跟踪的文本锚点）。
+        let state_migration = include_str!("../../../wit/operune/state/migration.wit");
+        assert!(state_migration.contains("from-version"));
+        let config_declaration = include_str!("../../../wit/operune/config/declaration.wit");
+        assert!(config_declaration.contains("get-config-declaration"));
+        let secret_world = include_str!("../../../wit/operune/secret/world.wit");
+        assert!(secret_world.contains("operune-secret-component"));
+        let scheduler_world = include_str!("../../../wit/operune/scheduler/world.wit");
+        assert!(scheduler_world.contains("operune-scheduler-component"));
+        let event_world = include_str!("../../../wit/operune/event/world.wit");
+        assert!(event_world.contains("operune-event-component"));
     }
 }

@@ -38,6 +38,12 @@ thiserror = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 # §15.5 / §20.3：read-mostly 不可变 Active 快照 + 原子切换（arc-swap）。
 arc-swap = { workspace = true }
+# 0.3.0 scheduler/event/lifecycle（§41.2 / §15）：tokio 是 native async
+# runtime（§15.1）——driver/pump/consumer 后台任务（rt）、有界队列与
+# watch 唤醒通道（sync，§15.2 无丢失唤醒）、定时器驱动（time）。
+# feature 最小集：rt + sync + time + macros（select! 宏；不使用
+# net/io 等生产 feature）。
+tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }
 
 [dev-dependencies]
 # §22.8 test/dev-only：真实 wasmtime 集成测试需要本地 JIT 后端（cranelift）
@@ -54,7 +60,9 @@ uuid = { workspace = true }
 # tokio 经 storage-sqlite 的既有 feature（rt/sync/macros/time）统一启用；
 # tempfile 提供真实 executor 的隔离 data root（§22.8 冻结清单已有）。
 operune-storage-sqlite = { path = "../storage-sqlite" }
-tokio = { workspace = true }
+# test-util：确定性时间测试（start_paused / tokio::time::advance，§15.1
+# scheduler/event 的时间控制；仅测试目标使用）。
+tokio = { workspace = true, features = ["test-util"] }
 tempfile = { workspace = true }
 # §22.8 / §16.6：secret 测试断言需要 ExposeSecret（明文比较入口；security
 # 的 SecretBytes 的 expose_secret 由 secrecy trait 提供）。

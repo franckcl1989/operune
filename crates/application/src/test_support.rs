@@ -16,9 +16,11 @@ use operune_domain::{
 };
 
 use crate::active::ActiveRuntimeRegistry;
+use crate::clock::{Clock, ClockError};
 use crate::composition::{ActiveGraph, CompositionService, GraphPolicy};
 use crate::contract::{GuestActionRequest, GuestComponentDescriptor};
 use crate::error::RuntimeExecutionError;
+use crate::event::DeliveredEvent;
 use crate::install::InstallService;
 use crate::model::{
     CandidateRecord, ContractSurface, DigestVersionBinding, GrantApproval, GrantSnapshot,
@@ -27,14 +29,16 @@ use crate::model::{
 };
 use crate::ports::{
     AuditError, AuditEvent, AuditPort, ComponentConfigStorePort, ComponentRegistryPort, ConfigPort,
-    ConfigStoreError, GrantError, GrantStorePort, GraphRecords, GraphStoreError,
-    InProcessActionPolicy, ProviderGraphPort, RegistryError, SecretCiphertextRecord,
-    SecretGrantPort, SecretStoreError, SecretStorePort, StateStoreError, StateStorePort,
-    StatefulAuditEvent, StatefulAuditPort,
+    ConfigStoreError, EventDeliveryError, EventDeliveryPort, GrantError, GrantStorePort,
+    GraphRecords, GraphStoreError, InProcessActionPolicy, ProviderGraphPort, RegistryError,
+    SchedulerDeliveryError, SchedulerDeliveryPort, SecretCiphertextRecord, SecretGrantPort,
+    SecretStoreError, SecretStorePort, StateStoreError, StateStorePort, StatefulAuditEvent,
+    StatefulAuditPort,
 };
 use crate::runtime::{ActiveRuntime, CompiledWasm, PreparedRuntime, RuntimePlan, WasmRuntime};
 use crate::upgrade::UpgradeService;
 use crate::web::{AssetCache, WebBridge};
+use operune_domain::{TriggerPayload, UtcInstant};
 
 /// 断言式失败：以测试失败语义中止当前测试（返回类型 `!`）。
 /// 与 runtime-wasm 的 test_support 同模式（§26.1 允许测试断言语义）。
@@ -1578,5 +1582,118 @@ impl StatefulAuditPort for FakeStatefulAudit {
             .map_err(|_| AuditError::Storage(Box::new(std::io::Error::other("lock poisoned"))))?;
         events.push(event);
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 0.3.0 scheduler/event（§41.2）：交付 fakes 与受控时钟（scheduler/event/
+// lifecycle 测试共用）。
+// ---------------------------------------------------------------------------
+
+/// FakeTriggerDelivery（scheduler 交付 port 的内存实现）：记录全部 fire
+/// 载荷（scheduler/event/lifecycle 测试共用）。
+#[derive(Debug, Default)]
+pub(crate) struct FakeTriggerDelivery {
+    delivered: Mutex<Vec<TriggerPayload>>,
+}
+
+impl FakeTriggerDelivery {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// 全部已投递的 fire 载荷（断言用）。
+    pub(crate) fn delivered(&self) -> Vec<TriggerPayload> {
+        match self.delivered.lock() {
+            Ok(guard) => guard.clone(),
+            Err(_) => Vec::new(),
+        }
+    }
+}
+
+impl SchedulerDeliveryPort for FakeTriggerDelivery {
+    fn on_trigger(&self, payload: TriggerPayload) -> Result<(), SchedulerDeliveryError> {
+        let mut delivered = self
+            .delivered
+            .lock()
+            .map_err(|_| SchedulerDeliveryError::Guest("delivery fake lock poisoned"))?;
+        delivered.push(payload);
+        Ok(())
+    }
+}
+
+/// FakeEventDelivery（event 交付 port 的内存实现）：记录全部投递事件。
+#[derive(Debug, Default)]
+pub(crate) struct FakeEventDelivery {
+    delivered: Mutex<Vec<DeliveredEvent>>,
+}
+
+impl FakeEventDelivery {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// 全部已投递事件（断言用）。
+    pub(crate) fn delivered(&self) -> Vec<DeliveredEvent> {
+        match self.delivered.lock() {
+            Ok(guard) => guard.clone(),
+            Err(_) => Vec::new(),
+        }
+    }
+}
+
+impl EventDeliveryPort for FakeEventDelivery {
+    fn on_event(&self, event: DeliveredEvent) -> Result<(), EventDeliveryError> {
+        let mut delivered = self
+            .delivered
+            .lock()
+            .map_err(|_| EventDeliveryError::Guest("delivery fake lock poisoned"))?;
+        delivered.push(event);
+        Ok(())
+    }
+}
+
+/// PausedClock（受控 UTC 时钟）：tokio **paused-time** 测试下与
+/// `tokio::time::advance` 锁步推进的时钟——`now()` 返回
+/// `start_utc + 单调流逝`（paused-time 下流逝只由 advance 推进），
+/// `sleep` 委托 tokio 定时器（同样受 advance 控制）。scheduler 的 UTC 硬
+/// 时刻语义测试无需真实等待（确定性，无 sleep 掩盖竞态）。
+#[derive(Debug, Clone)]
+pub(crate) struct PausedClock {
+    start_utc: UtcInstant,
+    start_mono: tokio::time::Instant,
+}
+
+impl PausedClock {
+    /// 新建受控时钟（UTC 锚点 `start_utc`）。
+    pub(crate) fn new(start_utc: UtcInstant) -> Self {
+        Self {
+            start_utc,
+            start_mono: tokio::time::Instant::now(),
+        }
+    }
+
+    /// 当前 UTC 时刻（paused-time 下由 advance 推进；与
+    /// `tokio::time::Instant::elapsed` 锁步）。
+    pub(crate) fn utc_now(&self) -> UtcInstant {
+        let elapsed = self.start_mono.elapsed();
+        let duration = operune_domain::Duration::from_std(elapsed);
+        match self.start_utc.checked_add(duration) {
+            Ok(instant) => instant,
+            Err(_) => self.start_utc,
+        }
+    }
+}
+
+impl Clock for PausedClock {
+    fn now(&self) -> Result<UtcInstant, ClockError> {
+        Ok(self.utc_now())
+    }
+
+    fn sleep(
+        &self,
+        duration: operune_domain::Duration,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(tokio::time::sleep(duration.as_std()))
     }
 }
