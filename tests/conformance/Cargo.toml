@@ -5,7 +5,25 @@ edition.workspace = true
 rust-version.workspace = true
 description = "Operune Component conformance test suite harness (spec 30)"
 
-[dependencies]
+# 本包是 §30 Component Conformance Suite 的宿主（仅测试目标）。
+# 说明（依赖范围）：生产 [dependencies] 保持为空——套件不提供任何产品
+# 代码，不参与 production qualification（§26.1）。全部依赖是 dev-only：
+# 消费 workspace member 的公开 typed API（runtime-wasm §7 / application
+# §19 / runtime-wasi-p2 §7.6 能力规格 / domain 类型），不 import 任何
+# wasmtime 具体类型之外的第三方 crate（§8.2 受控泄漏点：wasmtime 的
+# Linker/Instance/Func 与 StoreHostState 同处集成层，见 runtime-wasm
+# engine.rs / store.rs 的受控泄漏点文档）。
+[dev-dependencies]
+operune-application = { path = "../../crates/application" }
+operune-domain = { path = "../../crates/domain" }
+operune-runtime-wasm = { path = "../../crates/runtime-wasm" }
+operune-runtime-wasi-p2 = { path = "../../crates/runtime-wasi-p2" }
+# §22.8 test/dev-only：本地解析 wat 文本夹具（Component::new 的文本输入面
+# 依赖 wasmtime 的 "wat" feature；cranelift/component-model 等由
+# runtime-wasm 的生产 feature set 统一提供，见 workspace feature 说明）。
+wasmtime = { workspace = true, features = ["wat"] }
+# §22.8 test/dev-only：granted-preopen 能力路径需要真实宿主目录。
+tempfile = { workspace = true }
 
 [lints]
 workspace = true
