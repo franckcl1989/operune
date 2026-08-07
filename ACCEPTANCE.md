@@ -307,3 +307,109 @@ fmt / clippy / 全量测试 / §54 / cargo-deny / cargo-audit 六项结果与 0.
 - §41.3 验收逐项：**PASS 10 项**（1a 迁移原子推进、1b 失败回滚、1c crash、1d 取消、1e 磁盘失败（模拟级）、1f schema 版本绑定、#2 Secret 读/拒/轮换/审计、#3 SQLite dump 无明文、#4 全量测试数，以及 0.2 章节承接的确定性框架），**PASS-模拟 1 项**（1e 之 §33 进程级注入部分 = NOT-EXECUTABLE-本机），**MISSING-EVIDENCE 1 项**（1g 升级管线触发迁移的端到端编排测试——各原子性属性均已 PASS，组合编排待补）；
 - SecretStore key-provider 按 **ADR-0001 Proposed（待 Owner 裁决）的推荐方向**实现（XChaCha20Poly1305 AEAD + 文件 KEK），裁决点见第 4 节；
 - 无 release-blocker；全部已知缺口记录在案（工具链 9+ 项、qualification、soak、§33、checkpoint 最小入口、1g 编排缺口）。
+
+---
+
+# Operune 0.4.0 验收记录（ACCEPTANCE 增补：Web Application Runtime）
+
+- **日期**：2026-08-08
+- **验收对象**：Operune Core Runtime 0.4.0（Web Application Runtime，规范 §42）
+- **依据**：规范 §42.4（0.4.0 验收）、§42.2（MUST Scope）、§42.3（WASI 0.3 条件）、§8.3（WASI 0.3 准入 Gate）、§37（Release Gate）、§54、§35、§36；沿用 0.1/0.2/0.3 验收框架（§38：每个版本是前一版本的真实超集——0.4 全量 1019 测试中原样包含 0.3 的 833 测试，且 0.1 的 §39.4 基线验收不因新版本撤销）
+- **执行方式**：本机可执行子集验收（Windows x86_64）。全部 `cargo` 命令使用 `--locked`（§22.1；cargo-deny/cargo-audit 为各自固有调用形态，见下）。未执行任何 git 命令；除本文件外未修改任何文件。
+- **环境**：与 0.2.0/0.3.0 章节同一主机环境（Windows 11 Pro Build 26200，rustc/cargo 1.97.1，rustfmt 1.9.0-stable，clippy 0.1.97，cargo-deny 0.20.2，cargo-audit 0.22.2）。**门禁为本轮全新执行**（非引用旧轮结果）。
+
+---
+
+## 1. 本机全量门禁结果（§37 本机子集 + §54，0.4.0 轮全新执行）
+
+| # | 门禁 | 命令 | 结果 | 证据 |
+|---|---|---|---|---|
+| 1 | 格式化 | `cargo fmt --check` | **PASS** | exit 0，无 diff 输出 |
+| 2 | clippy -D warnings | `cargo clippy --workspace --all-targets --locked -- -D warnings` | **PASS** | exit 0；`Finished dev profile in 6.82s`，零警告（workspace.lints 固化 `-D clippy::unwrap_used/-D expect_used/-D panic/-D todo/-D unimplemented` 与 `unsafe_code = "forbid"`，Cargo.toml:35-43） |
+| 3 | 全量测试 | `cargo test --workspace --locked` | **PASS** | **1019 个测试全过、0 失败**（0.3 基线 833 → **+186**）：application 295 + stateful_e2e 1、conformance 35、domain 235、integration 0（空壳）、observability 23 + doc-test 1、platform 9、platform-windows 5、platform-linux/macos 0（骨架）、runtime-wasi-p2 12、runtime-wasm 45、security 65、server 72、storage-sqlite 104、web-admin 46（单元）+ 4（tls 集成）、web-component 67 |
+| 4 | §54 机械检查 | grep crates/ 与 tests/ 下 `.rs` | **PASS** | 见下节 1.1 |
+| 5 | 依赖门 | `cargo deny check advisories bans sources`（0.20.2，本轮运行） | **PASS** | `advisories ok, bans ok, sources ok`，exit 0（licenses 未启用属 §23.4 Owner 决策，CI 同配置） |
+| 6 | 漏洞扫描 | `cargo audit`（0.22.2，本轮运行，1190 条 advisory） | **PASS** | 扫描 **364 个 crate 依赖**（与 0.3 轮一致，0.4 未新增生产依赖），**0 vulnerabilities**，exit 0 |
+
+### 1.1 §54 机械检查明细（0.4.0 轮）
+
+- **`unsafe`**：代码中 **0 处**。grep 40 命中全部为：`#![forbid(unsafe_code)]` 指令行（各 crate 根）、CSP 策略字符串 `'unsafe-inline'`/`'unsafe-eval'`（web-component/src/csp.rs、web-admin/src/headers.rs）与文档注释。无 `unsafe {}` / `unsafe fn` / `unsafe impl`。workspace 级 `forbid(unsafe_code)` + clippy 通过 = 机械证明。
+- **`unwrap(` / `expect(`**：0 处（排除测试代码 `Arc::try_unwrap` 等不同 API；与 0.2/0.3 记录一致）。**`panic!`**：0 处（仅文档注释）。**`todo!` / `unimplemented!`**：0 处（仅文档注释）。
+- **`unreachable!`**：70 处非注释命中，**除 0.2 已记录的 domain graph.rs 生产路径 5 处 §14.3 fail-stop 外（resolve():516/526、compute_activation_order():563/616、find_cycle():664，带不变量说明消息，0.4 未新增），其余全部位于 `#[cfg(test)]` 模块**——本轮逐一核对 cfg(test) 边界：security 6 文件（session_cookie.rs:94、session.rs:372、token.rs:149、tls.rs:333、password.rs:360、csrf.rs:109 均 < cfg(test)）、observability（metrics.rs:341 < cfg(test)；support.rs 经 lib.rs:33 `#[cfg(test)] mod support` 门控）、server（server.rs:200、cli.rs、bootstrap.rs、config.rs、compose.rs、audit.rs 均 < cfg(test)）、storage-sqlite（ports.rs:2092、testutil.rs < cfg(test)）、web-component（http_04_tests.rs、http_tests.rs 为测试文件，test_support.rs 首行 `#![cfg(test)]`）、platform-windows data_root.rs、domain lifecycle.rs:235/upgrade.rs。**0.4 新增生产代码（web-component src 各模块、application web_app.rs/cancel.rs/web.rs、domain web.rs）零新增生产路径 unreachable!**。
+- 其余 §54 语义项（能力复用、领域泄漏、有界队列、deny-by-default 权限、审计不落 secret 等）由 §42.4 各验收测试覆盖，见第 2 节。
+
+---
+
+## 2. §42.4 验收逐项核对（本机可执行子集）
+
+结论图例同 0.2/0.3 章节：**PASS** = 本机测试实证；**PASS-部分** = 本机部分实证（层内/架构级，端到端留工具链或 CI）；**NOT-EXECUTABLE-本机** = 需 cargo-component 工具链/CI，本机不可执行（如实标注，不以替代证据冒充端到端）；**MISSING-EVIDENCE** = 验收项无对应实现或测试（如实标注，不伪造）。
+
+| # | 验收项 | 验证方式（测试名/文件） | 结论 |
+|---|---|---|---|
+| 1 | 测试 Component 仅凭标准 `.wasm` 提供完整 UI + backend，安装后出现 | **端到端 NOT-EXECUTABLE**：本机无 cargo-component/wasm-tools，无法构建导出 `operune:web@0.2.0` 契约的真实 guest 夹具（工具链缺口在案，gaps.rs `gap_inventory_is_recorded`：web assets + sandbox escape 组件、minimal valid Component、descriptor 全链路等，补齐条件 = cargo-component 就绪）——§42.4 核心验收项无法以真实 `.wasm` 实证。**层内替代证据（如实标注非端到端）**：application `activation_builds_web_app_context`（安装→激活→web-app context 建立并持久化）；web-component HTTP 层 `installed04` 夹具安装后：`navigation_index_lists_pages_and_default_page`（UI 出现）、`root_resolves_to_default_page`、`page_navigation_serves_page_asset`（页面可服务）、`dispatch_success_with_typed_params`（backend 可达）；0.1 兼容路径 `legacy_component_keeps_01_asset_and_action_paths` | **NOT-EXECUTABLE**（§42.4 核心项；层内替代证据全 PASS） |
+| 2 | 升级时整体切换（§21.5/§42.2 原子版本：backend exports + assets + descriptor 同一 ComponentVersion 一次性切换，禁止前后端版本拼接） | application web_app_tests.rs `upgrade_swaps_web_app_context_atomically`（v2 声明激活后断言 v1 路由 `get-item` 从 registry 消失、v2-only 路由可解析且经同一 WebAppService 分发成功——"旧声明必须在原子切换后消失"）；upgrade.rs `upgrade_swaps_and_drains_old_version`（旧版本实例排空、drain 有 deadline）；0.1 基线 `upgrade_failure_keeps_v1_active` 原样通过 | **PASS** |
+| 3 | 卸载后完整消失 | **无卸载操作**：grep crates/ tests/ 全量 `uninstall` 0 命中。存在的近似面：admin `disable`（facade.rs:831：drain(deadline) + 状态 Disabled + `active.remove(id)` + 审计 `component.disable`；测试 `disable_transitions_active_to_disabled`、`users_crud_and_disable_revokes_sessions`；且 `enable` 显式 `Unsupported`——disable 不可逆，非 uninstall）；composition `deactivate`（`deactivation_removes_records_and_swaps_snapshot`，仅清 graph records）；storage 无 installation 删除 API。**"卸载后 UI+backend 完整消失（资产/路由/记录全清）"无可测试对象** | **MISSING-EVIDENCE**（卸载操作本身未实现，属本版本验收缺口，见第 4 节 #1） |
+| 4 | 权限由 Core 统一治理（page/action permission 声明，§42.2） | web-component http_04_tests.rs：`page_navigation_with_permission_denied_is_403`、`page_navigation_with_permission_allowed`、`dispatch_unauthorized_is_403`；application web_app_tests.rs：`dispatch_route_permission_denied_before_guest`（拒绝发生在 guest 调用前，`route_calls()==0`）、`dispatch_route_permission_granted_by_named_scope`、`authorize_page_denied_without_grant`、`authorize_page_allowed_with_named_grant`、`authorize_page_not_active_denied`；0.1 基线 `web_action_denied_without_grant`/`web_action_scoped_grant_matches_action_name` 原样通过 | **PASS**（层内证据） |
+| 5 | 路由由 Core 统一治理（route namespace + conflict diagnostics，§42.2） | application web_app_tests.rs 声明期诊断：`build_app_declaration_rejects_route_id_conflict`、`rejects_route_path_conflict`、`rejects_page_route_conflict`、`rejects_param_mismatch`、`same_path_different_method_ok`、`rejects_default_page_not_declared`、`validate_contract_surface_cross_checks_exports`（声明与二进制 exports 交叉校验，§6.7 精神）；web-component mount.rs `namespaces_are_disjoint_by_installation`（挂载命名空间按 InstallationId 隔离）、`page_and_navigation_urls_live_under_mount_namespace`；HTTP 层 `dispatch_route_not_matched_is_404`、`navigation_unknown_installation_is_404`、`navigation_unknown_page_is_404`；domain web.rs 46 测试（typed params 闭集解析、整数溢出拒绝、路径规范化） | **PASS**（层内证据） |
+| 6 | 资源由 Core 统一治理（bounded request/response + per-Component HTTP quotas/backpressure，§42.2） | web-component http_04_tests.rs：`dispatch_quota_exceeded_is_429`、`dispatch_rate_limit_by_http_gate_is_429`、`dispatch_concurrency_limit_by_http_gate_is_503`（`#[tokio::test(flavor="multi_thread")]` 并发上限）、`dispatch_body_over_limit_rejected_early`、`dispatch_response_over_limit_rejected`；quota.rs 4 测试（`gate_rate_limits_in_window`、`gate_busy_when_in_flight_at_cap`、`gate_instances_are_independent`——quota 按 installation 隔离）；application：`dispatch_route_quota_rate_limit_rejected`（OverQuota(RateLimited)）、`dispatch_route_rejects_oversized_payload`（BodyTooLarge 且 guest 0 调用）、0.1 基线 `web_action_body_over_limit_denied`/`rate_limit_denies_burst` | **PASS**（层内证据） |
+| 7 | 浏览器安全由 Core 统一治理（CSP/security policy，§42.2） | web-component csp.rs `csp_covers_minimum_isolation_floor`（restrictive CSP 显式含 `default-src 'none'`/`script-src 'self'` 且无 `'unsafe-inline'`/`'unsafe-eval'`/`form-action 'none'`/`frame-ancestors 'none'`/`base-uri 'none'`/`object-src 'none'`/无外源通配）；http_04_tests.rs `assert_core_headers`（navigation/page/dispatch 响应全部携带 COMPONENT_CSP + `X-Content-Type-Options: nosniff` + **无 Set-Cookie**——Core 最后写，组件不可覆盖）；0.1 基线 CSP/headers 测试原样通过；WIT world.wit 明文：全部 browser isolation 面由 Core 生成并强制，**组件不存在放宽 sandbox/CSP 的配置面** | **PASS**（层内证据） |
+| 8 | Core 不包含该业务页面知识 | 架构级证据：navigation.rs 模块文档（"Core 是导航的唯一执行者：页面集合是安装期声明事实，不随运行期变化"；`NavigationIndex::from_declaration` 只搬运声明字段、不解析业务语义）；页面内容对 Core 为不透明字节（资产按 digest+path 缓存直供，`asset_carries_content_digest_and_immutable_cache`）；行为证据：`navigation_unknown_page_is_404`、`page_navigation_for_01_component_is_404`（Core 对未声明页面无知识残留）。完整端到端实证（真实组件携带业务页面走完整生命周期）随 #1 工具链缺口 | **PASS-部分**（架构/层内证据充分，端到端随 #1 NOT-EXECUTABLE） |
+| 9 | realtime/stream：仅当 §8.3 Gate 通过并宣称时才有 native async/stream conformance 义务；Gate 未过则不得假装该能力存在 | **Gate 状态确认 = 未通过**：机械证据——crates/ 下 `wasmtime_wasi::p3` 引用 **0 处**、无 wasi:http / stack-switching 引用；runtime-wasi-p2 Cargo.toml 明文 "production 仅 p2"；docs/adr 仅 ADR-0001（无 WASI 0.3 迁移 ADR，Gate 第 8 条不满足）。**未宣称证据**——WIT web@0.2.0 全部契约均为 p2 同步形态：app-descriptor.wit:109 "本版本**没有** realtime / stream flag：§42.3 条件未满足（§8.3 WASI 0.3 production Gate 未通过）"、route-dispatch.wit "同步 p2 形态：无 `stream<T>`、无 `future<T>`、无 async"、actions.wit 继承 0.1 边界（"无 WebSocket、无任意长连接、无流"）；grep crates/ `stream|future<T>|realtime` 实现代码 **0 命中**；无平行 async/stream ABI（§42.3 禁令）。p2/p3 adapter boundary 保留（runtime-wasi-p2 12 测试 + runtime-wasm wasi.rs trait 边界） | **PASS**（如实：Gate 未过 → 能力未宣称 → 无 native conformance 义务，验收不假装该能力存在） |
+| 10 | bounded request/response + cancellation 作为无条件 baseline（§42.2/§42.3） | application cancel.rs 6 测试（`fresh_token_is_not_cancelled`、`cancel_is_idempotent`、`cloned_tokens_share_cancellation`、`cancelled_before_await_returns_immediately`、`cancel_wakes_waiting_waiter`、`repeated_cancelled_awaits_are_instant`）；web-component http_04_tests.rs `dispatch_cancelled_maps_to_408`（客户端取消 → 408 确定语义）、`cancellation_token_flows_through_full_http_path`（每次 route 调用绑定 token：调用期间 fresh、handler 完成后 CancelOnDrop 幂等取消——客户端断开 → hyper 丢弃 future → 同机制取消 → epoch interruption 中止 in-flight guest 调用）；application：`dispatch_route_cancelled_token_refuses_to_start`（已取消不启动新调用）、`dispatch_route_post_call_cancellation_discards_result`（调用结束已取消 → 结果丢弃、已提交副作用不回滚、审计仍记录）、`dispatch_route_deadline_exceeded_maps_deterministically`；0.1 基线 epoch deadline 中断（conformance `infinite_loop_interrupted_by_epoch_deadline`）原样通过 | **PASS** |
+| 11 | 0.4 全量测试数汇总 | 见第 1 节门禁 #3：workspace **1019 测试 0 失败**（0.3 的 833 全部原样包含并全过）。0.4 相关新增：domain web.rs 46（189→235）、application +90（205→295：web_app_tests 51 + web.rs 11 + cancel 6 + 其余 web-app 接线）+ stateful_e2e 1、web-component +49（18→67：http_04_tests 30 + dispatch 7 + quota 4 + mount 4 + integrity 3 + router 2 + navigation 2 + csp 1）；conformance 35、security 65、storage 104、server 72、web-admin 50、observability 23、runtime-wasm 45、runtime-wasi-p2 12、platform 14 等与 0.3 相同 | **PASS** |
+
+### §42.2 MUST Scope 覆盖对照（供 Gate 8/13 参考）
+
+- **app descriptor / navigation / pages / typed routes / permissions / route-dispatch**：WIT `operune:web@0.2.0` 五新增面（app-descriptor/navigation/routes/permissions/route-dispatch）+ domain `AppDeclaration` + application `WebAppService`——层内测试齐（#4-#7、#10）。
+- **Web asset caching/integrity**：http_04_tests.rs `asset_carries_content_digest_and_immutable_cache`（digest 绑定不可变缓存）、`page_carries_content_digest_and_no_cache`；web-component integrity.rs 3 测试；0.1 基线 web.rs 资产缓存 + `asset_url_includes_digest_for_atomic_versioning`（URL 级原子版本）。
+- **0.1 基础不重造第二套 bridge**：`legacy_component_keeps_01_asset_and_action_paths`、`root_for_01_component_still_redirects_to_entry_asset`、`navigation_for_01_component_is_404`/`dispatch_for_01_component_is_404`（0.4 面不侵入 0.1 路径）。
+- **Web compatibility/conformance suite**：conformance 35 与 0.3 相同，**未新增 0.4 夹具**（工具链缺口，第 4 节 #2）——如实标注。
+
+---
+
+## 3. §37 Release Gate 逐项（本机子集，0.4.0 轮）
+
+| # | Gate | 结论 | 证据 |
+|---|---|---|---|
+| 1 | `cargo fmt` | **PASS** | 本轮 `cargo fmt --check` exit 0 |
+| 2 | clippy `-D warnings` | **PASS** | 本轮全 workspace 全 targets 零警告（6.82s） |
+| 3 | `forbid(unsafe_code)` 全 workspace | **PASS** | workspace.lints + 各 crate `#![forbid(unsafe_code)]` + grep 0 处 unsafe 代码 |
+| 4 | unit/property/integration/conformance | **PASS** | 1019 测试 0 失败（含 conformance 35、集成 stateful_e2e 1） |
+| 5 | security tests | **PASS** | security 65 + web-admin 50（46+4 tls）原样全过（0.4 未触碰 security 面） |
+| 6 | dependency advisory/license/source gate | **PASS** | 本轮 cargo-deny 0.20.2：advisories/bans/sources 全 ok（364 依赖）；cargo-audit 0.22.2：0 漏洞；licenses 未启用 = §23.4 Owner 决策 |
+| 7 | migration test | **PASS** | storage-sqlite 104 原样全过（0.4 无 schema 变更；0.3 迁移 12+2 在案） |
+| 8 | upgrade/rollback test | **PASS** | upgrade.rs 9 + 0.4 新增 `upgrade_swaps_web_app_context_atomically` + composition 升级门控 5 + conformance 升级 3 |
+| 9 | crash recovery test | **PASS** | storage recovery 9 + 0.3 状态面无残留全套原样通过；§33 完整 fault-injection = nightly/CI |
+| 10 | platform production qualification | **NOT-EXECUTABLE-本机** | 需 Linux x86_64 GNU / aarch64 GNU 原生 runner（§36 矩阵）；Windows x86_64 本机全量通过 |
+| 11 | release binary smoke | **NOT-RE-RUN** | 0.1 记录已实证（`cargo build --release --locked -p operune-server` + version/--help）；本 0.4 轮未重跑 release 构建（无 release 面变更证据要求），如实标注 |
+| 12 | SBOM/provenance/sha256/signing | **NOT-EXECUTABLE** | §37.12 按路线图进入相应版本后为 MUST；0.4.0 未启用（同 0.1-0.3） |
+| 13 | 文档/CLI/API compatibility check | **PASS-部分** | WIT `operune:web@0.2.0` 契约已提交稳定（wit/operune/web@0.2.0/ 七文件 + world.wit，与 0.1.0 package 并存，§8.4 无 flag-day）；0.1 组件兼容路径由 `legacy_component_keeps_01_asset_and_action_paths`、`root_for_01_component_still_redirects_to_entry_asset` 实证；CLI 面 0.1 测试原样通过 |
+| 14 | 没有 unresolved release-blocker | **PASS-条件** | 本机子集未发现既有面回归 blocker；但 §42.4 #3 卸载操作为 MISSING-EVIDENCE（见第 4 节 #1）——按 §42.4"全部成立"语义，0.4.0 最终标记前需卸载落地或 Owner 明确裁决 |
+
+---
+
+## 4. 已知非阻塞缺口清单（0.4.0）
+
+1. **卸载操作缺失（§42.4 #3 = MISSING-EVIDENCE，本轮新发现）**：全仓无 uninstall 实现（crates/ tests/ grep 0 命中）；admin 面仅 `disable`（drain + Disabled + active.remove，`enable` 显式 Unsupported）；composition `deactivate` 仅清 graph records；storage 无 installation 删除 API。"卸载后 UI + backend 完整消失"无可测试对象。0.1-0.3 验收未要求卸载，§42.4 首次显式要求——属本版本验收缺口，需实现卸载管线（资产/路由/记录/audit 清理 + 原子性）并补测试。
+2. **conformance 工具链缺口（§42.4 #1 端到端不可实证）**：cargo-component / wasm-tools 本机不可用（gaps.rs `gap_inventory_is_recorded` 审计门在案）。0.1 的 7 项 + 0.2 的 2 项不变；**0.4 专项**：导出 `operune:web@0.2.0` 全契约面的真实 Web app 组件（完整 UI + backend 单一 `.wasm`）、web assets + sandbox escape 攻击组件、descriptor 全链路、升级整体切换的真实二进制对——当前全部以 fake port / 声明构造覆盖层内语义，端到端随工具链补齐。
+3. **realtime/stream 未宣称（非缺口，如实记录）**：§8.3 Gate 未通过（无 p3 代码、无迁移 ADR），native async/stream 按 §42.3 顺延到第一个满足 Gate 的 release；本版本无 native conformance 义务，验收不假装该能力存在（§42.4 末句）。
+4. **qualification / soak / §33 完整 fault-injection / loom / tests/integration 空壳 / platform-linux-macos 骨架**：同 0.1-0.3 记录。
+5. **§54 delta**：与 0.2/0.3 相同——domain graph.rs 生产路径 5 处 §14.3 fail-stop `unreachable!`（带不变量说明消息）；**0.4 新增代码零新增生产路径 unreachable!/unsafe/panic 宏**（见 1.1）。
+6. **CI 现场状态**：同 0.3（本机无 gh/git 权限，无法直接读取 CI 运行历史；ci.yml 与 0.20.2/0.22.2 pin 及命令与本机一致，本机通过 = 同参数等价验证；Linux 侧结果需 CI 现场确认）。
+
+---
+
+## 5. CI 状态引用
+
+与 0.3.0 章节相同：`.github/workflows/ci.yml`（push/PR/workflow_dispatch，ubuntu + windows 双矩阵），命令与本机逐一对应：fmt（`cargo fmt --check`）、clippy（`cargo clippy --workspace --all-targets --locked -- -D warnings`）、test（`cargo test --workspace --locked`）、cargo-deny（0.20.2）、cargo-audit（0.22.2）。本机以相同版本工具链/命令全部执行并通过（fmt/clippy/test/deny/audit 共 6 项，见第 1 节）。工具链一致：rust-toolchain.toml 冻结 1.97.1，本机 `rustc 1.97.1 (8bab26f4f 2026-07-14)` 一致。
+
+---
+
+## 6. 结论（0.4.0）
+
+**0.4.0 本机可执行验收子集达成（含 1 项 §42.4 MISSING-EVIDENCE 与 1 项核心项 NOT-EXECUTABLE）**：
+
+- 本机全量门禁（fmt / clippy -D warnings / **1019 测试 0 失败** / §54 机械检查 / cargo-deny / cargo-audit）全部通过；0.3 基线 833 → 1019（+186：domain web.rs 46、application web_app_tests 51 + web.rs 11 + cancel 6 等 +90(+1 e2e)、web-component http_04_tests 30 + dispatch/quota/mount/integrity/router/navigation/csp 19 +49）；0.1/0.2/0.3 全部既有测试原样通过（§38 真实超集）；
+- §42.4 验收逐项：**PASS 7 项**（#2 升级整体切换、#4 权限、#5 路由、#6 资源、#7 浏览器安全 Core 统一治理、#9 realtime 未宣称（如实）、#10 bounded+cancellation baseline、#11 全量测试数）、**PASS-部分 1 项**（#8 Core 不包含业务页面知识——架构/层内证据充分，端到端随工具链）、**NOT-EXECUTABLE 1 项**（#1 测试 Component 端到端——cargo-component 工具链缺口，层内替代证据全 PASS，如实标注不冒充）、**MISSING-EVIDENCE 1 项**（#3 卸载后完整消失——卸载操作未实现）；
+- §37 共 14 项：本机可执行项 PASS（含依赖门/漏洞扫描本轮实测），qualification/SBOM/§33 等 NOT-EXECUTABLE 项同 0.1-0.3，无回归 blocker；
+- **0.4.0 最终标记的前置条件（本机结论）**：§42.4 全文语义要求——(a) 卸载管线落地并补齐"卸载后完整消失"测试；(b) cargo-component 工具链就绪后以真实 `.wasm` 完成 #1 端到端验证；(c) 既有 NOT-EXECUTABLE qualification 项由 CI/目标硬件完成。任一未达，0.4.0 不得按 §42.4"只有全部成立"语义完成最终标记。
