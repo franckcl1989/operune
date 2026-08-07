@@ -3,9 +3,45 @@ name = "operune-web-admin"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-description = "Operune Root Admin Axum/Askama HTTP adapter (spec 24.2)"
+description = "Operune Root Admin Web adapter: Axum + Askama SSR HTTP adapter (spec 21.1/21.2, security baseline 16)"
 
+# §22.3 Async / Web / TLS 基线。版本一律从 workspace.dependencies 取值（§23.2）。
+# - rustls：default-features = false；crypto provider 由本 crate（装配层）显式
+#   选择 ring（§22.3 注释；理由见 src/tls.rs）。"tls12" 保持 rustls 安全默认集
+#   （TLS 1.2 + 1.3，§16.2）；"std" 提供错误与 io 集成。
+# - 不依赖 tokio-rustls：workspace 冻结基线未声明 default-features=false，
+#   其默认 features 会隐式引入 aws-lc-rs provider（§23 基线不可由成员改写）；
+#   ServerConfig 装配即本 crate 的 TLS 边界，TlsAcceptor 由 server 接线。
+# - askama：默认 features（derive + std + config + urlencode，§22.3 校验）；SSR
+#   模板在 templates/ 目录编译期渲染，无 Node/npm 工具链（§21.2）。
+# - axum：默认 features（form/json/query/http1 等）；不启用 multipart（避免
+#   multer 新依赖）：上传以原始字节 body 传输（页面内最小原生 JS，§21.2）。
+# - 不引入 tower-http：body 上限用 axum 的 DefaultBodyLimit（其内部已是
+#   tower-http limit feature）；安全头由本 crate 的中间件显式设置（§21.3
+#   Core-owned headers 纪律）。
 [dependencies]
+operune-application = { path = "../application" }
+operune-domain = { path = "../domain" }
+operune-observability = { path = "../observability" }
+operune-security = { path = "../security" }
+askama = { workspace = true }
+axum = { workspace = true }
+cookie = { workspace = true }
+rustls = { workspace = true, default-features = false, features = ["ring", "tls12", "std"] }
+secrecy = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+thiserror = { workspace = true }
+time = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+# §22.8 test/dev-only：HTTP 黑盒测试（tower::ServiceExt::oneshot，tokio rt）、
+# tracing 捕获（§16.6 不记录密码的证明）。
+tokio = { workspace = true, features = ["rt", "macros"] }
+tower = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde_json = { workspace = true }
 
 [lints]
 workspace = true

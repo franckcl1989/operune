@@ -3,9 +3,27 @@ name = "operune-web-component"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-description = "Operune Component web bridge: assets/actions/routes from Components to Core Web (spec 24.2)"
+description = "Operune Component Web bridge: Component web assets/actions to Core Web (spec 21.3)"
 
+# §21.3 最小 Component Web bridge 的 Core 侧 HTTP adapter（§24.2）。
+# - 只消费 application 的 WebBridge 用例（read_asset / invoke_action）与
+#   domain 类型；不实现 application 的 ports（§24.2）。
+# - axum：默认 features；不启用 multipart（避免新依赖）：action body 为
+#   JSON 或原始字节。
+# - serde/serde_json：action 请求 payload 的边界解析（§13.3）。
+# - tower：仅 dev（HTTP 黑盒测试 oneshot，§32）。
 [dependencies]
+operune-application = { path = "../application" }
+operune-domain = { path = "../domain" }
+axum = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+# §22.8 test/dev-only：HTTP 黑盒测试（tokio rt + tower oneshot）。
+tokio = { workspace = true, features = ["rt", "macros"] }
+tower = { workspace = true }
 
 [lints]
 workspace = true

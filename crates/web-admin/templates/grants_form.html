@@ -1,0 +1,19 @@
+{% extends "base.html" %}
+{% block title %}Edit grants {{ id }}{% endblock %}
+{% block content %}
+<h1>Edit grants <code>{{ id }}</code></h1>
+<p class="note">One grant per line: <code>capability-id</code> (unscoped) or
+  <code>capability-id=action:name</code> (web action scope). Replacing the set
+  is the explicit re-approval under RFC 17.5.</p>
+{% if let Some(error) = error %}
+<p class="err">{{ error }}</p>
+{% endif %}
+<form method="post" action="/grants/{{ id }}">
+  <input type="hidden" name="_csrf" value="{{ ctx.csrf }}">
+  <label>Grants
+    <textarea name="capabilities" rows="6">{{ current }}</textarea>
+  </label>
+  <button type="submit">Replace grants</button>
+</form>
+<p><a href="/components/{{ id }}">Back to component</a></p>
+{% endblock %}

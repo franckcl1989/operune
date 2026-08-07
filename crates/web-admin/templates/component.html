@@ -1,0 +1,52 @@
+{% extends "base.html" %}
+{% block title %}Component {{ record.installation_id }}{% endblock %}
+{% block content %}
+<h1>Component <code>{{ record.installation_id }}</code></h1>
+
+{% if let Some(message) = message %}
+<p class="ok">{{ message }}</p>
+{% endif %}
+{% if let Some(approval) = requires_approval %}
+<p class="warn">Upgrade requires explicit approval for: {{ approval }}.
+  Use the upgrade page and resubmit with these capabilities granted (RFC 17.5:
+  expanded grants are never inherited silently).</p>
+{% endif %}
+
+<table>
+  <tbody>
+    <tr><th>Installation</th><td><code>{{ record.installation_id }}</code></td></tr>
+    <tr><th>Component</th><td>{{ record.component_id }}</td></tr>
+    <tr><th>Version</th><td>{{ record.version }}</td></tr>
+    <tr><th>State</th><td>{{ record.state }}</td></tr>
+    <tr><th>Active digest</th><td>{% if let Some(digest) = record.active_digest %}<code>{{ digest }}</code>{% else %}-{% endif %}</td></tr>
+    <tr><th>Rollback target</th><td>{% if let Some(digest) = record.last_known_good_digest %}<code>{{ digest }}</code>{% else %}-{% endif %}</td></tr>
+  </tbody>
+</table>
+
+<h2>Grants (RFC 17.5)</h2>
+<ul>
+{% for g in grants %}
+  <li><code>{{ g.capability }}</code> — {{ g.scope }}</li>
+{% else %}
+  <li>(none — deny by default)</li>
+{% endfor %}
+</ul>
+<p><a href="/grants/{{ record.installation_id }}">Edit grants</a></p>
+
+<h2>Operations</h2>
+<p>
+  <a href="/components/{{ record.installation_id }}/upgrade">Upgrade</a>
+</p>
+<form method="post" action="/components/{{ record.installation_id }}/disable" class="inline">
+  <input type="hidden" name="_csrf" value="{{ ctx.csrf }}">
+  <button type="submit">Disable</button>
+</form>
+<form method="post" action="/components/{{ record.installation_id }}/enable" class="inline">
+  <input type="hidden" name="_csrf" value="{{ ctx.csrf }}">
+  <button type="submit">Enable</button>
+</form>
+<form method="post" action="/components/{{ record.installation_id }}/rollback" class="inline">
+  <input type="hidden" name="_csrf" value="{{ ctx.csrf }}">
+  <button type="submit">Rollback</button>
+</form>
+{% endblock %}

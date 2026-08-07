@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% block title %}Components{% endblock %}
+{% block content %}
+<h1>Components</h1>
+<p><a href="/components/install">Install new component (.wasm upload)</a></p>
+<table>
+  <thead><tr><th>Installation</th><th>Component</th><th>Version</th><th>State</th><th>Active</th><th>Grants</th></tr></thead>
+  <tbody>
+  {% for c in components %}
+    <tr>
+      <td><a href="/components/{{ c.record.installation_id }}">{{ c.record.installation_id }}</a></td>
+      <td>{{ c.record.component_id }}</td>
+      <td>{{ c.record.version }}</td>
+      <td>{{ c.record.state }}</td>
+      <td>{% if let Some(a) = c.active %}active <code>{{ a.digest }}</code>{% else %}-{% endif %}</td>
+      <td>{{ c.grants.len() }}</td>
+    </tr>
+  {% else %}
+    <tr><td colspan="6">No components installed yet.</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endblock %}

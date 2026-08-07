@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Operune Root Admin — Sign in</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: system-ui, sans-serif; display: flex; justify-content: center;
+         padding-top: 4rem; }
+  .card { width: 20rem; padding: 1.5rem; border: 1px solid #888; border-radius: 6px; }
+  label { display: block; margin-top: 0.75rem; }
+  input { width: 100%; box-sizing: border-box; margin-top: 0.25rem; }
+  button { margin-top: 1rem; width: 100%; }
+  .err { color: #c62828; }
+  .note { font-size: 0.8rem; color: #666; margin-top: 1rem; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>Operune Root Admin</h1>
+  <p class="note">Runtime recovery / administration plane. HTTPS required in
+    production (RFC 16); this page never records your password.</p>
+  {% if let Some(error) = error %}
+  <p class="err">{{ error }}</p>
+  {% endif %}
+  <form method="post" action="/login" autocomplete="off">
+    <input type="hidden" name="_csrf" value="{{ csrf }}">
+    <label>User name<input type="text" name="username" required autocomplete="username"></label>
+    <label>Password<input type="password" name="password" required autocomplete="current-password"></label>
+    <button type="submit">Sign in</button>
+  </form>
+</div>
+</body>
+</html>

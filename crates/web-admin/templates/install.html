@@ -1,0 +1,22 @@
+{% extends "base.html" %}
+{% block title %}Install component{% endblock %}
+{% block content %}
+<h1>Install component</h1>
+<p class="note">The uploaded bytes are treated as untrusted input (RFC 19.2):
+  validated, quarantined and activated only through the two-stage pipeline.
+  Grants given here are the explicit approval for the new installation
+  (RFC 17.1 / 17.5).</p>
+{% if let Some(error) = error %}
+<p class="err">{{ error }}</p>
+{% endif %}
+<form id="upload-form" data-url="/components/install">
+  <label>Component file (.wasm)
+    <input type="file" id="wasm" accept=".wasm" required>
+  </label>
+  <label>Grants (one capability id per line, optional)
+    <textarea id="grants" rows="4" placeholder="operune:web/actions"></textarea>
+  </label>
+  <button type="submit">Upload and install</button>
+</form>
+<script src="/static/admin.js"></script>
+{% endblock %}

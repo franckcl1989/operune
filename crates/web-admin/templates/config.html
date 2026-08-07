@@ -1,0 +1,21 @@
+{% extends "base.html" %}
+{% block title %}Core config{% endblock %}
+{% block content %}
+<h1>Core config (RFC 18.0 runtime snapshot)</h1>
+<p class="note">Read-only in 0.1.0: RuntimeConfig is managed by the Core after
+  it opens the authoritative store; mutation lands with the config use-case
+  API in a later milestone.</p>
+<table>
+  <tbody>
+    <tr><th>Max component bytes</th><td>{{ view.max_component_bytes }}</td></tr>
+    <tr><th>Descriptor deadline</th><td>{{ view.descriptor_deadline_ms }} ms</td></tr>
+    <tr><th>Readiness deadline</th><td>{{ view.readiness_deadline_ms }} ms</td></tr>
+    <tr><th>Drain deadline</th><td>{{ view.drain_deadline_ms }} ms</td></tr>
+    <tr><th>Max web assets</th><td>{{ view.max_web_assets }}</td></tr>
+    <tr><th>Max asset bytes</th><td>{{ view.max_asset_bytes }}</td></tr>
+    <tr><th>Max action body</th><td>{{ view.max_action_body_bytes }}</td></tr>
+    <tr><th>Max action response</th><td>{{ view.max_action_response_bytes }}</td></tr>
+    <tr><th>Actions per minute per installation</th><td>{{ view.max_actions_per_minute }}</td></tr>
+  </tbody>
+</table>
+{% endblock %}

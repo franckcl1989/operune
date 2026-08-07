@@ -1,0 +1,50 @@
+{% extends "base.html" %}
+{% block title %}Runtime status{% endblock %}
+{% block content %}
+<h1>Runtime status</h1>
+<p>Safe mode: <strong>{{ view.safe_mode }}</strong>
+  {% if view.safe_mode %}(auto-activation of problematic components is suspended){% endif %}</p>
+
+<h2>Active installations ({{ view.active.len() }})</h2>
+<table>
+  <thead><tr><th>Installation</th><th>Component</th><th>Version</th><th>Digest</th></tr></thead>
+  <tbody>
+  {% for a in view.active %}
+    <tr><td><a href="/components/{{ a.installation_id }}">{{ a.installation_id }}</a></td>
+        <td>{{ a.component_id }}</td><td>{{ a.version }}</td><td><code>{{ a.digest }}</code></td></tr>
+  {% else %}
+    <tr><td colspan="4">No active installations.</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+
+<h2>Installations ({{ view.installations.len() }})</h2>
+<table>
+  <thead><tr><th>Installation</th><th>Component</th><th>Version</th><th>State</th><th>Active digest</th><th>Rollback target</th></tr></thead>
+  <tbody>
+  {% for i in view.installations %}
+    <tr><td><a href="/components/{{ i.installation_id }}">{{ i.installation_id }}</a></td>
+        <td>{{ i.component_id }}</td><td>{{ i.version }}</td><td>{{ i.state }}</td>
+        <td>{% if let Some(digest) = i.active_digest %}<code>{{ digest }}</code>{% else %}-{% endif %}</td>
+        <td>{% if let Some(digest) = i.last_known_good_digest %}<code>{{ digest }}</code>{% else %}-{% endif %}</td></tr>
+  {% else %}
+    <tr><td colspan="6">No components installed yet.</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+
+<h2>Core config</h2>
+<table>
+  <tbody>
+    <tr><th>Max component bytes</th><td>{{ view.config.max_component_bytes }}</td></tr>
+    <tr><th>Descriptor deadline</th><td>{{ view.config.descriptor_deadline_ms }} ms</td></tr>
+    <tr><th>Readiness deadline</th><td>{{ view.config.readiness_deadline_ms }} ms</td></tr>
+    <tr><th>Drain deadline</th><td>{{ view.config.drain_deadline_ms }} ms</td></tr>
+    <tr><th>Max web assets</th><td>{{ view.config.max_web_assets }}</td></tr>
+    <tr><th>Max asset bytes</th><td>{{ view.config.max_asset_bytes }}</td></tr>
+    <tr><th>Max action body</th><td>{{ view.config.max_action_body_bytes }}</td></tr>
+    <tr><th>Max action response</th><td>{{ view.config.max_action_response_bytes }}</td></tr>
+    <tr><th>Actions per minute per installation</th><td>{{ view.config.max_actions_per_minute }}</td></tr>
+  </tbody>
+</table>
+{% endblock %}

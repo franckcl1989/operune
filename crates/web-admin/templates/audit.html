@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+{% block title %}Audit{% endblock %}
+{% block content %}
+<h1>Audit log (recent)</h1>
+<p class="note">Security / admin events. Component pipeline events are
+  recorded through the application audit port (RFC 18.7); a unified durable
+  read model arrives with storage-sqlite wiring.</p>
+<table>
+  <thead><tr><th>Time</th><th>Category</th><th>Severity</th><th>Outcome</th><th>Action</th><th>Message</th></tr></thead>
+  <tbody>
+  {% for e in events %}
+    <tr>
+      <td>{{ e.occurred_at }}</td>
+      <td>{{ e.category }}</td>
+      <td>{{ e.severity }}</td>
+      <td>{{ e.outcome }}</td>
+      <td>{{ e.action }}</td>
+      <td>{{ e.message }}</td>
+    </tr>
+  {% else %}
+    <tr><td colspan="6">No audit events yet.</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endblock %}

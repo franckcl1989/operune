@@ -1,0 +1,21 @@
+{% extends "base.html" %}
+{% block title %}Grants{% endblock %}
+{% block content %}
+<h1>Grants (RFC 17.5 — bound to installation)</h1>
+{% for c in components %}
+<section>
+  <h2><a href="/components/{{ c.record.installation_id }}">{{ c.record.installation_id }}</a>
+      <small>{{ c.record.component_id }} {{ c.record.version }}</small></h2>
+  <ul>
+  {% for g in c.grants %}
+    <li><code>{{ g.capability }}</code> — {{ g.scope }}</li>
+  {% else %}
+    <li>(none — deny by default)</li>
+  {% endfor %}
+  </ul>
+  <p><a href="/grants/{{ c.record.installation_id }}">Edit grants</a></p>
+</section>
+{% else %}
+<p>No installations yet.</p>
+{% endfor %}
+{% endblock %}

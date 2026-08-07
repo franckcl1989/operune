@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% block title %}Upgrade {{ id }}{% endblock %}
+{% block content %}
+<h1>Upgrade <code>{{ id }}</code></h1>
+{% if !missing.is_empty() %}
+<p class="warn">The previous grant set does not cover the new version's imports.
+  Explicitly approve the missing capabilities below and resubmit (RFC 17.5:
+  expanded grants are never inherited silently): {{ missing }}</p>
+{% endif %}
+{% if let Some(error) = error %}
+<p class="err">{{ error }}</p>
+{% endif %}
+<form id="upload-form" data-url="/components/{{ id }}/upgrade">
+  <label>New version file (.wasm)
+    <input type="file" id="wasm" accept=".wasm" required>
+  </label>
+  <label>Explicit grants (one capability id per line; empty = reuse existing where allowed)
+    <textarea id="grants" rows="4" placeholder="operune:web/actions"></textarea>
+  </label>
+  <button type="submit">Upload and upgrade</button>
+</form>
+<script src="/static/admin.js"></script>
+{% endblock %}

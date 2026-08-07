@@ -1,0 +1,51 @@
+{% extends "base.html" %}
+{% block title %}Users{% endblock %}
+{% block content %}
+<h1>Users (minimal admin / RBAC)</h1>
+<p class="note">The first administrator is created by the local bootstrap CLI
+  (RFC 16.3); this page manages additional admin subjects. Passwords are
+  never stored or logged in plaintext (RFC 16.4 / 16.6).</p>
+{% if let Some(error) = error %}
+<p class="err">{{ error }}</p>
+{% endif %}
+
+<h2>Create user</h2>
+<form method="post" action="/users">
+  <input type="hidden" name="_csrf" value="{{ ctx.csrf }}">
+  <label>User name
+    <input type="text" name="subject" required maxlength="255">
+  </label>
+  <label>Password
+    <input type="password" name="password" required autocomplete="new-password">
+  </label>
+  <button type="submit">Create user</button>
+</form>
+
+<h2>Users</h2>
+<table>
+  <thead><tr><th>Subject</th><th>Enabled</th><th>Actions</th></tr></thead>
+  <tbody>
+  {% for u in users %}
+    <tr>
+      <td>{{ u.subject }}</td>
+      <td>{{ u.enabled }}</td>
+      <td>
+        {% if u.enabled %}
+        <form method="post" action="/users/{{ u.subject }}/disable" class="inline">
+          <input type="hidden" name="_csrf" value="{{ ctx.csrf }}">
+          <button type="submit">Disable</button>
+        </form>
+        {% else %}
+        <form method="post" action="/users/{{ u.subject }}/enable" class="inline">
+          <input type="hidden" name="_csrf" value="{{ ctx.csrf }}">
+          <button type="submit">Enable</button>
+        </form>
+        {% endif %}
+      </td>
+    </tr>
+  {% else %}
+    <tr><td colspan="3">No users yet (bootstrap CLI creates the first admin).</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endblock %}
